@@ -17,6 +17,7 @@ import { openCodeService, describeError } from '../opencode/service'
 import { eventBus, type RawEvent } from '../opencode/bus'
 import { getTicket } from '../jira/board'
 import { getDb, settingGet } from '../db'
+import { sessionIndex } from '../opencode/session-index'
 import { reviewManager } from '../review'
 import { renderPrompt, DEFAULT_START_PROMPT } from '@shared/prompts'
 import { IPC, type PromptImage, type PromptRefs, type StartWorkInput, type WorkState, type WorkSummary } from '@shared/types'
@@ -136,6 +137,7 @@ class WorkManager {
       metadata: { revva: { kind: 'work', workId: id, ticketKey: ticket.key, phase: 'build', mode: input.mode } }
     })
     getDb().prepare('UPDATE work SET session_id = ? WHERE id = ?').run(session.id, id)
+    sessionIndex.register(session.id, 'work')
 
     const prompt = await this.buildPrompt(ticket.key, input)
     await api.session.prompt({ sessionID: session.id, text: prompt }).catch((err) => {
@@ -284,6 +286,8 @@ class WorkManager {
     const data = (e.data ?? {}) as Record<string, unknown>
     const sessionId = data.sessionID
     if (typeof sessionId !== 'string') return
+    // Fast miss on the index: chat/reviewer sessions never touch SQLite here.
+    if (sessionIndex.kindOf(sessionId) !== 'work') return
     const work = this.workBySession(sessionId)
     if (!work) return
 
@@ -327,7 +331,10 @@ class WorkManager {
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(id) as WorkRow | undefined
     if (!work) return
     await reviewManager.cancelWork(id)
-    if (work.session_id) await openCodeService.api.session.remove({ sessionID: work.session_id }).catch(() => undefined)
+    if (work.session_id) {
+      sessionIndex.forget(work.session_id)
+      await openCodeService.api.session.remove({ sessionID: work.session_id }).catch(() => undefined)
+    }
     await exec('git', ['-C', work.repo_dir, 'worktree', 'remove', '--force', work.worktree_dir]).catch(() => undefined)
     let note: string | undefined
     try {

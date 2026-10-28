@@ -10,6 +10,7 @@
 import { BrowserWindow } from 'electron'
 import { jiraMcp } from './mcp'
 import { getDb } from '../db'
+import { sessionIndex } from '../opencode/session-index'
 import { openCodeService, describeError } from '../opencode/service'
 import { eventBus, type RawEvent } from '../opencode/bus'
 import { shipManager } from '../ship'
@@ -134,6 +135,7 @@ class CommentWatcher {
     })
     this.reworking.set(session.id, workId)
     getDb().prepare('UPDATE work SET session_id = ?, updated_at = ? WHERE id = ?').run(session.id, Date.now(), workId)
+    sessionIndex.register(session.id, 'work')
     workManager.setReviewState(workId, 'REWORK')
     const prompt = [
       `Ticket ${work.ticket_key} received new Jira comments after the PR was opened (${work.pr_url ?? 'see branch'}).`,

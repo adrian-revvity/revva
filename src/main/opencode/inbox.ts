@@ -8,6 +8,7 @@
  */
 import { BrowserWindow, Notification } from 'electron'
 import { getDb } from '../db'
+import { sessionIndex } from './session-index'
 import { openCodeService, describeError } from './service'
 import { eventBus, type RawEvent } from './bus'
 import { IPC, type PendingItem } from '@shared/types'
@@ -184,11 +185,7 @@ class InboxManager {
   }
 
   private isKnown(sessionID: string): boolean {
-    const db = getDb()
-    return (
-      db.prepare('SELECT 1 FROM chat WHERE session_id = ?').get(sessionID) !== undefined ||
-      db.prepare('SELECT 1 FROM work WHERE session_id = ?').get(sessionID) !== undefined
-    )
+    return sessionIndex.kindOf(sessionID) !== undefined
   }
 
   /** A blocked run is visibly WAITING_HUMAN on its ticket card. */

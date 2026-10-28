@@ -12,6 +12,7 @@ import { scriptManager } from './scripts'
 import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
 import { commentWatcher } from './jira/watch'
+import { sessionIndex } from './opencode/session-index'
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -60,6 +61,7 @@ app.whenReady().then(() => {
   reviewManager.wire()
   scriptManager.wire()
   commentWatcher.wire()
+  sessionIndex.rebuild()
   void jiraAuth.load().then(() => {
     if (jiraAuth.status().connected) void jiraMcp.connect().catch(() => undefined)
   })

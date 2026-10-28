@@ -10,6 +10,7 @@ import { BrowserWindow } from 'electron'
 import { openCodeService, describeError } from './service'
 import { eventBus, type RawEvent } from './bus'
 import { getDb } from '../db'
+import { sessionIndex } from './session-index'
 import { parsePrRef, repoFromGitRemote, resolvePrRef } from '@shared/pr-ref'
 import { IPC, type ChatCreateInput, type ChatMessage, type ChatSummary, type PromptImage, type PromptRefs, type PushEvent, type QueuedMessage } from '@shared/types'
 import { fileAttachments, skillAttachments } from './prompt-refs'
@@ -173,6 +174,7 @@ class ChatManager {
          VALUES(?,?,?,?,?,?,?,?,?,?)`
       )
       .run(session.id, title, input.directory, input.agentID ?? null, input.model?.providerID ?? null, input.model?.id ?? null, input.ticketKey ?? null, prUrl ?? null, now, now)
+    sessionIndex.register(session.id, 'chat')
     return {
       sessionId: session.id,
       title,
@@ -212,6 +214,7 @@ class ChatManager {
           s.time?.created ?? Date.now(),
           s.time?.updated ?? Date.now()
         )
+        sessionIndex.register(s.id, 'chat')
       }
     } catch (err) {
       console.warn('[chat] reconcile failed:', describeError(err))
@@ -321,6 +324,7 @@ class ChatManager {
       // already gone remotely — fine, remove local index anyway
     }
     getDb().prepare('DELETE FROM chat WHERE session_id = ?').run(sessionId)
+    sessionIndex.forget(sessionId)
   }
 
   private touch(sessionId: string): void {
@@ -339,15 +343,11 @@ class ChatManager {
     return row?.directory ?? ''
   }
 
-  private isChat(sessionId: string): boolean {
-    return getDb().prepare('SELECT 1 FROM chat WHERE session_id = ?').get(sessionId) !== undefined
-  }
-
   private onEvent(e: RawEvent): void {
     const data = (e.data ?? {}) as Record<string, unknown>
     const sessionId = data.sessionID
     if (typeof sessionId !== 'string') return
-    if (!this.isChat(sessionId)) return
+    if (sessionIndex.kindOf(sessionId) !== 'chat') return
     switch (e.type) {
       case 'session.text.delta': {
         const msgId = String(data.assistantMessageID ?? '')
