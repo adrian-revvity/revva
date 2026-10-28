@@ -5,10 +5,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+- (nothing yet)
+
+## [0.1.0] - 2026-10-28
+
 ### Added
 
 - Dashboard landing view summarizing OpenCode, Jira, Inbox, pipeline work, PRs and scripts.
-- Release flow: `pnpm release:patch|minor|major` bumps the version, seals CHANGELOG.md, tags, and GitHub Actions publishes a macOS DMG/ZIP on the Releases page.
+- Release flow: `pnpm release:patch|minor|major` bumps the version, seals CHANGELOG.md, tags, and GitHub Actions publishes a macOS DMG/
+
+ZIP on the Releases page.
 - In-app changelog (Setup header → version button), with markdown-rendered chat messages.
 
 ## [0.0.1] - 2026-10-28
