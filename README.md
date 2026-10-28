@@ -2,6 +2,12 @@
 
 A local Electron desktop app that turns your Jira sprint into shipped, reviewed pull requests — driven by **opencode** sessions you control from one cockpit.
 
+**[Download the latest release](https://github.com/adrian-revvity/revva/releases/latest)** — macOS (Apple Silicon DMG) and Windows (x64 installer).
+
+<p align="center">
+  <img src="docs/images/dashboard.png" alt="Revva dashboard: OpenCode health, Jira sprint progress, inbox, pipeline work, PRs and scripts at a glance" width="860">
+</p>
+
 ```
 Jira sprint board ──▶ pick tickets ──▶ worktree + branch per ticket
         │                                    │
@@ -38,6 +44,27 @@ Jira sprint board ──▶ pick tickets ──▶ worktree + branch per ticket
 15. **Prompt tuning + favorites** — Setup holds per-role agent/model defaults (build, reviewers, fixer, PR review), editable prompt templates for every one-click button, and starred favorite models that pin to the top of every picker.
 
 The same list is available in-app: **Setup → Features**.
+
+## The views
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/jira.png" alt="Jira sprint board with per-ticket Start flow"></td>
+    <td width="50%"><img src="docs/images/cockpit.png" alt="Ticket cockpit with live streaming transcript and tool calls"></td>
+  </tr>
+  <tr>
+    <td><b>Jira sprint board</b> — your tickets, one <i>Start flow</i> click from worktree + branch + agent.</td>
+    <td><b>Ticket cockpit</b> — live transcript, tool calls, follow-up composer, per-reviewer pipeline state.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/github.png" alt="GitHub tab listing open PRs across projects with one-click review"></td>
+    <td><img src="docs/images/scripts.png" alt="Scripts tab with one-click shell scripts and port probes"></td>
+  </tr>
+  <tr>
+    <td><b>GitHub</b> — open PRs across all your repos; <i>Review</i> spins up a read-only agent on the PR head.</td>
+    <td><b>Scripts</b> — your shell routines (e.g. <code>morning</code>) as one-click buttons with live output.</td>
+  </tr>
+</table>
 
 ## Run Revva
 
