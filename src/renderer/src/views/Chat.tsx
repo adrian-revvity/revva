@@ -126,16 +126,14 @@ export function TranscriptView({
   })
   const model = useQuery({
     queryKey: ['session-model', sessionId],
-    queryFn: () => window.revva.session.model(sessionId),
-    refetchInterval: 10_000
+    queryFn: () => window.revva.session.model(sessionId)
   })
   const modelLabel = model.data
     ? `${model.data.providerID}/${model.data.id}${model.data.variant ? ` · ${model.data.variant}` : ''}`
     : model.isError ? 'Unavailable' : model.isPending ? 'Loading…' : 'Service default'
   const queue = useQuery({
     queryKey: ['session-queue', sessionId],
-    queryFn: () => window.revva.session.queue(sessionId),
-    refetchInterval: 15_000
+    queryFn: () => window.revva.session.queue(sessionId)
   })
   // Keep drafts in the renderer cache when a transcript unmounts or changes sessions.
   const draftKey = ['session-draft', sessionId] as const
@@ -198,7 +196,8 @@ export function TranscriptView({
     )
   }, [sessionId, drive, qc])
 
-  // Inbox/queue and model selection change from outside this window too (TUI, other clients).
+  // Main pushes queue/model changes for every session (bus forwards all sessions, so
+  // the TUI and other clients are covered); these pushes are the update channel.
   useEffect(() => {
     return window.revva.events.on((event) => {
       if (event.kind === 'session.queue' && event.sessionId === sessionId) {

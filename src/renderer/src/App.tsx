@@ -60,7 +60,8 @@ export default function App(): React.JSX.Element {
   const status = useQuery({
     queryKey: ['service-status'],
     queryFn: () => window.revva.service.status(),
-    refetchInterval: 10_000
+    // Slow heartbeat only — reality arrives via the 'service' push from main.
+    refetchInterval: 60_000
   })
   const chats = useQuery({ queryKey: ['chats'], queryFn: () => window.revva.chat.list() })
   const works = useQuery({ queryKey: ['works'], queryFn: () => window.revva.work.list() })
@@ -68,7 +69,6 @@ export default function App(): React.JSX.Element {
     queryKey: ['session-activity'],
     queryFn: () => window.revva.session.active(),
     enabled: status.data?.state === 'connected',
-    refetchInterval: 5000
   })
   const pending = useInbox()
 

@@ -9,6 +9,10 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 - **Windows builds** — every release now also ships a Windows x64 NSIS installer + ZIP, built on a `windows-latest` CI runner alongside the macOS DMG/ZIP. Jira OAuth (Windows Credential store), chats, pipelines and GitHub work there; the Scripts tab runs PowerShell instead of zsh, and `opencode`/`git`/`gh` must be on `PATH`. Builds are unsigned (SmartScreen: More info → Run anyway).
 
+### Changed
+
+- Idle background polling removed: service status, session activity, model and queue strips, and script status are now driven purely by the push events main already sends (plus a 60s safety heartbeat and refetch-on-focus). The app does essentially no IPC work while you are not touching it.
+
 ## [0.1.0] - 2026-10-28
 
 The "cockpit" release: Revva now opens on a Dashboard that summarizes everything it is watching, chat reads like it should, and the app ships as a downloadable installer.
