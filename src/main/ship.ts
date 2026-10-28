@@ -156,6 +156,12 @@ class ShipManager {
     return { prUrl, alreadyShipped: false }
   }
 
+  /** Push existing commits to the branch (used by rework); never force. */
+  async pushOnly(worktreeDir: string, branch: string): Promise<void> {
+    const push = await this.probe('git', ['-C', worktreeDir, 'push', 'origin', branch])
+    if (!push.ok) throw new Error(`git push failed: ${push.err.slice(0, 400)}`)
+  }
+
   /** AUTO mode: called by the review pipeline the moment all gates approve. */
   async autoShip(workId: string): Promise<void> {
     try {

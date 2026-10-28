@@ -11,6 +11,7 @@ import { reviewManager } from './review'
 import { scriptManager } from './scripts'
 import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
+import { commentWatcher } from './jira/watch'
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -54,6 +55,7 @@ app.whenReady().then(() => {
   inboxManager.wire()
   reviewManager.wire()
   scriptManager.wire()
+  commentWatcher.wire()
   void jiraAuth.load().then(() => {
     if (jiraAuth.status().connected) void jiraMcp.connect().catch(() => undefined)
   })

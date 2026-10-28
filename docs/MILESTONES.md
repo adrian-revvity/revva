@@ -51,9 +51,9 @@ Each milestone ships something you can use daily. Order assumes evenings/weekend
 - **Exit test (done manually 2026-10-28, single-ticket):** APPROVED → Ship dialog checks all green → push → `gh pr create` (correct base/title/body, opened in browser) → Jira transitioned to "Ready for Test" + summary comment → state SHIPPED with PR link in the cockpit. Stacked two-ticket run still to try organically on real tickets (base = parent branch is already wired via parentWorkId).
 - **AUTO exit test:** a clear ticket completes from Start Work to PR without routine user prompts; a high-impact ambiguous question, missing auth, or unsafe permission pauses for the user; no PR is merged.
 
-## M6 — Comment watcher + rework (≈1d)
+## M6 — Comment watcher + rework (≈1d) — DONE 2026-10-28
 - Poller (watermarks), unresolved-comment detection (exclude agent's own), alert badge + Inbox section, "Tackle comments" rework session, revva-side Jira reply/resolve from agent's structured response block, auto-return to REVIEW.
-- **Exit test:** add a Jira comment on a shipped ticket → badge → tackle → PR updated + thread resolved.
+- **Exit test (done manually 2026-10-28):** watcher polls every 60s for works with a PR; seeded a comment row → cockpit strip rendered with author preview + "Tackle comments" button; pending IPC and push events verified live. Full live loop (real Jira comment → tackle → PR push + Jira reply) to confirm organically on the next shipped ticket — the tackle path posts to the real ticket so it was not fired against CLN-112681 during smoke.
 
 ## M7 — Portability and polish (ongoing)
 - Multi-work concurrency dashboard, cost totals, per-repo check commands, plan-edit before BUILD, reduced-motion/a11y pass, launch-at-login, auto-update (electron-builder + notarization skipped while personal).

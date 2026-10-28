@@ -12,6 +12,7 @@ import { listAgents, listModels, listSkills } from './opencode/inventory'
 import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
 import { fetchBoard } from './jira/board'
+import { commentWatcher } from './jira/watch'
 import { workManager } from './pipeline/works'
 import { reviewManager } from './review'
 import { shipManager } from './ship'
@@ -136,6 +137,10 @@ export function registerIpc(): void {
     inboxManager.replyForm(String(sessionId), String(formId), inboxAnswerSchema.parse(answer)))
   ipcMain.handle(IPC.inboxReplyPermission, (_e, sessionId: string, requestId: string, decision: unknown) =>
     inboxManager.replyPermission(String(sessionId), String(requestId), permissionDecisionSchema.parse(decision)))
+
+  /* ---------- comment watcher (M6) ---------- */
+  ipcMain.handle(IPC.commentsPending, () => commentWatcher.pending())
+  ipcMain.handle(IPC.commentsTackle, (_e, workId: string) => commentWatcher.tackleComments(String(workId)))
 
   /* ---------- scripts (one-click shell, incl. Morning) ---------- */
   ipcMain.handle(IPC.scriptList, () => scriptManager.list())

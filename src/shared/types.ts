@@ -138,6 +138,7 @@ export const workStateSchema = z.enum([
   'FIXING',
   'APPROVED',
   'WAITING_HUMAN',
+  'REWORK',
   'SHIPPED',
   'ABANDONED'
 ])
@@ -230,6 +231,19 @@ export const startWorkInputSchema = z.object({
     .optional()
 })
 export type StartWorkInput = z.infer<typeof startWorkInputSchema>
+
+/* ---------- Comment watcher (M6) ---------- */
+
+export const jiraCommentSchema = z.object({
+  workId: z.string(),
+  ticketKey: z.string(),
+  id: z.string(),
+  author: z.string(),
+  body: z.string(),
+  createdAt: z.number(),
+  tackledAt: z.number().optional()
+})
+export type JiraComment = z.infer<typeof jiraCommentSchema>
 
 /* ---------- Ship (M5) ---------- */
 
@@ -337,6 +351,8 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('review.updated'), workId: z.string(), round: z.number(), reviews: z.array(reviewRowSchema) }),
   /** Live streamed text from a reviewer/fixer session. */
   z.object({ kind: z.literal('review.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
+  /** New Jira comments pending action (M6). */
+  z.object({ kind: z.literal('comments'), items: z.array(jiraCommentSchema) }),
   z.object({ kind: z.literal('script.output'), scriptId: z.string(), chunk: z.string() }),
   z.object({ kind: z.literal('script.status'), status: scriptStatusSchema })
 ])
@@ -398,6 +414,12 @@ export interface RevvaApi {
   roleConfig: {
     list(): Promise<RoleConfig[]>
     save(cfg: RoleConfig): Promise<void>
+  }
+  comments: {
+    /** New (untackled) Jira comments across shipped works. */
+    pending(): Promise<JiraComment[]>
+    /** Rework session that addresses the alerts, updates the PR, replies on Jira. */
+    tackle(workId: string): Promise<void>
   }
   inbox: {
     list(): Promise<PendingItem[]>

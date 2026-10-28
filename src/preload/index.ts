@@ -53,6 +53,10 @@ const api: RevvaApi = {
     list: () => ipcRenderer.invoke(IPC.roleConfigList),
     save: (cfg) => ipcRenderer.invoke(IPC.roleConfigSave, cfg)
   },
+  comments: {
+    pending: () => ipcRenderer.invoke(IPC.commentsPending),
+    tackle: (workId) => ipcRenderer.invoke(IPC.commentsTackle, workId)
+  },
   inbox: {
     list: () => ipcRenderer.invoke(IPC.inboxList),
     replyForm: (sessionId, formId, answer) => ipcRenderer.invoke(IPC.inboxReplyForm, sessionId, formId, answer),

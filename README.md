@@ -10,29 +10,31 @@ Jira sprint board ──▶ pick tickets ──▶ worktree + branch per ticket
         │                                    │
         │        ┌───────────────────────────┼───────────────────────────┐
         │        ▼                           ▼                           ▼
-        │  /grill-me intake          main coding session        review loops
-        │  (optional)                streaming output view      (sol-loop ×N, /test-audit,
-        │        │                   answer pending questions   /impeccable when UI)
+        │  /grill-me intake          main coding session        review fan-out
+        │  (optional)                streaming output view      (sol-loop, test-audit,
+        │        │                   answer pending questions   impeccable when UI) — parallel
         │        └───────────┬───────────────────────────────────────────┘
         │                    ▼
         └── status/comment ◀── PR + gh-stack + Jira transition
              sync ◀────────── "tackle new comments" rework agent
 ```
 
-## What it does (feature list)
+## Features
 
-1. **Sprint board** — fetches Jira issues assigned to you in the current sprint (via the Atlassian MCP server, using Revva's own Jira connection).
-2. **Start work** — creates a git worktree + branch per ticket in a workspace folder you pick (configurable, e.g. `~/workspace-worktrees`), optionally **branching from another ticket's branch** (stacked work).
-3. **Optional `/grill-me` phase** — before coding, a subagent session grills you about the ticket until the plan is solid; its output seeds the coding prompt.
-4. **Agent/model picker** — discover every configured OpenCode agent and model. Set defaults by role and override per run: implementation, Sol-loop, test audit, UI review, grill-me, rework, and general chat.
-5. **Scripts** — add your own one-click shell scripts (aliases work; runs in interactive zsh), e.g. your `morning` AWS/SSO/proxy routine. Revva just runs them and shows live output; it ships no AWS-specific logic. Models whose provider needs a local endpoint are grayed out until that port is listening.
-6. **General chat** — a global **New Chat** action starts a normal OpenCode session with a chosen workspace directory, agent, model, and optional skills, with no Jira ticket or delivery pipeline required.
-7. **Ticket cockpit** — click a ticket → live agent output (streaming text, tool calls, costs), subagent runs, and diffs.
-8. **Question inbox** — global view of every **pending form (question)** and **permission request** across Revva sessions; answer inline without leaving the app.
-9. **Parallel review pipeline** — when implementation finishes, revva fans out independent read-only subagent reviews concurrently: the sol-loop protocol, `/test-audit`, and `/impeccable` when UI is involved. Each reviewer can use its configured default or a per-run-selected OpenCode agent/model. Findings are consolidated for a fixer; changed code is then re-reviewed in parallel within bounded rounds.
-10. **Ship** — create + open the PR (`gh`), stack it with `gh-stack` when the ticket depends on another, transition the Jira issue and post a summary comment.
-11. **AUTO mode** — opt into a run that chooses recommended/safe options, minimizes routine questions, completes implementation and parallel reviews, and pushes/opens the PR automatically when gates pass. It pauses on genuine blockers or unsafe requests and never merges.
-12. **Comment watcher** — polls Jira for unresolved comments on shipped tickets; a **"Tackle comments"** button spins up a rework agent that fixes the feedback, answers + resolves the comments, and requests re-review (re-entering the review pipeline).
+1. **Sprint board** — fetches Jira issues assigned to you in the current sprint (via the Atlassian MCP server, using Revva's own OAuth connection — never another app's token cache).
+2. **Start work** — creates a git worktree + branch per ticket in a workspace folder you pick (worktree root configurable), optionally **branching from another ticket's branch** (stacked work; the PR base follows the parent's branch, gh-stack-compatible).
+3. **Optional `/grill-me` phase** — before coding, the agent grills you about the ticket until the plan is solid; its output seeds the build.
+4. **Agent/model selection everywhere** — every agent and model exposed by your OpenCode service is eligible. Per-role defaults (Sol-loop, test audit, UI review, fixer) live in Setup; any run can override each reviewer and the fixer individually. Models whose provider needs a local endpoint are marked until that port is listening.
+5. **Scripts** — add your own one-click shell scripts (aliases work; runs in interactive zsh), e.g. your `morning` AWS/SSO/proxy routine. Revva just runs them, streams output, and can probe a local port they open; it ships no AWS-specific logic.
+6. **General chat** — a global **New Chat** action starts a normal OpenCode session with a chosen workspace directory, agent, and model — no Jira ticket or pipeline required.
+7. **Ticket cockpit** — live agent output (streaming text, tool calls), follow-up composer, interrupt, and a shared transcript view.
+8. **Question inbox** — global view of every **pending question (form)** and **permission request** across Revva sessions; answer inline without leaving the app. Every answer is audited.
+9. **Parallel review pipeline** — when the build finishes, revva fans out **concurrent read-only reviewers**: sol-loop protocol, test audit, and UI review (impeccable) only when UI files changed. Verdict protocol per reviewer; incomplete/errored reviewers block approval and skipped ≠ approved. Findings fan in to **one fixer** session, then bounded parallel re-review rounds (default 3, max 5). Live read-only transcripts per reviewer.
+10. **Ship** — pre-flight checks (gh present/auth, GitHub remote, clean tree, commits ahead), `git push` (never force), `gh pr create` with a review-gate summary, opens the PR in your browser, then transitions Jira to a review-ish status and posts a summary comment. revva never merges.
+11. **AUTO mode** — opt-in per run: the agent picks recommended/safe options, minimizes routine questions, and after all review gates pass revva pushes + opens the PR by itself. Genuine blockers park the work in WAITING_HUMAN with the reason; gates are never skipped and decisions are logged to an audit ledger.
+12. **Comment watcher** — polls Jira for new comments on shipped tickets (excluding revva's own); a **"Tackle comments"** button runs a rework agent on the branch, pushes the fixes onto the open PR, and posts the agent's reply back to Jira.
+
+The same list is available in-app: **Setup → Features**.
 
 ## What it is not
 
@@ -41,68 +43,53 @@ Not a server platform. No Vercel/Neon, no sandboxes, no second agent runtime. re
 ## Stack
 
 - **Electron + electron-vite + React + TypeScript + Tailwind** — desktop shell and UI.
-- **shadcn/ui** — component library for the renderer. Prefer existing components and compositions before creating custom UI; shadcn skill + MCP are configured for development (see [docs/FRONTEND.md](docs/FRONTEND.md)).
-- **`@opencode/client`** (official TS client) + `@opencode/client/service` — discovers/starts the opencode background service and drives it over HTTP/SSE. revva does **not** spawn opencode per-session; it attaches to your shared service (`opencode api get /api/info` today returns `http://127.0.0.1:49374` — same mechanism).
-- **Atlassian MCP over Streamable HTTP** — connect through Revva's own onboarding/OAuth flow and keep credentials in OS secure storage; optional documented REST/API-token fallback. Never depend on another app's private token-cache file.
-- **better-sqlite3** — revva's own state: tickets↔sessions↔branches map, review ledgers, comment-watch watermarks, settings.
-- **Built-in AWS readiness manager** — orchestrates AWS CLI v2 SSO login in-app and manages any required bundled local SigV4 proxy; no user's shell function or custom Python script.
-- **child_process** — feature-detected `aws`, `gh`, `gh stack`, and `git` operations with in-app status/errors; no AppleScript dependency.
+- **shadcn/ui** — component library for the renderer. Prefer existing components and compositions before creating custom UI (see [docs/FRONTEND.md](docs/FRONTEND.md)).
+- **`@opencode/client`** (official TS client) + `@opencode/client/service` — discovers/starts the opencode background service and drives it over HTTP/SSE. revva does **not** spawn opencode per-session; it attaches to your shared service.
+- **Atlassian MCP over Streamable HTTP** — Revva's own onboarding/OAuth flow (device/PKCE via loopback), tokens in Electron `safeStorage`. Optional documented fallbacks only. Never reads another app's private token-cache file.
+- **better-sqlite3** — revva's own state: tickets↔sessions↔branches map, review ledger, decision audit log, comment-watch watermarks, role defaults, settings.
+- **child_process** — feature-detected `git`, `gh`, and user scripts (`/bin/zsh -ic`), with in-app status/errors.
 
 ## Repo layout
 
 ```
 revva/
-├── package.json               # pnpm workspace root (single package is fine at first)
 ├── electron.vite.config.ts
-├── components.json             # shadcn/ui project configuration (created in M0)
-├── opencode.json               # project-local shadcn MCP for development
-├── skills-lock.json            # pinned source metadata for project skills
-├── .agents/skills/shadcn/      # project-local shadcn skill
+├── components.json                # hand-maintained shadcn/ui config (CLI can't detect electron-vite)
 ├── src/
-│   ├── main/                  # Electron main process = the "engine"
-│   │   ├── opencode/          #   service discovery, client singleton, event bus (SSE)
-│   │   ├── jira/              #   Atlassian MCP client, JQL queries, comment watcher
-│   │   ├── git/               #   worktrees, branches, dependency chains
-│   │   ├── pipeline/          #   state machine: intake→grill→build→review→ship→rework
-│   │   ├── review/            #   sol-loop / test-audit / impeccable orchestrators
-│   │   ├── ship/              #   gh, gh-stack, Jira transitions
-│   │   ├── scripts.ts         #   user one-click scripts (aliases, e.g. morning) + endpoint probes
-│   │   ├── chat/              #   general, non-ticket OpenCode sessions
-│   │   └── db/                #   better-sqlite3 schema + repositories
-│   ├── preload/               # typed contextBridge API surface (one `revva` global)
-│   └── renderer/              # React UI
-│       ├── board/             #   sprint board (columns, cards, dependency badges)
-│       ├── cockpit/           #   per-ticket view: transcript, diff, phases, questions
-│       ├── chat/              #   general chats and New Chat flow
-│       ├── inbox/             #   global questions & permissions inbox
-│       └── settings/          #   workspace folders, Jira, AWS profile/region, role defaults
-├── skills/
-│   └── sol-loop/SKILL.md      # vendored from t3dotgg/tstack (adapted for opencode)
+│   ├── main/                      # Electron main process = the "engine"
+│   │   ├── opencode/              #   service attach (service.ts), SSE bus, chats, inbox mirror, inventory
+│   │   ├── jira/                  #   OAuth (auth.ts), MCP client (mcp.ts), board queries, comment watcher (watch.ts)
+│   │   ├── pipeline/works.ts      #   work state machine: worktree/branch/build session + review hooks
+│   │   ├── review.ts              #   M4: parallel reviewer fan-out, fan-in fixer, bounded rounds
+│   │   ├── ship.ts                #   M5: pre-flight checks, push, gh pr create, Jira sync, AUTO ship
+│   │   ├── scripts.ts             #   user one-click scripts (aliases via interactive zsh) + port probes
+│   │   ├── ipc.ts                 #   typed IPC surface (zod-validated in main only)
+│   │   └── db/                    #   better-sqlite3 schema + settings/role-config helpers
+│   ├── preload/                   # typed contextBridge API surface (one `revva` global; zod-free)
+│   ├── shared/                    # IPC contract: channel names + zod types shared by main/renderer
+│   └── renderer/src/views/        # React UI: Board, Cockpit, Inbox, Scripts, Chats, Setup + dialogs
 └── docs/
-    ├── REQUIREMENTS.md        # reusable product/setup requirements and acceptance criteria
-    ├── FRONTEND.md            # shadcn/ui choice, reuse-first policy, and component map
-    ├── ARCHITECTURE.md        # components, API surface used, data model
-    ├── PIPELINE.md            # the ticket state machine in detail
-    └── MILESTONES.md          # build order M0–M7, each shippable
+    ├── REQUIREMENTS.md            # reusable product/setup requirements and acceptance criteria
+    ├── FRONTEND.md                # shadcn/ui choice, reuse-first policy, component map
+    ├── ARCHITECTURE.md            # components, API surface used, data model
+    ├── PIPELINE.md                # the ticket state machine in detail
+    └── MILESTONES.md              # build order + owner notes
 ```
 
 ## Integration notes (verified against this local setup, 2026-10-28; local values are examples, not requirements)
 
 | Fact | Evidence |
 | --- | --- |
-| opencode v2.2.0 background service with HTTP API | `opencode api get /api/info` → `{"version":"2.0.30","urls":["http://127.0.0.1:49374"],...}` |
-| Pending agent questions = **forms**: `GET /api/form`, answer `POST /api/session/{id}/form/{formID}/reply` | OpenAPI `/v2/openapi.json` |
-| Permission prompts: `GET /api/permission/request`, reply `POST /api/session/{id}/permission/{requestID}/reply` | same |
-| Skills can be invoked over the API: `POST /api/experimental/session/{id}/skill {id}`; prompt endpoint also accepts `skills:[{id,name}]` | same |
-| Commands (`/grill-me`) over API: `POST /api/session/{id}/command {name,text}` | same |
-| Worktree API: `POST /api/worktree {projectID, from, branch, directory}` | same |
-| Model selection per session: `session.create({model:{providerID,id}, location:{directory}})` | same |
-| Streaming transcript: `GET /api/event` (SSE) + `GET /api/session/{id}/message` | same |
-| Original developer's Atlassian MCP is OAuth-configured | Local observation only; Revva must offer its own connection flow and cannot rely on this token cache |
+| opencode background service with HTTP API | registration file + `/api/info`; revva auto-attaches or starts one |
+| Pending agent questions = **forms**; `form.created` events carry `data.form` | SSE stream (live-only, no replay — revva resyncs on reconnect) |
+| Completion signal: `session.execution.succeeded/failed/interrupted` | `session.idle` does NOT fire over SSE |
+| Permission prompts: `permission.asked` (fields directly on `data`) | SSE stream |
+| Worktree API exists; revva uses plain `git worktree add` for predictability | verified live |
+| Model selection per session: `session.create({model:{providerID,id}, location:{directory}})` | verified live |
+| Real MCP tool names: `searchJiraIssuesUsingJql`, `getJiraIssue`, `addCommentToJiraIssue`, `transitionJiraIssue`, `getTransitionsForJiraIssue`, `atlassianUserInfo`; all require `cloudId`; there is **no** list-comments tool (comments come from `getIssue` fields) | live `tools/list` |
 | Original developer's `morning` zsh function calls `useaws.py` and starts a proxy | Local observation only; added as a user **Script** in Revva — Revva runs it and probes its local port, nothing AWS-specific in code |
 | Original developer has GPU, Bedrock, and Kimi providers configured | Local observation only; Revva discovers agents/models dynamically and makes none a requirement |
 | Original developer has `grill-me`, `test-audit`, `impeccable`, and `gh-stack` installed | Local observation only; Revva checks skills/extensions per installation |
-| Original developer uses `.worktrees` and an external worktree allowlist | Local observation only; Revva asks each user to choose worktree locations |
 
 ## Requirements
 
@@ -110,4 +97,4 @@ See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for reusable-app requirements, 
 
 ## Build order
 
-See [docs/MILESTONES.md](docs/MILESTONES.md). Each milestone is independently usable; early milestones include general chat as well as Jira-driven work.
+See [docs/MILESTONES.md](docs/MILESTONES.md). Each milestone is independently usable.

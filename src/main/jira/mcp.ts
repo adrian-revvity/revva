@@ -48,6 +48,7 @@ export class JiraMcp {
   private tools: ToolDef[] = []
   private capMap = new Map<JiraCapability, string>()
   private cloudId: string | undefined
+  private cachedAccountId: string | null | undefined
 
   get connected(): boolean {
     return !!this.client
@@ -154,6 +155,26 @@ export class JiraMcp {
   async listTransitions(key: string): Promise<unknown> {
     const cloudId = await this.resolveCloudId()
     return this.call('getTransitions', { cloudId, issueIdOrKey: key })
+  }
+
+  /** Comments from getIssue (there is no list-comments tool on this MCP). */
+  async comments(key: string): Promise<Array<{ id?: string; author?: { displayName?: string; accountId?: string }; body?: unknown; created?: string }>> {
+    const raw = (await this.getIssue(key)) as { fields?: Record<string, unknown> } | { issue?: { fields?: Record<string, unknown> } }
+    const fields = (raw as { fields?: Record<string, unknown> })?.fields ?? (raw as { issue?: { fields?: Record<string, unknown> } })?.issue?.fields
+    const comments = (fields?.comment as { comments?: unknown[] })?.comments
+    return Array.isArray(comments) ? (comments as Array<{ id?: string; author?: { displayName?: string; accountId?: string }; body?: unknown; created?: string }>) : []
+  }
+
+  /** Our own account id, so we can skip comments revva itself posted. */
+  async myAccountId(): Promise<string | undefined> {
+    if (this.cachedAccountId !== undefined) return this.cachedAccountId ?? undefined
+    try {
+      const raw = (await this.call('user', {})) as { accountId?: string; user?: { accountId?: string } }
+      this.cachedAccountId = raw?.accountId ?? raw?.user?.accountId ?? null
+    } catch {
+      this.cachedAccountId = null
+    }
+    return this.cachedAccountId ?? undefined
   }
 
   async transitionIssue(key: string, transitionId: string): Promise<unknown> {

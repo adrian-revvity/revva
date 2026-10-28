@@ -9,6 +9,7 @@ import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { RoleSelectors, DEFAULT, selOrUndefined } from './RoleSelectors'
+import { FeaturesDialogButton } from './FeaturesDialog'
 import type { PipelineRole } from '@shared/types'
 
 /**
@@ -42,11 +43,14 @@ export function SetupView(): React.JSX.Element {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-2xl space-y-8 px-6 py-8">
-        <header>
-          <h1 className="text-xl font-semibold">Setup</h1>
-          <p className="text-sm text-muted-foreground">
-            Revva drives whatever your own OpenCode service exposes — no imported config required.
-          </p>
+        <header className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-xl font-semibold">Setup</h1>
+            <p className="text-sm text-muted-foreground">
+              Revva drives whatever your own OpenCode service exposes — no imported config required.
+            </p>
+          </div>
+          <FeaturesDialogButton />
         </header>
 
         <section className="space-y-2">
