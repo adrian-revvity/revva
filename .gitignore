@@ -1,0 +1,8 @@
+node_modules/
+out/
+dist/
+release/
+*.db
+*.db-*
+.DS_Store
+*.local
