@@ -206,7 +206,7 @@ util.ts + 2 import-sites only; `grep -rn "indexOf(',')" src/main` → zero.
 
 Remove now-unused imports (`BrowserWindow` where fully replaced, etc.).
 
-**Verify**: `pnpm typecheck` → exit 0, no errors; `pnpm build` → exit 0 (or baseline-only).
+**Verify**: `pnpm typecheck` → exit 0, no errors; `pnpm build` → exit 0 .
 
 ### Step 5: Grep gates
 

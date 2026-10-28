@@ -66,11 +66,9 @@ Repo conventions:
 | Build     | `pnpm build` | exit 0 |
 | Manual run | `pnpm dev` | app window opens, no main-process stack traces |
 
-**Known baseline**: at plan time the repo had pre-existing typecheck failures in
-`src/main/worktrees.ts` and `src/main/ipc.ts` from unrelated in-flight work. If
-those files still fail when you start, confirm your change adds **no new
-errors** (diff the error list before/after) and note it in your report. Any
-error in an in-scope file below is yours to fix.
+**Precondition**: `pnpm typecheck` passes cleanly at commit `830a20f` (verified
+at plan-writing time). If it fails before you change anything, the tree has
+new in-flight work — STOP and report.
 
 ## Scope
 
@@ -145,7 +143,7 @@ The app must start clean (fresh DB), show the sidebar/dashboard, and
 
 ### Step 4: Build gate
 
-**Verify**: `pnpm build` → exit 0 (or baseline failures only in the two known files).
+**Verify**: `pnpm build` → exit 0.
 
 ## Test plan
 
@@ -155,8 +153,8 @@ Verification is the typecheck/build gates plus the Step 3 manual run.
 ## Done criteria
 
 - [ ] `grep -rn "ensureSchema\|CREATE TABLE\|ALTER TABLE" src/main/` → matches only inside `src/main/db/index.ts`
-- [ ] `pnpm typecheck` introduces exit 0, no errors
-- [ ] `pnpm build` succeeds (modulo the two known baseline-failing files, if still broken)
+- [ ] `pnpm typecheck` exits 0 with no errors
+- [ ] `pnpm build` exits 0
 - [ ] Fresh-DB and upgraded-DB manual runs both start clean; `PRAGMA user_version` → 2
 - [ ] No files outside the in-scope list modified (`git status`)
 - [ ] `plans/README.md` status row updated to DONE

@@ -68,7 +68,7 @@ main process ESM; concise "why" comments.
 
 | Purpose | Command | Expected |
 |---------|---------|----------|
-| Typecheck | `pnpm typecheck` | exit 0, no errors (two pre-existing failures may exist in `src/main/worktrees.ts`/`src/main/ipc.ts` from unrelated in-flight work at plan time — diff the error list) |
+| Typecheck | `pnpm typecheck` | exit 0, no errors |
 | Build | `pnpm build` | exit 0 |
 | Manual run | `pnpm dev` | chat streaming + ticket cockpit still show live output |
 

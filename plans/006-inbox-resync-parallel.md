@@ -51,7 +51,7 @@ and never sets `owner`, so after a reconnect the inbox cards lose their
 
 | Purpose | Command | Expected |
 |---------|---------|----------|
-| Typecheck | `pnpm typecheck` | exit 0, no errors (possible pre-existing baseline in `src/main/worktrees.ts`/`ipc.ts` — diff before/after) |
+| Typecheck | `pnpm typecheck` | exit 0, no errors |
 | Build | `pnpm build` | exit 0 |
 | Manual | `pnpm dev` | Step 4 |
 
@@ -146,7 +146,7 @@ you delay). Confirm:
 
 ### Step 4: Build gate
 
-**Verify**: `pnpm build` → exit 0 (or baseline-only known failures).
+**Verify**: `pnpm build` → exit 0 .
 
 ## Test plan
 

@@ -185,7 +185,7 @@ typecheck clean — an inline async arrow inside the method is simplest).
 
 ### Step 5: Build gate
 
-**Verify**: `pnpm build` → exit 0 (or baseline-only known failures).
+**Verify**: `pnpm build` → exit 0 .
 
 ## Test plan
 

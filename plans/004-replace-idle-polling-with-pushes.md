@@ -75,7 +75,7 @@ via `window.revva.events.on(...)` — see `useInbox()` in
 
 | Purpose | Command | Expected |
 |---------|---------|----------|
-| Typecheck | `pnpm typecheck` | exit 0, no errors (pre-existing baseline failures may exist in `src/main/worktrees.ts`/`src/main/ipc.ts` from the owner's in-flight work — diff before/after) |
+| Typecheck | `pnpm typecheck` | exit 0, no errors |
 | Build | `pnpm build` | exit 0 |
 | Manual | `pnpm dev` | click-through in Steps |
 
