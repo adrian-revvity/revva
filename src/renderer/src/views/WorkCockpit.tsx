@@ -4,6 +4,7 @@ import { CircleDot, GitBranch, FolderGit2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import type { PushEvent, WorkSummary } from '@shared/types'
 import { TranscriptView, type TranscriptDrive } from './Chat'
+import { FormCard, PermissionCard, useInbox } from './InboxView'
 
 const stateClasses: Record<string, string> = {
   BUILDING: 'bg-sky-500/15 text-sky-700 dark:text-sky-400 border-sky-500/30',
@@ -20,6 +21,8 @@ const stateClasses: Record<string, string> = {
  */
 export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element {
   const sessionId = work.sessionId
+  const allPending = useInbox()
+  const pending = allPending.filter((p) => p.sessionID === sessionId)
 
   // work.delta carries per-token increments; accumulate per message for the shared transcript.
   const drive = useMemo<TranscriptDrive>(() => {
@@ -55,7 +58,18 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
   }
 
   return (
-    <TranscriptView
+    <div className="flex min-h-0 flex-1 flex-col">
+      {pending.length > 0 && (
+        <div className="max-h-64 shrink-0 space-y-2 overflow-y-auto border-b bg-amber-500/5 p-3">
+          <p className="text-[11px] font-medium text-amber-700 dark:text-amber-400">
+            Waiting on you ({pending.length})
+          </p>
+          {pending.map((p) =>
+            p.kind === 'form' ? <FormCard key={p.id} item={p} /> : <PermissionCard key={p.id} item={p} />
+          )}
+        </div>
+      )}
+      <TranscriptView
       sessionId={sessionId}
       drive={drive}
       emptyHint="The build session is spinning up — output appears here live."
@@ -81,5 +95,6 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
         </>
       }
     />
+    </div>
   )
 }

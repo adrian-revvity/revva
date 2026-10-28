@@ -31,5 +31,8 @@ export const IPC = {
   workPrompt: 'revva:work:prompt',
   workInterrupt: 'revva:work:interrupt',
   workMessages: 'revva:work:messages',
+  inboxList: 'revva:inbox:list',
+  inboxReplyForm: 'revva:inbox:reply-form',
+  inboxReplyPermission: 'revva:inbox:reply-permission',
   eventPush: 'revva:event'
 } as const

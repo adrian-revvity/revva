@@ -45,6 +45,11 @@ const api: RevvaApi = {
     prompt: (sessionId, text) => ipcRenderer.invoke(IPC.workPrompt, sessionId, text),
     interrupt: (sessionId) => ipcRenderer.invoke(IPC.workInterrupt, sessionId)
   },
+  inbox: {
+    list: () => ipcRenderer.invoke(IPC.inboxList),
+    replyForm: (sessionId, formId, answer) => ipcRenderer.invoke(IPC.inboxReplyForm, sessionId, formId, answer),
+    replyPermission: (sessionId, requestId, decision) => ipcRenderer.invoke(IPC.inboxReplyPermission, sessionId, requestId, decision)
+  },
   events: {
     on(handler: (event: PushEvent) => void) {
       // Payloads are validated in main before sending; zod cannot run in the preload context.

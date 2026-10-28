@@ -7,7 +7,8 @@ import {
   Server,
   RefreshCw,
   Kanban,
-  Hammer
+  Hammer,
+  Inbox as InboxIcon
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -20,12 +21,14 @@ import { ChatView } from '@/views/Chat'
 import { NewChatDialog } from '@/views/NewChatDialog'
 import { BoardView } from '@/views/BoardView'
 import { WorkCockpit } from '@/views/WorkCockpit'
+import { InboxView, useInbox } from '@/views/InboxView'
 
 type View =
   | { kind: 'chat'; sessionId: string }
   | { kind: 'setup' }
   | { kind: 'board' }
   | { kind: 'work'; workId: string }
+  | { kind: 'inbox' }
 
 const serviceStateLabels = {
   connecting: { label: 'Connecting…', cls: 'text-muted-foreground' },
@@ -46,6 +49,7 @@ export default function App(): React.JSX.Element {
   })
   const chats = useQuery({ queryKey: ['chats'], queryFn: () => window.revva.chat.list() })
   const works = useQuery({ queryKey: ['works'], queryFn: () => window.revva.work.list() })
+  const pending = useInbox()
 
   useEffect(() => {
     return window.revva.events.on((event) => {
@@ -80,6 +84,13 @@ export default function App(): React.JSX.Element {
             label="Board"
             active={view.kind === 'board'}
             onClick={() => setView({ kind: 'board' })}
+          />
+          <NavButton
+            icon={<InboxIcon className={cn('size-4', pending.length > 0 && 'text-amber-500')} />}
+            label="Inbox"
+            badge={pending.length > 0 ? pending.length : undefined}
+            active={view.kind === 'inbox'}
+            onClick={() => setView({ kind: 'inbox' })}
           />
           {runningWorks.map((w) => (
             <NavButton
@@ -186,6 +197,8 @@ export default function App(): React.JSX.Element {
         </div>
         {view.kind === 'setup' ? (
           <SetupView />
+        ) : view.kind === 'inbox' ? (
+          <InboxView />
         ) : view.kind === 'board' ? (
           <BoardView works={works.data ?? []} onStart={(workId) => setView({ kind: 'work', workId })} />
         ) : view.kind === 'work' ? (
@@ -212,12 +225,14 @@ function NavButton({
   icon,
   label,
   sublabel,
+  badge,
   active,
   onClick
 }: {
   icon: React.ReactNode
   label: string
   sublabel?: string
+  badge?: number
   active: boolean
   onClick: () => void
 }): React.JSX.Element {
@@ -231,6 +246,11 @@ function NavButton({
     >
       {icon}
       <span className="truncate">{label}</span>
+      {badge !== undefined && (
+        <span className="ml-auto flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold text-white">
+          {badge}
+        </span>
+      )}
       {sublabel && <span className="ml-auto text-[10px] text-muted-foreground">{sublabel}</span>}
     </button>
   )

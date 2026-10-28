@@ -166,6 +166,39 @@ export const startWorkInputSchema = z.object({
 })
 export type StartWorkInput = z.infer<typeof startWorkInputSchema>
 
+/* ---------- Inbox (M2) ---------- */
+
+export const inboxFieldSchema = z.object({
+  key: z.string(),
+  title: z.string().optional(),
+  description: z.string().optional(),
+  type: z.enum(['string', 'number', 'integer', 'boolean', 'multiselect']),
+  required: z.boolean().optional(),
+  placeholder: z.string().optional(),
+  default: z.unknown().optional(),
+  options: z.array(z.object({ value: z.string(), label: z.string().optional() })).optional()
+})
+export type InboxField = z.infer<typeof inboxFieldSchema>
+
+export const pendingItemSchema = z.object({
+  kind: z.enum(['form', 'permission']),
+  id: z.string(),
+  sessionID: z.string(),
+  title: z.string(),
+  directory: z.string(),
+  createdAt: z.number(),
+  owner: z.string().optional(),
+  fields: z.array(inboxFieldSchema).optional(),
+  action: z.string().optional(),
+  resources: z.array(z.string()).optional(),
+  /** open-ended defaults on fields are preserved verbatim */
+  rawFields: z.unknown().optional()
+})
+export type PendingItem = z.infer<typeof pendingItemSchema>
+
+export const inboxAnswerSchema = z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.array(z.string())]))
+export const permissionDecisionSchema = z.enum(['once', 'always', 'reject'])
+
 /* ---------- Events pushed main → renderer ---------- */
 
 export const pushEventSchema = z.discriminatedUnion('kind', [
@@ -175,7 +208,8 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('chat.idle'), sessionId: z.string() }),
   z.object({ kind: z.literal('chat.tool'), sessionId: z.string(), tool: z.string(), state: z.string() }),
   z.object({ kind: z.literal('work.updated'), workId: z.string(), state: workStateSchema }),
-  z.object({ kind: z.literal('work.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() })
+  z.object({ kind: z.literal('work.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
+  z.object({ kind: z.literal('inbox'), items: z.array(pendingItemSchema) })
 ])
 export type PushEvent = z.infer<typeof pushEventSchema>
 
@@ -223,6 +257,11 @@ export interface RevvaApi {
     messages(sessionId: string): Promise<ChatMessage[]>
     prompt(sessionId: string, text: string): Promise<void>
     interrupt(sessionId: string): Promise<void>
+  }
+  inbox: {
+    list(): Promise<PendingItem[]>
+    replyForm(sessionId: string, formId: string, answer: Record<string, string | number | boolean | string[]>): Promise<void>
+    replyPermission(sessionId: string, requestId: string, decision: 'once' | 'always' | 'reject'): Promise<void>
   }
   events: {
     /** Subscribe to main-process pushes; returns unsubscribe. */

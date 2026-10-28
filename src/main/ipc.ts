@@ -7,13 +7,14 @@ import { statSync } from 'node:fs'
 import { IPC, settingsKeySchema, chatCreateInputSchema, type Workspace } from '@shared/types'
 import { openCodeService } from './opencode/service'
 import { chatManager } from './opencode/chats'
+import { inboxManager } from './opencode/inbox'
 import { listAgents, listModels, listSkills } from './opencode/inventory'
 import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
 import { fetchBoard } from './jira/board'
 import { workManager } from './pipeline/works'
 import { getDb, settingGet, settingSet } from './db'
-import { startWorkInputSchema } from '@shared/types'
+import { startWorkInputSchema, inboxAnswerSchema, permissionDecisionSchema } from '@shared/types'
 
 export function registerIpc(): void {
   /* ---------- service ---------- */
@@ -112,4 +113,11 @@ export function registerIpc(): void {
   ipcMain.handle(IPC.workMessages, (_e, sessionId: string) => chatManager.messages(String(sessionId)))
   ipcMain.handle(IPC.workPrompt, (_e, sessionId: string, text: string) => workManager.followUp(String(sessionId), String(text)))
   ipcMain.handle(IPC.workInterrupt, (_e, sessionId: string) => workManager.interrupt(String(sessionId)))
+
+  /* ---------- inbox (M2) ---------- */
+  ipcMain.handle(IPC.inboxList, () => inboxManager.list())
+  ipcMain.handle(IPC.inboxReplyForm, (_e, sessionId: string, formId: string, answer: unknown) =>
+    inboxManager.replyForm(String(sessionId), String(formId), inboxAnswerSchema.parse(answer)))
+  ipcMain.handle(IPC.inboxReplyPermission, (_e, sessionId: string, requestId: string, decision: unknown) =>
+    inboxManager.replyPermission(String(sessionId), String(requestId), permissionDecisionSchema.parse(decision)))
 }

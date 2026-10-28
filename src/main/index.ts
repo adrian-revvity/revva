@@ -5,6 +5,7 @@ import { registerIpc } from './ipc'
 import { openCodeService } from './opencode/service'
 import { eventBus } from './opencode/bus'
 import { chatManager } from './opencode/chats'
+import { inboxManager } from './opencode/inbox'
 import { workManager } from './pipeline/works'
 import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
@@ -48,6 +49,7 @@ app.whenReady().then(() => {
   eventBus.start()
   chatManager.wire()
   workManager.wire()
+  inboxManager.wire()
   void jiraAuth.load().then(() => {
     if (jiraAuth.status().connected) void jiraMcp.connect().catch(() => undefined)
   })
