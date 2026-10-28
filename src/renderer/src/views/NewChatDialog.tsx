@@ -163,9 +163,15 @@ export function NewChatDialog({
                 <SelectContent>
                   <SelectItem value="__default__">Service default</SelectItem>
                   {(models.data ?? []).map((m) => (
-                    <SelectItem key={modelKeyOf(m.providerID, m.id)} value={modelKeyOf(m.providerID, m.id)}>
+                    <SelectItem
+                      key={modelKeyOf(m.providerID, m.id)}
+                      value={modelKeyOf(m.providerID, m.id)}
+                      disabled={!!m.gated}
+                      title={m.gated}
+                    >
                       {m.name || m.id}
                       <span className="ml-1 text-muted-foreground">{m.providerID}</span>
+                      {m.gated && <span className="ml-1 text-[10px] text-amber-600">needs local endpoint</span>}
                     </SelectItem>
                   ))}
                 </SelectContent>

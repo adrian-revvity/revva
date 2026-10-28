@@ -38,7 +38,7 @@ All privileged work. Subsystems:
 | `pipeline/auto.ts` | AUTO policy: answer safe/recommended structured questions, record assumptions, apply the configured permission boundary, and advance to automatic PR delivery when gates pass. |
 | `review/` | sol-loop round runner, test-audit runner, impeccable runner (see §6). |
 | `ship/` | `gh pr create`/`gh stack submit`, Jira transition + summary comment. |
-| `morning/` | Built-in AWS SSO lifecycle: configured profile/region, invoke `aws sso login` from the app, manage a Revva-bundled SigV4 proxy when required, and expose status/expiry/errors. No shell function, Python script, Terminal.app, fixed port, or developer-specific AWS values. |
+| `scripts.ts` | User one-click shell scripts (name + command/alias, optional cwd) run via interactive zsh with live output, kill, history. Also probes whether loopback endpoints referenced by provider base URLs are listening (drives model gating). Revva contains no AWS/SSO/proxy logic — users paste their own scripts (e.g. `morning`). |
 | `chat/` | Create/list/reopen general OpenCode sessions; role/model/skill selection; transcript, follow-up prompts, interrupt, questions/permissions. No Jira association. |
 | `db/` | better-sqlite3 under Electron's platform-specific `app.getPath('userData')`; no hard-coded home-directory path. |
 
@@ -138,13 +138,11 @@ interface ReviewBatchRunner {
 - Inbox view groups by ticket with jump-to-cockpit; answering posts the reply and records it in `question`.
 - The cockpit also shows the pending question inline at the bottom of the transcript.
 
-## 9. Built-in Morning / Bedrock readiness
+## 9. Scripts (user one-click commands)
 
-- Settings hold the user's AWS SSO profile, SSO start URL/region, Bedrock region, and whether their OpenCode provider needs the Revva-managed SigV4 proxy. Never ship personal account/profile defaults.
-- The Morning action invokes `aws sso login --profile <configured-profile>` as a managed child process (AWS CLI v2 is an explicit optional prerequisite), opens the AWS browser login as needed, and displays progress/error/retry in Revva. No custom zsh function, Python script, or Terminal.app dependency.
-- If required by the selected provider, Revva starts and monitors its bundled proxy using standard AWS credential-provider resolution, loopback-only bind, configurable port/region, and clean shutdown. Never expose credentials or accept remote connections.
-- Readiness is based on login completion/credential validity and, when configured, proxy health—not a fixed port or credentials-file shape.
-- UI status: not configured / signing in / ready / expired / error. Gate only models that need unavailable AWS credentials/proxy; other providers and general chat remain available.
+- Users define scripts in Revva: name, shell command or alias, optional working directory, interactive-shell toggle (loads .zshrc so aliases/functions work). Run/kill with live streamed output, last exit/duration, run history in sqlite.
+- Revva models nothing about what scripts do — no AWS/SSO/proxy/SigV4 code. The earlier "built-in Morning" design was dropped as overengineering; the user's own `morning` alias is just a Script.
+- Providers whose `settings.baseURL` points at a loopback endpoint (e.g. a local proxy started by a user script) get their models grayed out in pickers while the port is not listening, with an explanation. The gate is per-provider and never blocks other providers or chat.
 
 ## 10. Security & safety
 

@@ -3,6 +3,7 @@
  * Nothing is hardcoded; selections are always IDs discovered here (REQ-SETUP-3).
  */
 import { openCodeService } from './service'
+import { scriptManager } from '../scripts'
 import type { AgentInfo, ModelInfo, SkillInfo } from '@shared/types'
 
 export async function listAgents(): Promise<AgentInfo[]> {
@@ -14,11 +15,30 @@ export async function listAgents(): Promise<AgentInfo[]> {
 }
 
 export async function listModels(): Promise<ModelInfo[]> {
-  const res = await openCodeService.api.model.list({})
+  const [res, gating] = await Promise.all([openCodeService.api.model.list({}), morningGate()])
   return res.data
     .filter((m) => m.enabled)
-    .map((m) => ({ providerID: m.providerID, id: m.modelID ?? m.id, name: m.name, context: m.limit?.context }))
+    .map((m) => ({
+      providerID: m.providerID,
+      id: m.modelID ?? m.id,
+      name: m.name,
+      context: m.limit?.context,
+      gated: gating.get(m.providerID)
+    }))
     .sort((x, y) => `${x.providerID}/${x.id}`.localeCompare(`${y.providerID}/${y.id}`))
+}
+
+/** Providers whose local endpoint (proxy) is down — models gray out until it's up. */
+async function morningGate(): Promise<Map<string, string>> {
+  const map = new Map<string, string>()
+  try {
+    for (const n of await scriptManager.providerNeeds()) {
+      if (!n.up) map.set(n.providerID, `Needs the local endpoint at ${n.baseURL} — run its script in Scripts`)
+    }
+  } catch {
+    /* providers not listable yet */
+  }
+  return map
 }
 
 export async function listSkills(): Promise<SkillInfo[]> {

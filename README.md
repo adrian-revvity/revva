@@ -25,7 +25,7 @@ Jira sprint board ──▶ pick tickets ──▶ worktree + branch per ticket
 2. **Start work** — creates a git worktree + branch per ticket in a workspace folder you pick (configurable, e.g. `~/workspace-worktrees`), optionally **branching from another ticket's branch** (stacked work).
 3. **Optional `/grill-me` phase** — before coding, a subagent session grills you about the ticket until the plan is solid; its output seeds the coding prompt.
 4. **Agent/model picker** — discover every configured OpenCode agent and model. Set defaults by role and override per run: implementation, Sol-loop, test audit, UI review, grill-me, rework, and general chat.
-5. **Morning button** — built into Revva: configure your own AWS SSO profile and region, start login from the app, and manage/readiness-check any required local Bedrock SigV4 proxy. No personal shell function, Python script, Terminal.app workflow, or developer-specific AWS settings are shipped.
+5. **Scripts** — add your own one-click shell scripts (aliases work; runs in interactive zsh), e.g. your `morning` AWS/SSO/proxy routine. Revva just runs them and shows live output; it ships no AWS-specific logic. Models whose provider needs a local endpoint are grayed out until that port is listening.
 6. **General chat** — a global **New Chat** action starts a normal OpenCode session with a chosen workspace directory, agent, model, and optional skills, with no Jira ticket or delivery pipeline required.
 7. **Ticket cockpit** — click a ticket → live agent output (streaming text, tool calls, costs), subagent runs, and diffs.
 8. **Question inbox** — global view of every **pending form (question)** and **permission request** across Revva sessions; answer inline without leaving the app.
@@ -66,7 +66,7 @@ revva/
 │   │   ├── pipeline/          #   state machine: intake→grill→build→review→ship→rework
 │   │   ├── review/            #   sol-loop / test-audit / impeccable orchestrators
 │   │   ├── ship/              #   gh, gh-stack, Jira transitions
-│   │   ├── morning/           #   built-in AWS SSO/proxy lifecycle + readiness probes
+│   │   ├── scripts.ts         #   user one-click scripts (aliases, e.g. morning) + endpoint probes
 │   │   ├── chat/              #   general, non-ticket OpenCode sessions
 │   │   └── db/                #   better-sqlite3 schema + repositories
 │   ├── preload/               # typed contextBridge API surface (one `revva` global)
@@ -99,14 +99,14 @@ revva/
 | Model selection per session: `session.create({model:{providerID,id}, location:{directory}})` | same |
 | Streaming transcript: `GET /api/event` (SSE) + `GET /api/session/{id}/message` | same |
 | Original developer's Atlassian MCP is OAuth-configured | Local observation only; Revva must offer its own connection flow and cannot rely on this token cache |
-| Original developer's `morning` zsh function calls `useaws.py` and starts a proxy | Local observation only; Revva replaces this with a built-in, user-configurable flow |
+| Original developer's `morning` zsh function calls `useaws.py` and starts a proxy | Local observation only; added as a user **Script** in Revva — Revva runs it and probes its local port, nothing AWS-specific in code |
 | Original developer has GPU, Bedrock, and Kimi providers configured | Local observation only; Revva discovers agents/models dynamically and makes none a requirement |
 | Original developer has `grill-me`, `test-audit`, `impeccable`, and `gh-stack` installed | Local observation only; Revva checks skills/extensions per installation |
 | Original developer uses `.worktrees` and an external worktree allowlist | Local observation only; Revva asks each user to choose worktree locations |
 
 ## Requirements
 
-See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for reusable-app requirements, first-run setup, optional integration prerequisites, built-in AWS SSO/Morning behavior, role-based agent/model selection, general chat, AUTO behavior, security, and acceptance criteria.
+See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for reusable-app requirements, first-run setup, optional integration prerequisites, the scripts feature, role-based agent/model selection, general chat, AUTO behavior, security, and acceptance criteria.
 
 ## Build order
 

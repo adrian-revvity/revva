@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { FolderPlus, Trash2, CircleCheck, CircleX, CircleDashed } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
@@ -148,16 +149,14 @@ export function SetupView(): React.JSX.Element {
 
         <Separator />
         <section className="space-y-1 text-xs text-muted-foreground">
-          <p>Jira (Atlassian OAuth) · AWS/Bedrock readiness · role defaults arrive with M1–M3.</p>
-          <p>Pick a project folder above, then use “New chat” to start a general session.</p>
+          <p>Pick a project folder above, then use “New chat” to start a general session or open the Board to start work on a ticket.</p>
         </section>
       </div>
     </div>
   )
 }
 
-function InventoryRow({ label, items, loading }: { label: string; items: string[]; loading: boolean }): React.JSX.Element {
-  return (
+function InventoryRow({ label, items, loading }: { label: string; items: string[]; loading: boolean }): React.JSX.Element {  return (
     <div>
       <div className="mb-1 text-xs font-medium text-muted-foreground">{label}</div>
       {loading ? (

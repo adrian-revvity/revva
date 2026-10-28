@@ -28,11 +28,11 @@ Each milestone ships something you can use daily. Order assumes evenings/weekend
 - `GET /api/form` + `/api/permission/request` per active location, SSE-pushed; global Inbox; inline in Cockpit; answered-audit table.
 - **Exit test:** agent asks a question → red badge → answer from Inbox → agent continues.
 
-## M3 — Built-in Morning / AWS readiness (≈1d)
-- AWS profile/SSO start URL/region/Bedrock region settings; feature-detect AWS CLI v2; invoke `aws sso login` as a managed process with in-app progress/browser handoff, no shell function or custom Python script.
-- Bundle/manage a loopback-only SigV4 proxy if the selected provider requires it; configurable port; lifecycle/readiness/expiry/error handling.
-- Dynamic model readiness gating; no hardcoded Sol/Qwen IDs or developer account defaults.
-- **Exit test:** configure a test user's SSO profile and complete Morning from Revva; no `morning` function, `useaws.py`, or Terminal.app flow is required; a non-AWS model works with AWS unconfigured.
+## M3 — Scripts (user one-click commands) (≈0.5d)
+- Sidebar Scripts section: user-defined scripts (name + shell command or alias, optional cwd), run/kill with live streamed output, last exit/duration, run history. Runs through interactive zsh so the user's own aliases (e.g. `morning`) work unchanged.
+- "Morning" is NOT modeled: no AWS CLI/SSO/proxy/SigV4 logic in Revva. The user pastes their own script.
+- Light model gating only: providers whose baseURL is a loopback endpoint get grayed out in pickers while that port is not listening, with a "run its script" explanation. No provider ever blocks the app (REQ-AWS-5).
+- **Exit test:** add a script, click Run, see live output + exit code; a loopback-provider model is disabled until the port answers.
 
 ## M4 — Review pipeline (≈2d) ⭐ the meat
 - Phase runner framework (idle detection via `session.idle` + `/wait`, verdict parsing, ledger persistence, resume).
@@ -64,3 +64,17 @@ Each milestone ships something you can use daily. Order assumes evenings/weekend
 2. **grill-me session lifecycle** (M4 if grill feels clunky): keep grill as its own session (current plan) vs. same session as build with the command — same-session loses the clean "locked plan" artifact; current plan preferred.
 3. **Review role defaults** (M4): ship sensible empty/default role settings based on the user's available inventory; never hardcode Sol/Qwen. Any role can be overridden per run.
 4. **Rework Jira writes by agent vs. revva** (M6): current plan = revva writes (agents get no Jira credentials); revisit if comment replies lose the agent's nuance.
+
+---
+
+---
+
+## Testing policy (owner decision — YOLO)
+
+No E2E tests and nearly no unit tests, on purpose. Every "Exit test" above means:
+run the app manually and click through the flow once. `pnpm typecheck` +
+`pnpm build` are the only automated gates. See AGENTS.md.
+
+## Owner notes (backlog)
+
+- **Board polish:** give Jira status codes a color palette so they're easy to tell apart at a glance; add a status dropdown filter and a search bar to the Board page.

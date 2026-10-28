@@ -7,6 +7,7 @@ import { eventBus } from './opencode/bus'
 import { chatManager } from './opencode/chats'
 import { inboxManager } from './opencode/inbox'
 import { workManager } from './pipeline/works'
+import { scriptManager } from './scripts'
 import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
 
@@ -50,6 +51,7 @@ app.whenReady().then(() => {
   chatManager.wire()
   workManager.wire()
   inboxManager.wire()
+  scriptManager.wire()
   void jiraAuth.load().then(() => {
     if (jiraAuth.status().connected) void jiraMcp.connect().catch(() => undefined)
   })
@@ -69,4 +71,5 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   eventBus.stop()
   openCodeService.dispose()
+  // Running scripts (e.g. a user's proxy) are intentionally left alive.
 })

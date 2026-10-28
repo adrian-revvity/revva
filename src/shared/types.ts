@@ -34,8 +34,9 @@ export const modelInfoSchema = z.object({
   providerID: z.string(),
   id: z.string(),
   name: z.string().optional(),
-  /** Whether AWS/Bedrock readiness (M3) may be required before use. */
-  context: z.number().optional()
+  context: z.number().optional(),
+  /** Set when the provider's local endpoint (e.g. proxy script) is down — pickers gray out + explain. */
+  gated: z.string().optional()
 })
 export type ModelInfo = z.infer<typeof modelInfoSchema>
 
@@ -199,6 +200,48 @@ export type PendingItem = z.infer<typeof pendingItemSchema>
 export const inboxAnswerSchema = z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.array(z.string())]))
 export const permissionDecisionSchema = z.enum(['once', 'always', 'reject'])
 
+/* ---------- Scripts (user one-click commands, e.g. "morning") ---------- */
+
+export const scriptDefSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  /** Shell one-liner or path — run with zsh. May be an alias when interactive. */
+  command: z.string(),
+  cwd: z.string().optional(),
+  /** Run through an interactive zsh so .zshrc aliases work. */
+  interactive: z.boolean().default(true),
+  createdAt: z.number()
+})
+export type ScriptDef = z.infer<typeof scriptDefSchema>
+
+export const scriptInputSchema = scriptDefSchema.omit({ id: true, createdAt: true }).extend({ id: z.string().optional() })
+export type ScriptInput = z.infer<typeof scriptInputSchema>
+
+export interface ScriptStatus {
+  id: string
+  running: boolean
+  lastExit: number | null
+  lastRunAt: number | null
+  lastDurationMs: number | null
+}
+
+export const scriptStatusSchema = z.object({
+  id: z.string(),
+  running: z.boolean(),
+  lastExit: z.number().nullable(),
+  lastRunAt: z.number().nullable(),
+  lastDurationMs: z.number().nullable()
+})
+
+export interface ScriptRunRow {
+  id: number
+  scriptId: string
+  startedAt: number
+  endedAt: number | null
+  exitCode: number | null
+  outputTail: string
+}
+
 /* ---------- Events pushed main → renderer ---------- */
 
 export const pushEventSchema = z.discriminatedUnion('kind', [
@@ -209,7 +252,9 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('chat.tool'), sessionId: z.string(), tool: z.string(), state: z.string() }),
   z.object({ kind: z.literal('work.updated'), workId: z.string(), state: workStateSchema }),
   z.object({ kind: z.literal('work.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
-  z.object({ kind: z.literal('inbox'), items: z.array(pendingItemSchema) })
+  z.object({ kind: z.literal('inbox'), items: z.array(pendingItemSchema) }),
+  z.object({ kind: z.literal('script.output'), scriptId: z.string(), chunk: z.string() }),
+  z.object({ kind: z.literal('script.status'), status: scriptStatusSchema })
 ])
 export type PushEvent = z.infer<typeof pushEventSchema>
 
@@ -262,6 +307,17 @@ export interface RevvaApi {
     list(): Promise<PendingItem[]>
     replyForm(sessionId: string, formId: string, answer: Record<string, string | number | boolean | string[]>): Promise<void>
     replyPermission(sessionId: string, requestId: string, decision: 'once' | 'always' | 'reject'): Promise<void>
+  }
+  scripts: {
+    list(): Promise<ScriptDef[]>
+    save(input: ScriptInput): Promise<ScriptDef>
+    remove(id: string): Promise<void>
+    run(id: string): Promise<{ ok: boolean }>
+    kill(id: string): Promise<void>
+    status(): Promise<ScriptStatus[]>
+    history(id: string): Promise<ScriptRunRow[]>
+    /** Providers gated on a local endpoint (their baseURL is loopback:port). */
+    providerNeeds(): Promise<{ providerID: string; baseURL: string; port: number; up: boolean }[]>
   }
   events: {
     /** Subscribe to main-process pushes; returns unsubscribe. */

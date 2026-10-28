@@ -34,5 +34,13 @@ export const IPC = {
   inboxList: 'revva:inbox:list',
   inboxReplyForm: 'revva:inbox:reply-form',
   inboxReplyPermission: 'revva:inbox:reply-permission',
+  scriptList: 'revva:script:list',
+  scriptSave: 'revva:script:save',
+  scriptRemove: 'revva:script:remove',
+  scriptRun: 'revva:script:run',
+  scriptKill: 'revva:script:kill',
+  scriptStatus: 'revva:script:status',
+  scriptHistory: 'revva:script:history',
+  scriptProviderNeeds: 'revva:script:provider-needs',
   eventPush: 'revva:event'
 } as const

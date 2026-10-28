@@ -8,6 +8,7 @@ import {
   RefreshCw,
   Kanban,
   Hammer,
+  Terminal,
   Inbox as InboxIcon
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -22,6 +23,7 @@ import { NewChatDialog } from '@/views/NewChatDialog'
 import { BoardView } from '@/views/BoardView'
 import { WorkCockpit } from '@/views/WorkCockpit'
 import { InboxView, useInbox } from '@/views/InboxView'
+import { ScriptsView } from '@/views/ScriptsView'
 
 type View =
   | { kind: 'chat'; sessionId: string }
@@ -29,6 +31,7 @@ type View =
   | { kind: 'board' }
   | { kind: 'work'; workId: string }
   | { kind: 'inbox' }
+  | { kind: 'scripts' }
 
 const serviceStateLabels = {
   connecting: { label: 'Connecting…', cls: 'text-muted-foreground' },
@@ -91,6 +94,12 @@ export default function App(): React.JSX.Element {
             badge={pending.length > 0 ? pending.length : undefined}
             active={view.kind === 'inbox'}
             onClick={() => setView({ kind: 'inbox' })}
+          />
+          <NavButton
+            icon={<Terminal className="size-4" />}
+            label="Scripts"
+            active={view.kind === 'scripts'}
+            onClick={() => setView({ kind: 'scripts' })}
           />
           {runningWorks.map((w) => (
             <NavButton
@@ -199,6 +208,8 @@ export default function App(): React.JSX.Element {
           <SetupView />
         ) : view.kind === 'inbox' ? (
           <InboxView />
+        ) : view.kind === 'scripts' ? (
+          <ScriptsView />
         ) : view.kind === 'board' ? (
           <BoardView works={works.data ?? []} onStart={(workId) => setView({ kind: 'work', workId })} />
         ) : view.kind === 'work' ? (

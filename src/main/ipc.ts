@@ -13,8 +13,9 @@ import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
 import { fetchBoard } from './jira/board'
 import { workManager } from './pipeline/works'
+import { scriptManager } from './scripts'
 import { getDb, settingGet, settingSet } from './db'
-import { startWorkInputSchema, inboxAnswerSchema, permissionDecisionSchema } from '@shared/types'
+import { startWorkInputSchema, inboxAnswerSchema, permissionDecisionSchema, scriptInputSchema } from '@shared/types'
 
 export function registerIpc(): void {
   /* ---------- service ---------- */
@@ -120,4 +121,14 @@ export function registerIpc(): void {
     inboxManager.replyForm(String(sessionId), String(formId), inboxAnswerSchema.parse(answer)))
   ipcMain.handle(IPC.inboxReplyPermission, (_e, sessionId: string, requestId: string, decision: unknown) =>
     inboxManager.replyPermission(String(sessionId), String(requestId), permissionDecisionSchema.parse(decision)))
+
+  /* ---------- scripts (one-click shell, incl. Morning) ---------- */
+  ipcMain.handle(IPC.scriptList, () => scriptManager.list())
+  ipcMain.handle(IPC.scriptSave, (_e, input: unknown) => scriptManager.save(scriptInputSchema.parse(input)))
+  ipcMain.handle(IPC.scriptRemove, (_e, id: string) => scriptManager.remove(String(id)))
+  ipcMain.handle(IPC.scriptRun, (_e, id: string) => scriptManager.run(String(id)))
+  ipcMain.handle(IPC.scriptKill, (_e, id: string) => scriptManager.kill(String(id)))
+  ipcMain.handle(IPC.scriptStatus, () => scriptManager.status())
+  ipcMain.handle(IPC.scriptHistory, (_e, id: string) => scriptManager.history(String(id)))
+  ipcMain.handle(IPC.scriptProviderNeeds, () => scriptManager.providerNeeds())
 }

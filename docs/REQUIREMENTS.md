@@ -37,14 +37,11 @@ Revva is a reusable local desktop cockpit for running OpenCode sessions against 
 - **REQ-AUTO-5 — Permission boundary:** AUTO may pre-authorize only actions within an explicitly configured least-privilege policy (for example, normal edits and tests inside the selected worktree). Never auto-approve access outside selected folders, secret disclosure, destructive git/data-loss actions, force-push, or PR merge. Show any permission request that is not covered by the policy.
 - **REQ-AUTO-6 — Auditability:** keep an AUTO decision log with chosen options, inferred assumptions, reviewer outputs, checks, push/PR results, and any pause reason. AUTO completion and blockers are visible in Revva; routine progress need not interrupt the user.
 
-### AWS / Bedrock readiness (“Morning”)
+### Scripts (user one-click commands, e.g. “Morning”)
 
-- **REQ-AWS-1 — Built-in feature:** implement Morning as a first-class Revva feature. Do not require a user's `morning` shell function, `useaws.py`, custom Python environment, Terminal.app, or machine-specific proxy script.
-- **REQ-AWS-2 — Per-user configuration:** configure AWS SSO profile, SSO start URL/region as applicable, and Bedrock/AWS region in Revva. Do not bundle the current developer's organization URL, account/profile names, role names, or credentials.
-- **REQ-AWS-3 — Login lifecycle:** start AWS SSO login from the UI, show progress/errors and open the browser when the AWS CLI requests it, then report readiness and credential expiry. Provide retry/sign-out guidance; never collect or display secrets.
-- **REQ-AWS-4 — Proxy lifecycle:** where a selected OpenCode provider needs the SigV4 proxy, start, monitor, and stop a Revva-managed local proxy with user-configurable bind/port and region. Do not start an unauthenticated network listener; default to loopback only.
-- **REQ-AWS-5 — Optional integration:** AWS/Bedrock setup is optional. Non-AWS providers and general chat remain usable without AWS configuration. Gate only models that actually require unavailable AWS credentials/proxy.
-- **REQ-AWS-6 — No silent model substitution:** if a requested model cannot run, explain why and let the user choose another available model.
+- **REQ-SCRIPT-1 — Opaque commands:** users add scripts (name + shell command/alias + optional cwd + interactive toggle) and run them from the sidebar with live output, kill, and history. Revva contains no AWS/SSO/proxy/SigV4 logic and never inspects what scripts do.
+- **REQ-SCRIPT-2 — No personal defaults:** ship no developer-specific aliases, commands, accounts, or ports; the Scripts list starts empty.
+- **REQ-SCRIPT-3 — Optional integration:** general chat and non-loopback providers work with an empty Scripts list. Gate only providers whose configured baseURL is a loopback endpoint that is not currently listening; explain the gray-out and let the user pick another model (no silent substitution).
 
 ### Ticket pipeline and delivery
 
@@ -81,7 +78,7 @@ Required to use Revva:
 Optional, feature-specific:
 
 - Jira Cloud account + Atlassian MCP OAuth authorization (or explicitly configured Jira REST/API-token fallback) for sprint board, comments, and transitions.
-- AWS CLI v2 + a locally configured AWS IAM Identity Center/SSO profile for the initial built-in Morning implementation; AWS account access to the desired Bedrock models. The app orchestrates the login and proxy; users do not install or run Revva-specific scripts.
+- (Optional) Whatever external tooling a user's scripts need — e.g. AWS CLI v2 and an SSO profile if their `morning` script uses them. Revva itself has no AWS prerequisites; scripts are opaque commands.
 - GitHub CLI authenticated to GitHub for PR creation; `gh-stack` extension for stacked PR conveniences. Without these, coding/review still works and the ship panel explains what's missing.
 - Skills are discovered from OpenCode. Missing optional skills are surfaced in setup and can be installed by the user; Revva must not assume this developer's `~/.agents/skills` directory.
 
@@ -93,5 +90,5 @@ Optional, feature-specific:
 - A user can choose different configured agents/models for implementation and each review role, either from defaults or as per-run overrides; the review subagents still run concurrently and read-only.
 - New visual features use existing shadcn/ui components where suitable; custom primitives are introduced only with a documented reason.
 - AUTO can complete an eligible run through PR creation without routine user prompts; a simulated ambiguous/security-sensitive question pauses safely, and no run merges a PR.
-- An AWS user can configure their own SSO profile and start Morning from Revva; no developer-specific AWS URL/account/profile is present in shipped code or defaults.
+- A user can add their own `morning`-style script (alias or pasted commands) and run it from the sidebar with live output; no developer-specific commands or accounts are shipped in code or defaults.
 - Missing optional integrations degrade independently and are explained in the UI rather than preventing app startup.
