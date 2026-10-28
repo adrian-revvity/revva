@@ -19,6 +19,6 @@
 
 - Every user-visible change gets a bullet under `## [Unreleased]` in `CHANGELOG.md` **in the same change** — not at release time, when the detail is gone.
 - Do **not** bump `package.json` version yourself; releases are the owner's call.
-- To ship (from a clean `main`): `pnpm release:patch|minor|major`. It bumps the version, seals `[Unreleased]`, commits, tags `vX.Y.Z`, pushes — GitHub Actions then builds the mac DMG/ZIP and publishes them at Releases with the matching changelog section as notes.
+- To ship (from a clean `main`): `pnpm release:patch|minor|major`. It bumps the version, seals `[Unreleased]`, commits, tags `vX.Y.Z`, pushes — GitHub Actions then builds the mac DMG/ZIP + Windows NSIS/ZIP and publishes them at Releases with the matching changelog section as notes.
 - Semver: patch = fixes; minor = features (this app is 0.x — treat features as minor); major = reserve.
 - Builds are unsigned for now (no Developer ID identity); document the right-click → Open caveat rather than "fixing" it by hacking entitlements.
