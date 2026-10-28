@@ -446,7 +446,9 @@ export const pendingItemSchema = z.object({
   action: z.string().optional(),
   resources: z.array(z.string()).optional(),
   /** open-ended defaults on fields are preserved verbatim */
-  rawFields: z.unknown().optional()
+  rawFields: z.unknown().optional(),
+  /** Tail of the agent's last message before it blocked (card preview). */
+  lastMessage: z.string().optional()
 })
 export type PendingItem = z.infer<typeof pendingItemSchema>
 
@@ -538,6 +540,7 @@ export interface RevvaApi {
   }
   workspace: {
     list(): Promise<Workspace[]>
+    repositories(id: string): Promise<{ paths: string[]; incomplete: boolean }>
     add(path: string): Promise<Workspace>
     remove(id: string): Promise<void>
     pickFolder(): Promise<string | null>
@@ -564,6 +567,7 @@ export interface RevvaApi {
   }
   session: {
     model(sessionId: string): Promise<(ModelRef & { variant?: string }) | null>
+    contextUsage(sessionId: string): Promise<{ tokens: number; limit?: number; providerID: string; modelID: string } | null>
     active(): Promise<string[]>
     /** Messages waiting in OpenCode's inbox for this session. */
     queue(sessionId: string): Promise<QueuedMessage[]>

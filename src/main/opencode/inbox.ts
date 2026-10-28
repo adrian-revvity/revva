@@ -97,6 +97,9 @@ class InboxManager {
     }
     this.pending = fresh
     this.push()
+    // Preview tails are fetched after the snapshot is up (resync runs on every
+    // connect; message.list per session would slow the initial paint otherwise).
+    for (const [key, item] of fresh) this.attachLastMessage(key, item.sessionID)
   }
 
   private knownSessions(): string[] {
@@ -130,6 +133,30 @@ class InboxManager {
     return sessionID
   }
 
+  /**
+   * Tail of the agent's last assistant message, so an inbox card says what the
+   * agent was doing when it blocked — without opening the chat. Best-effort.
+   */
+  private async lastMessage(sessionID: string): Promise<string | undefined> {
+    try {
+      const res = await openCodeService.api.message.list({ sessionID, order: 'desc', limit: 20 })
+      for (const m of res.data) {
+        if (m.type !== 'assistant') continue
+        let text = ''
+        for (const part of m.content ?? []) {
+          const p = part as Record<string, unknown>
+          if (p.type === 'text' && typeof p.text === 'string') text += p.text
+        }
+        const clean = text.trim().replace(/\s+/g, ' ')
+        if (!clean) continue
+        return clean.length > 280 ? `…${clean.slice(-280)}` : clean
+      }
+    } catch {
+      /* transcript unavailable — card renders without the preview */
+    }
+    return undefined
+  }
+
   private onEvent(e: RawEvent): void {
     const data = (e.data ?? {}) as Record<string, unknown>
     switch (e.type) {
@@ -149,6 +176,7 @@ class InboxManager {
         this.markSessionWaiting(form.sessionID)
         this.notify(this.pending.get(`form:${form.id}`)!)
         this.push()
+        this.attachLastMessage(`form:${form.id}`, form.sessionID)
         break
       }
       case 'form.replied':
@@ -174,6 +202,7 @@ class InboxManager {
         this.markSessionWaiting(req.sessionID)
         this.notify(this.pending.get(`perm:${req.id}`)!)
         this.push()
+        this.attachLastMessage(`perm:${req.id}`, req.sessionID)
         break
       }
       case 'permission.replied': {
@@ -182,6 +211,16 @@ class InboxManager {
         break
       }
     }
+  }
+
+  /** Async tail-fetch after the item is already shown; pushes an updated snapshot. */
+  private attachLastMessage(key: string, sessionID: string): void {
+    void this.lastMessage(sessionID).then((text) => {
+      const item = this.pending.get(key)
+      if (!item || !text) return
+      item.lastMessage = text
+      this.push()
+    })
   }
 
   private isKnown(sessionID: string): boolean {

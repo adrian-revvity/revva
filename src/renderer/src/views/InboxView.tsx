@@ -90,6 +90,7 @@ export function FormCard({ item }: { item: PendingItem }): React.JSX.Element {
         <div className="min-w-0 flex-1">
           <div className="text-sm font-medium">{item.title}</div>
           <OwnerLine item={item} />
+          <LastMessageLine item={item} />
         </div>
         <Badge variant="secondary" className="text-[10px]">question</Badge>
       </div>
@@ -217,6 +218,7 @@ export function PermissionCard({ item }: { item: PendingItem }): React.JSX.Eleme
               {item.resources.length > 3 ? ` +${item.resources.length - 3}` : ''}
             </p>
           )}
+          <LastMessageLine item={item} />
         </div>
         <Badge variant="outline" className="border-amber-500/40 text-[10px]">permission</Badge>
       </div>
@@ -242,6 +244,16 @@ function OwnerLine({ item }: { item: PendingItem }): React.JSX.Element {
       <Separator orientation="vertical" className="h-3" />
       <FolderOpen className="size-3" />
       <span className="truncate font-mono">{item.directory}</span>
+    </p>
+  )
+}
+
+/** What the agent was saying when it blocked — tail of its last message. */
+function LastMessageLine({ item }: { item: PendingItem }): React.JSX.Element | null {
+  if (!item.lastMessage) return null
+  return (
+    <p className="mt-2 line-clamp-3 border-l-2 border-muted-foreground/30 pl-2 text-[11px] italic leading-relaxed text-muted-foreground">
+      {item.lastMessage}
     </p>
   )
 }

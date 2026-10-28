@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { existsSync } from 'node:fs'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, realpath } from 'node:fs/promises'
 import { join, basename } from 'node:path'
 import { BrowserWindow } from 'electron'
 import { openCodeService, describeError } from '../opencode/service'
@@ -115,6 +115,9 @@ class WorkManager {
       const parent = getDb().prepare('SELECT * FROM work WHERE id = ?').get(input.parentWorkId) as WorkRow | undefined
       if (!parent) throw new Error('Parent work not found.')
       if (!existsSync(parent.worktree_dir)) throw new Error(`Parent worktree is gone: ${parent.worktree_dir}`)
+      if (await realpath(parent.repo_dir) !== await realpath(input.repoDir)) {
+        throw new Error('Parent work belongs to a different repository. Choose a parent from this repository.')
+      }
       baseRef = parent.branch
     }
 
@@ -237,10 +240,10 @@ class WorkManager {
     }
 
     // Lazy fetch: only hit the network when the requested base isn't already local.
-    let base = baseRef ?? (await defaultBranch(repoDir))
+    const base = baseRef ?? (await defaultBranch(repoDir))
     if (!(await refExists(repoDir, base))) {
       await exec('git', ['-C', repoDir, 'fetch', '--all', '--prune'], { timeout: 120_000 }).catch(() => undefined)
-      if (!(await refExists(repoDir, base))) base = await defaultBranch(repoDir)
+      if (!(await refExists(repoDir, base))) throw new Error(`Base branch ${base} was not found in ${repoDir}.`)
     }
 
     await mkdir(root, { recursive: true }).catch(() => undefined)
@@ -416,17 +419,17 @@ async function refExists(repoDir: string, ref: string): Promise<boolean> {
 }
 
 async function defaultBranch(repoDir: string): Promise<string> {
-  const candidates = ['origin/HEAD', 'origin/main', 'origin/master', 'main', 'master']
+  const candidates = ['origin/HEAD', 'origin/main', 'origin/master', 'main', 'master', 'HEAD']
   for (const ref of candidates) {
     try {
       await exec('git', ['-C', repoDir, 'rev-parse', '--verify', '--quiet', ref])
-      return ref.replace('origin/', '')
+      return ref
     } catch {
       /* try next */
     }
   }
   throw new Error(
-    `No usable base branch in ${repoDir} (no main/master, no commits?). Commit something or pick another repository.`
+    `No usable base commit in ${repoDir}. Choose a Git repository with at least one commit.`
   )
 }
 

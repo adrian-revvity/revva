@@ -21,6 +21,7 @@ import { shipManager } from './ship'
 import { scriptManager } from './scripts'
 import { githubManager } from './github'
 import { startTicketSession } from './tasks'
+import { discoverRepositories } from './repositories'
 import { parsePrRef } from '@shared/pr-ref'
 import { getDb, settingGet, settingSet, roleConfigList, roleConfigSet, favoriteModels, toggleFavoriteModel } from './db'
 import {
@@ -92,6 +93,12 @@ export function registerIpc(): void {
     }>
     return rows.map((r) => ({ id: r.id, path: r.path, defaultBaseBranch: r.default_base_branch ?? undefined }) satisfies Workspace)
   })
+  ipcMain.handle(IPC.workspaceRepositories, async (_e, id: unknown) => {
+    if (typeof id !== 'string') throw new Error('Invalid workspace.')
+    const row = getDb().prepare('SELECT path FROM workspace WHERE id = ?').get(id) as { path: string } | undefined
+    if (!row) throw new Error('Workspace not found. Refresh Setup and try again.')
+    return discoverRepositories(row.path)
+  })
   ipcMain.handle(IPC.workspaceAdd, (_e, path: string) => {
     const resolved = path.trim()
     const isDir = (() => {
@@ -156,6 +163,27 @@ export function registerIpc(): void {
   ipcMain.handle(IPC.sessionModel, async (_e, sessionId: string) => {
     const session = await openCodeService.api.session.get({ sessionID: String(sessionId) })
     return session.model ?? null
+  })
+  ipcMain.handle(IPC.sessionContextUsage, async (_e, sessionId: string) => {
+    const api = openCodeService.api
+    const [messages, session] = await Promise.all([
+      api.session.context({ sessionID: String(sessionId) }),
+      api.session.get({ sessionID: String(sessionId) })
+    ])
+    // Context excludes history before compaction. Use the last reported response,
+    // not a sum of usage across turns.
+    const boundary = session.revert?.messageID
+    const end = boundary ? messages.findIndex((message) => message.id === boundary) : messages.length
+    if (end < 0) return null
+    const last = messages.slice(0, end).findLast((message) => message.type === 'assistant' && message.tokens !== undefined)
+    if (!last || last.type !== 'assistant' || !last.tokens) return null
+    const usage = last.tokens
+    const tokens = usage.input + usage.output + usage.reasoning + usage.cache.read + usage.cache.write
+    if (!Number.isFinite(tokens) || tokens <= 0) return null
+    const models = await api.model.list({ location: { directory: session.location.directory } }).catch(() => undefined)
+    const model = models?.data.find((m) => m.providerID === last.model.providerID && (m.id === last.model.id || m.modelID === last.model.id))
+    const limit = model?.limit?.context
+    return { tokens, limit: limit && limit > 0 ? limit : undefined, providerID: last.model.providerID, modelID: last.model.id }
   })
   ipcMain.handle(IPC.sessionActive, async () => Object.keys(await openCodeService.api.session.active()))
   ipcMain.handle(IPC.sessionQueue, (_e, sessionId: string) => chatManager.queue(String(sessionId)))

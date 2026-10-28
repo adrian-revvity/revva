@@ -7,7 +7,13 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 ## [Unreleased]
 
-- (nothing yet)
+- **Conversation scrolling** — switching conversations opens the transcript at the latest messages.
+- **`/new` chat command** — type `/new` in a chat composer (or pick it from the `/` menu) to start a fresh session with the same directory, agent, model, and ticket/PR links; a context reset that keeps the old chat in the sidebar.
+- **Conversation context** — chats and work transcripts show the last reported token usage, model context limit, and percentage used when available.
+- **Workspace repositories** — choose a repository discovered within a workspace when starting Jira work, with suggestions based on ticket history and names.
+- **PR status in the GitHub tab** — each PR shows whether it is merged, approved, changes-requested, or awaiting review, plus a "new comment" flag (with author and age) when someone commented since you last looked. "Mine" also lists recently merged PRs.
+- **Unread chats** — a sidebar chat whose run finished while you weren't looking swaps its icon for a dot; opening the chat clears it.
+- **Inbox context** — pending question and permission cards quote the tail of the agent's last message, so you can answer without opening the chat first.
 
 ## [0.2.0] - 2026-10-28
 

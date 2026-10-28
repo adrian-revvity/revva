@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowUp, ChevronRight, ImageIcon, Square, X } from 'lucide-react'
 import ReactMarkdown, { type Components } from 'react-markdown'
@@ -109,7 +109,8 @@ export function TranscriptView({
   drive,
   header,
   emptyHint,
-  readOnly
+  readOnly,
+  onNewSession
 }: {
   sessionId: string
   drive: TranscriptDrive
@@ -117,6 +118,8 @@ export function TranscriptView({
   emptyHint: string
   /** Hides the composer (reviewer sessions are read-only). */
   readOnly?: boolean
+  /** When set, sending exactly `/new` calls this instead (chats: fresh session, same settings). */
+  onNewSession?: () => void
 }): React.JSX.Element {
   const qc = useQueryClient()
   const messages = useQuery({
@@ -157,7 +160,20 @@ export function TranscriptView({
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
+  const positionedSessionRef = useRef<string | null>(null)
   const running = streamingText !== null
+  const contextUsage = useQuery({
+    queryKey: ['session-context-usage', sessionId],
+    queryFn: () => window.revva.session.contextUsage(sessionId),
+    refetchInterval: running ? 30_000 : false
+  })
+  const usage = contextUsage.data
+  const usageText = usage
+    ? `${usage.tokens.toLocaleString()}${usage.limit ? ` / ${usage.limit.toLocaleString()} tokens · ${Math.round(usage.tokens / usage.limit * 100)}% used` : ' tokens · limit unavailable'}`
+    : contextUsage.isPending ? 'Loading…' : 'Not yet available'
+  const usageDescription = usage
+    ? `Last reported response for ${usage.providerID}/${usage.modelID}. Includes input, output, reasoning and cached tokens; the next request may differ.`
+    : 'Usage is available after the model reports token counts.'
 
   const skills = useQuery({
     queryKey: ['skills'],
@@ -178,7 +194,30 @@ export function TranscriptView({
     staleTime: 30_000
   })
   const fileMatches: FileHit[] = fileHits.data ?? []
-  const menuItems = token?.kind === 'skill' ? skillMatches.length : fileMatches.length
+  /** One row in the autocomplete menu; `run` items fire an action instead of inserting. */
+  interface MenuItem {
+    key: string
+    insert: string
+    hint?: string
+    run?: () => void
+  }
+  const menuList: MenuItem[] = useMemo(() => {
+    if (!token) return []
+    if (token.kind === 'file') {
+      return fileMatches.map((f) => ({
+        key: f.path,
+        insert: `@${f.path}${f.type === 'directory' ? '/' : ''}`
+      }))
+    }
+    const items: MenuItem[] = []
+    const q = token.query.toLowerCase()
+    if (onNewSession && 'new'.startsWith(q)) {
+      items.push({ key: '__new', insert: '/new', hint: 'New session, same settings (fresh context)', run: onNewSession })
+    }
+    for (const s of skillMatches) items.push({ key: s.id, insert: `/${s.id}`, hint: s.description })
+    return items.slice(0, 9)
+  }, [token, skillMatches, fileMatches, onNewSession])
+  const menuItems = menuList.length
 
   useEffect(() => {
     setStreamingText(null)
@@ -194,6 +233,7 @@ export function TranscriptView({
         void qc.invalidateQueries({ queryKey: [...drive.queryKey, sessionId] })
         void qc.invalidateQueries({ queryKey: ['session-queue', sessionId] })
         void qc.invalidateQueries({ queryKey: ['session-model', sessionId] })
+        void qc.invalidateQueries({ queryKey: ['session-context-usage', sessionId] })
       }
     )
   }, [sessionId, drive, qc])
@@ -207,8 +247,21 @@ export function TranscriptView({
       if (event.kind === 'session.model' && event.sessionId === sessionId) {
         void qc.invalidateQueries({ queryKey: ['session-model', sessionId] })
       }
+      if (event.kind === 'session.activity' && event.sessionId === sessionId && !event.running) {
+        void qc.invalidateQueries({ queryKey: ['session-context-usage', sessionId] })
+      }
     })
   }, [sessionId, qc])
+
+  useLayoutEffect(() => {
+    positionedSessionRef.current = null
+  }, [sessionId])
+
+  useLayoutEffect(() => {
+    if (!messages.data || positionedSessionRef.current === sessionId) return
+    bottomRef.current?.scrollIntoView({ behavior: 'instant', block: 'end' })
+    positionedSessionRef.current = sessionId
+  }, [sessionId, messages.data])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
@@ -241,10 +294,28 @@ export function TranscriptView({
     })
   }
 
+  /** Accept the highlighted menu row: fire its action or insert its token. */
+  const pickMenu = (item: MenuItem): void => {
+    if (item.run) {
+      qc.setQueryData(draftKey, '')
+      setToken(null)
+      item.run()
+    } else {
+      acceptToken(item.insert)
+    }
+  }
+
   const send = useMutation({
     mutationFn: async () => {
       const text = input.trim()
       const images = pendingImages
+      // '/new' on its own is a command, not a message.
+      if (text === '/new' && images.length === 0 && onNewSession) {
+        qc.setQueryData(draftKey, '')
+        setToken(null)
+        onNewSession()
+        return
+      }
       if (!text && images.length === 0) return
       const refs = extractRefs(text, skills.data ?? [])
       qc.setQueryData(draftKey, '')
@@ -298,6 +369,9 @@ export function TranscriptView({
           <span className="truncate">Model: {modelLabel}</span>
         </Badge>
       </div>
+      <div className="shrink-0 border-b px-4 py-1 text-xs text-muted-foreground" title={usageDescription}>
+        <span>Context (last response): {contextUsage.isError ? 'Unavailable' : usageText}</span>
+      </div>
 
       <ScrollArea className="min-h-0 flex-1">
         <div className="mx-auto flex max-w-3xl flex-col gap-4 px-6 py-5">
@@ -350,31 +424,21 @@ export function TranscriptView({
               {token && menuItems > 0 && (
                 <div className="absolute bottom-full left-0 z-10 mb-2 flex w-80 flex-col overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-md">
                   <div className="border-b px-2.5 py-1 text-[10px] text-muted-foreground">
-                    {token.kind === 'skill' ? 'Skills — Enter/Tab to insert' : 'Files — Enter/Tab to insert'}
+                    {token.kind === 'skill' ? 'Commands — Enter/Tab to insert' : 'Files — Enter/Tab to insert'}
                   </div>
-                  {(token.kind === 'skill' ? skillMatches : fileMatches).map((item, i) => (
+                  {menuList.map((item, i) => (
                     <button
-                      key={token.kind === 'skill' ? (item as SkillInfo).id : (item as FileHit).path}
+                      key={item.key}
                       type="button"
                       onMouseDown={(e) => e.preventDefault()}
-                      onClick={() =>
-                        acceptToken(
-                          token.kind === 'skill'
-                            ? `/${(item as SkillInfo).id}`
-                            : `@${(item as FileHit).path}${(item as FileHit).type === 'directory' ? '/' : ''}`
-                        )
-                      }
+                      onClick={() => pickMenu(item)}
                       className={cn(
                         'flex items-baseline gap-2 px-2.5 py-1.5 text-left text-xs',
                         i === tokenIndex && 'bg-muted'
                       )}
                     >
-                      <span className="shrink-0 font-mono font-medium">
-                        {token.kind === 'skill' ? `/${(item as SkillInfo).id}` : `@${(item as FileHit).path}`}
-                      </span>
-                      {token.kind === 'skill' && (item as SkillInfo).description && (
-                        <span className="truncate text-muted-foreground">{(item as SkillInfo).description}</span>
-                      )}
+                      <span className="shrink-0 font-mono font-medium">{item.insert}</span>
+                      {item.hint && <span className="truncate text-muted-foreground">{item.hint}</span>}
                     </button>
                   ))}
                 </div>
@@ -418,11 +482,8 @@ export function TranscriptView({
                     }
                     if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
                       e.preventDefault()
-                      const pick =
-                        token.kind === 'skill'
-                          ? `/${skillMatches[tokenIndex]?.id ?? skillMatches[tokenIndex]?.name ?? ''}`
-                          : `@${fileMatches[tokenIndex]?.path ?? ''}`
-                      acceptToken(pick)
+                      const pick = menuList[tokenIndex]
+                      if (pick) pickMenu(pick)
                       return
                     }
                     if (e.key === 'Escape') {
@@ -682,14 +743,34 @@ export const chatDrive: TranscriptDrive = {
     })
 }
 
-export function ChatView({ sessionId }: { sessionId: string }): React.JSX.Element {
+export function ChatView({ sessionId, onOpenChat }: { sessionId: string; onOpenChat?: (sessionId: string) => void }): React.JSX.Element {
+  const qc = useQueryClient()
   const chats = useQuery({ queryKey: ['chats'], queryFn: () => window.revva.chat.list() })
   const chat = chats.data?.find((c) => c.sessionId === sessionId)
+  /** `/new` — fresh context: a new session with this chat's directory/agent/model/links. */
+  const newSession = (): void => {
+    if (!chat || !onOpenChat) return
+    void window.revva.chat
+      .create({
+        directory: chat.directory,
+        title: chat.title,
+        agentID: chat.agentID,
+        model: chat.providerID && chat.modelID ? { providerID: chat.providerID, id: chat.modelID } : undefined,
+        ticketKey: chat.ticketKey,
+        prUrl: chat.prUrl
+      })
+      .then((created) => {
+        void qc.invalidateQueries({ queryKey: ['chats'] })
+        onOpenChat(created.sessionId)
+      })
+      .catch((err) => console.error('[chat] /new failed:', err))
+  }
   return (
     <TranscriptView
       sessionId={sessionId}
       drive={chatDrive}
       emptyHint="Ask anything about this project — this chat is not attached to a ticket."
+      onNewSession={onOpenChat && chat ? newSession : undefined}
       header={
         <>
           <span className="truncate text-[13px] font-medium">{chat?.title ?? 'Chat'}</span>

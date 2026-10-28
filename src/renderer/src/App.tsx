@@ -369,7 +369,7 @@ export default function App(): React.JSX.Element {
             <div className="p-8 text-sm text-muted-foreground">Loading work…</div>
           )
         ) : (
-          <ChatView key={view.sessionId} sessionId={view.sessionId} />
+          <ChatView key={view.sessionId} sessionId={view.sessionId} onOpenChat={(sessionId) => setView({ kind: 'chat', sessionId })} />
         )}
       </main>
 

@@ -18,6 +18,7 @@ const api: RevvaApi = {
   },
   workspace: {
     list: () => ipcRenderer.invoke(IPC.workspaceList),
+    repositories: (id) => ipcRenderer.invoke(IPC.workspaceRepositories, id),
     add: (path) => ipcRenderer.invoke(IPC.workspaceAdd, path),
     remove: (id) => ipcRenderer.invoke(IPC.workspaceRemove, id),
     pickFolder: () => ipcRenderer.invoke(IPC.dialogPickFolder)
@@ -40,6 +41,7 @@ const api: RevvaApi = {
   },
   session: {
     model: (sessionId) => ipcRenderer.invoke(IPC.sessionModel, sessionId),
+    contextUsage: (sessionId) => ipcRenderer.invoke(IPC.sessionContextUsage, sessionId),
     active: () => ipcRenderer.invoke(IPC.sessionActive),
     queue: (sessionId) => ipcRenderer.invoke(IPC.sessionQueue, sessionId),
     cancelQueued: (sessionId, inboxId) => ipcRenderer.invoke(IPC.sessionQueueCancel, sessionId, inboxId)
