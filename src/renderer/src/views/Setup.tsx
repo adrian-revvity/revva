@@ -81,6 +81,11 @@ export function SetupView(): React.JSX.Element {
         </section>
 
         <section className="space-y-2">
+          <h2 className="text-sm font-medium">Jira</h2>
+          <JiraSection />
+        </section>
+
+        <section className="space-y-2">
           <h2 className="text-sm font-medium">Project folders</h2>
           <p className="text-xs text-muted-foreground">
             Folders Revva may create sessions and worktrees in. Add repos you work on (Jira tickets attach in M1).
@@ -167,6 +172,80 @@ function InventoryRow({ label, items, loading }: { label: string; items: string[
           {items.length > 40 && <Badge variant="outline" className="text-[10px]">+{items.length - 40}</Badge>}
         </div>
       )}
+    </div>
+  )
+}
+
+function JiraSection(): React.JSX.Element {
+  const qc = useQueryClient()
+  const jira = useQuery({ queryKey: ['jira-status'], queryFn: () => window.revva.jira.status() })
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const connect = async (): Promise<void> => {
+    setBusy(true)
+    setError(null)
+    try {
+      await window.revva.jira.connect()
+      void qc.invalidateQueries({ queryKey: ['jira-status'] })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const connected = jira.data?.connected
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between rounded-lg border p-3">
+        <div className="flex items-center gap-2 text-sm">
+          {connected ? (
+            <CircleCheck className="size-4 text-emerald-600 dark:text-emerald-400" />
+          ) : jira.data?.expired ? (
+            <CircleX className="size-4 text-amber-500" />
+          ) : (
+            <CircleX className="size-4 text-muted-foreground" />
+          )}
+          <span>
+            {connected
+              ? 'Connected via Atlassian MCP (OAuth)'
+              : jira.data?.expired
+                ? 'Token expired — reconnect'
+                : 'Not connected'}
+          </span>
+        </div>
+        {connected ? (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() =>
+              void window.revva.jira
+                .disconnect()
+                .then(() => qc.invalidateQueries({ queryKey: ['jira-status'] }))
+            }
+          >
+            Disconnect
+          </Button>
+        ) : (
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => void connect()}>
+            {busy ? 'Waiting for browser…' : 'Connect'}
+          </Button>
+        )}
+      </div>
+      {connected && jira.data?.capabilities && (
+        <div className="flex flex-wrap gap-1">
+          {Object.entries(jira.data.capabilities).map(([cap, tool]) => (
+            <Badge key={cap} variant={tool ? 'secondary' : 'outline'} className="font-mono text-[10px]">
+              {tool ? `✓ ${cap}` : `✗ ${cap}`}
+            </Badge>
+          ))}
+        </div>
+      )}
+      {error && <p className="text-xs text-destructive">{error}</p>}
+      <p className="text-xs text-muted-foreground">
+        Revva registers its own OAuth client and stores tokens in the macOS Keychain (encrypted), never reading other apps' credential caches.
+      </p>
     </div>
   )
 }

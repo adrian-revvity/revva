@@ -21,5 +21,15 @@ export const IPC = {
   chatRename: 'revva:chat:rename',
   chatDelete: 'revva:chat:delete',
   dialogPickFolder: 'revva:dialog:pick-folder',
+  jiraStatus: 'revva:jira:status',
+  jiraConnect: 'revva:jira:connect',
+  jiraDisconnect: 'revva:jira:disconnect',
+  boardFetch: 'revva:board:fetch',
+  workStart: 'revva:work:start',
+  workList: 'revva:work:list',
+  workAbandon: 'revva:work:abandon',
+  workPrompt: 'revva:work:prompt',
+  workInterrupt: 'revva:work:interrupt',
+  workMessages: 'revva:work:messages',
   eventPush: 'revva:event'
 } as const

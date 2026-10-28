@@ -31,6 +31,20 @@ const api: RevvaApi = {
     rename: (sessionId, title) => ipcRenderer.invoke(IPC.chatRename, sessionId, title),
     remove: (sessionId) => ipcRenderer.invoke(IPC.chatDelete, sessionId)
   },
+  jira: {
+    status: () => ipcRenderer.invoke(IPC.jiraStatus),
+    connect: () => ipcRenderer.invoke(IPC.jiraConnect),
+    disconnect: () => ipcRenderer.invoke(IPC.jiraDisconnect),
+    board: () => ipcRenderer.invoke(IPC.boardFetch)
+  },
+  work: {
+    start: (input) => ipcRenderer.invoke(IPC.workStart, input),
+    list: () => ipcRenderer.invoke(IPC.workList),
+    abandon: (id) => ipcRenderer.invoke(IPC.workAbandon, id),
+    messages: (sessionId) => ipcRenderer.invoke(IPC.workMessages, sessionId),
+    prompt: (sessionId, text) => ipcRenderer.invoke(IPC.workPrompt, sessionId, text),
+    interrupt: (sessionId) => ipcRenderer.invoke(IPC.workInterrupt, sessionId)
+  },
   events: {
     on(handler: (event: PushEvent) => void) {
       // Payloads are validated in main before sending; zod cannot run in the preload context.

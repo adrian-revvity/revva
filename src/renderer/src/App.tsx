@@ -1,6 +1,14 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { MessageSquare, Plus, Settings, Server, RefreshCw } from 'lucide-react'
+import {
+  MessageSquare,
+  Plus,
+  Settings,
+  Server,
+  RefreshCw,
+  Kanban,
+  Hammer
+} from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
@@ -10,8 +18,14 @@ import { cn } from '@/lib/utils'
 import { SetupView } from '@/views/Setup'
 import { ChatView } from '@/views/Chat'
 import { NewChatDialog } from '@/views/NewChatDialog'
+import { BoardView } from '@/views/BoardView'
+import { WorkCockpit } from '@/views/WorkCockpit'
 
-type View = { kind: 'chat'; sessionId: string } | { kind: 'setup' }
+type View =
+  | { kind: 'chat'; sessionId: string }
+  | { kind: 'setup' }
+  | { kind: 'board' }
+  | { kind: 'work'; workId: string }
 
 const serviceStateLabels = {
   connecting: { label: 'Connecting…', cls: 'text-muted-foreground' },
@@ -22,7 +36,7 @@ const serviceStateLabels = {
 
 export default function App(): React.JSX.Element {
   const qc = useQueryClient()
-  const [view, setView] = useState<View>({ kind: 'setup' })
+  const [view, setView] = useState<View>({ kind: 'board' })
   const [newChatOpen, setNewChatOpen] = useState(false)
 
   const status = useQuery({
@@ -31,6 +45,7 @@ export default function App(): React.JSX.Element {
     refetchInterval: 10_000
   })
   const chats = useQuery({ queryKey: ['chats'], queryFn: () => window.revva.chat.list() })
+  const works = useQuery({ queryKey: ['works'], queryFn: () => window.revva.work.list() })
 
   useEffect(() => {
     return window.revva.events.on((event) => {
@@ -38,25 +53,19 @@ export default function App(): React.JSX.Element {
         qc.setQueryData(['service-status'], event.status)
         if (event.status.state === 'connected') void chats.refetch()
       }
-      if (event.kind === 'chat.idle' || event.kind === 'chat.message') {
-        void chats.refetch()
-        void qc.invalidateQueries({ queryKey: ['chat-messages', event.kind === 'chat.message' ? event.sessionId : ''] })
-      }
+      if (event.kind === 'chat.idle' || event.kind === 'chat.message') void chats.refetch()
+      if (event.kind === 'work.updated') void works.refetch()
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [qc])
 
-  // First launch: once connected and no chats exist, offer New Chat via setup CTA; if chats exist open the latest.
-  useEffect(() => {
-    if (view.kind === 'setup' && status.data?.state === 'connected' && (chats.data?.length ?? 0) > 0) {
-      const last = chats.data![0]!
-      setView({ kind: 'chat', sessionId: last.sessionId })
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status.data?.state, chats.data?.length])
-
   const st = status.data
   const stateInfo = serviceStateLabels[st?.state ?? 'connecting']
+  const activeWork =
+    view.kind === 'work' ? works.data?.find((w) => w.id === view.workId) : undefined
+  const runningWorks = (works.data ?? []).filter(
+    (w) => w.state === 'BUILDING' || w.state === 'REVIEW' || w.state === 'WAITING_HUMAN'
+  )
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -64,8 +73,39 @@ export default function App(): React.JSX.Element {
         <div className="drag-region flex h-11 items-center px-3 pl-20">
           <span className="text-[13px] font-semibold tracking-wide">revva</span>
         </div>
+
+        <div className="space-y-0.5 px-2">
+          <NavButton
+            icon={<Kanban className="size-4" />}
+            label="Board"
+            active={view.kind === 'board'}
+            onClick={() => setView({ kind: 'board' })}
+          />
+          {runningWorks.map((w) => (
+            <NavButton
+              key={w.id}
+              icon={
+                <Hammer
+                  className={cn('size-4', w.state === 'BUILDING' && 'animate-pulse text-sky-500')}
+                />
+              }
+              label={w.ticketKey}
+              sublabel={w.state}
+              active={view.kind === 'work' && view.workId === w.id}
+              onClick={() => setView({ kind: 'work', workId: w.id })}
+            />
+          ))}
+        </div>
+
+        <Separator className="my-2" />
+
         <div className="px-3 pb-2">
-          <Button size="sm" className="w-full justify-start gap-2" onClick={() => setNewChatOpen(true)} disabled={st?.state !== 'connected'}>
+          <Button
+            size="sm"
+            className="w-full justify-start gap-2"
+            onClick={() => setNewChatOpen(true)}
+            disabled={st?.state !== 'connected'}
+          >
             <Plus className="size-4" /> New chat
           </Button>
         </div>
@@ -75,19 +115,16 @@ export default function App(): React.JSX.Element {
         <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
           {chats.isLoading && <Skeleton className="mx-1 h-8" />}
           {chats.data?.map((c) => (
-            <button
+            <NavButton
               key={c.sessionId}
+              icon={<MessageSquare className="size-4 shrink-0 text-muted-foreground" />}
+              label={c.title}
+              active={view.kind === 'chat' && view.sessionId === c.sessionId}
               onClick={() => setView({ kind: 'chat', sessionId: c.sessionId })}
-              className={cn(
-                'flex w-full items-center gap-2 truncate rounded-md px-2 py-1.5 text-left text-[13px] hover:bg-sidebar-accent',
-                view.kind === 'chat' && view.sessionId === c.sessionId && 'bg-sidebar-accent font-medium'
-              )}
-            >
-              <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />
-              <span className="truncate">{c.title}</span>
-            </button>
+            />
           ))}
         </div>
+
         <Separator />
         <div className="flex items-center justify-between px-3 py-2">
           <Tooltip>
@@ -135,14 +172,31 @@ export default function App(): React.JSX.Element {
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col">
-        <div className="drag-region flex h-11 shrink-0 items-center justify-end border-b px-3">
+        <div className="drag-region flex h-11 shrink-0 items-center justify-end gap-2 border-b px-3">
+          {works.data?.some((w) => w.state === 'BUILDING') && (
+            <Badge variant="outline" className="no-drag animate-pulse font-normal">
+              building…
+            </Badge>
+          )}
           {st?.state === 'connected' && (
             <Badge variant="outline" className="no-drag font-normal">
               opencode v{st.version}
             </Badge>
           )}
         </div>
-        {view.kind === 'setup' ? <SetupView /> : <ChatView key={view.sessionId} sessionId={view.sessionId} />}
+        {view.kind === 'setup' ? (
+          <SetupView />
+        ) : view.kind === 'board' ? (
+          <BoardView works={works.data ?? []} onStart={(workId) => setView({ kind: 'work', workId })} />
+        ) : view.kind === 'work' ? (
+          activeWork ? (
+            <WorkCockpit key={activeWork.sessionId ?? activeWork.id} work={activeWork} />
+          ) : (
+            <div className="p-8 text-sm text-muted-foreground">Loading work…</div>
+          )
+        ) : (
+          <ChatView key={view.sessionId} sessionId={view.sessionId} />
+        )}
       </main>
 
       <NewChatDialog
@@ -151,5 +205,33 @@ export default function App(): React.JSX.Element {
         onCreated={(sessionId) => setView({ kind: 'chat', sessionId })}
       />
     </div>
+  )
+}
+
+function NavButton({
+  icon,
+  label,
+  sublabel,
+  active,
+  onClick
+}: {
+  icon: React.ReactNode
+  label: string
+  sublabel?: string
+  active: boolean
+  onClick: () => void
+}): React.JSX.Element {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        'flex w-full items-center gap-2 truncate rounded-md px-2 py-1.5 text-left text-[13px] hover:bg-sidebar-accent',
+        active && 'bg-sidebar-accent font-medium'
+      )}
+    >
+      {icon}
+      <span className="truncate">{label}</span>
+      {sublabel && <span className="ml-auto text-[10px] text-muted-foreground">{sublabel}</span>}
+    </button>
   )
 }

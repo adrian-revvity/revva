@@ -103,6 +103,69 @@ export const chatMessageSchema = z.object({
 })
 export type ChatMessage = z.infer<typeof chatMessageSchema>
 
+/* ---------- Jira board / works ---------- */
+
+export const ticketSchema = z.object({
+  key: z.string(),
+  id: z.string(),
+  summary: z.string(),
+  status: z.string(),
+  statusCategory: z.string(),
+  storyPoints: z.number().optional(),
+  issueTypeName: z.string().optional(),
+  dependsOn: z.array(z.string()),
+  url: z.string().optional()
+})
+export type Ticket = z.infer<typeof ticketSchema>
+
+export const jiraStatusSchema = z.object({
+  connected: z.boolean(),
+  expired: z.boolean(),
+  expiresAt: z.number().optional(),
+  capabilities: z.record(z.string(), z.string().nullish()).optional()
+})
+export type JiraStatus = z.infer<typeof jiraStatusSchema>
+
+export const workModeSchema = z.enum(['interactive', 'auto'])
+export type WorkMode = z.infer<typeof workModeSchema>
+
+export const workStateSchema = z.enum([
+  'READY',
+  'BUILDING',
+  'REVIEW',
+  'APPROVED',
+  'WAITING_HUMAN',
+  'SHIPPED',
+  'ABANDONED'
+])
+export type WorkState = z.infer<typeof workStateSchema>
+
+export const workSummarySchema = z.object({
+  id: z.string(),
+  ticketKey: z.string(),
+  ticketSummary: z.string(),
+  repoDir: z.string(),
+  branch: z.string(),
+  worktreeDir: z.string(),
+  parentWorkId: z.string().optional(),
+  mode: workModeSchema,
+  state: workStateSchema,
+  sessionId: z.string().optional(),
+  updatedAt: z.number()
+})
+export type WorkSummary = z.infer<typeof workSummarySchema>
+
+export const startWorkInputSchema = z.object({
+  ticketKey: z.string().min(1),
+  repoDir: z.string().min(1),
+  mode: workModeSchema.default('interactive'),
+  agentID: z.string().optional(),
+  model: modelRefSchema.optional(),
+  parentWorkId: z.string().optional(),
+  grill: z.boolean().default(false)
+})
+export type StartWorkInput = z.infer<typeof startWorkInputSchema>
+
 /* ---------- Events pushed main → renderer ---------- */
 
 export const pushEventSchema = z.discriminatedUnion('kind', [
@@ -110,7 +173,9 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('chat.delta'), sessionId: z.string(), messageId: z.string(), text: z.string() }),
   z.object({ kind: z.literal('chat.message'), sessionId: z.string(), message: chatMessageSchema }),
   z.object({ kind: z.literal('chat.idle'), sessionId: z.string() }),
-  z.object({ kind: z.literal('chat.tool'), sessionId: z.string(), tool: z.string(), state: z.string() })
+  z.object({ kind: z.literal('chat.tool'), sessionId: z.string(), tool: z.string(), state: z.string() }),
+  z.object({ kind: z.literal('work.updated'), workId: z.string(), state: workStateSchema }),
+  z.object({ kind: z.literal('work.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() })
 ])
 export type PushEvent = z.infer<typeof pushEventSchema>
 
@@ -144,6 +209,20 @@ export interface RevvaApi {
     interrupt(sessionId: string): Promise<void>
     rename(sessionId: string, title: string): Promise<void>
     remove(sessionId: string): Promise<void>
+  }
+  jira: {
+    status(): Promise<JiraStatus>
+    connect(): Promise<{ connected: boolean; expired: boolean; expiresAt?: number }>
+    disconnect(): Promise<{ connected: boolean; expired: boolean; expiresAt?: number }>
+    board(): Promise<Ticket[]>
+  }
+  work: {
+    start(input: StartWorkInput): Promise<WorkSummary>
+    list(): Promise<WorkSummary[]>
+    abandon(id: string): Promise<void>
+    messages(sessionId: string): Promise<ChatMessage[]>
+    prompt(sessionId: string, text: string): Promise<void>
+    interrupt(sessionId: string): Promise<void>
   }
   events: {
     /** Subscribe to main-process pushes; returns unsubscribe. */

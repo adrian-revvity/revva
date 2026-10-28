@@ -8,7 +8,12 @@ import { IPC, settingsKeySchema, chatCreateInputSchema, type Workspace } from '@
 import { openCodeService } from './opencode/service'
 import { chatManager } from './opencode/chats'
 import { listAgents, listModels, listSkills } from './opencode/inventory'
+import { jiraAuth } from './jira/auth'
+import { jiraMcp } from './jira/mcp'
+import { fetchBoard } from './jira/board'
+import { workManager } from './pipeline/works'
 import { getDb, settingGet, settingSet } from './db'
+import { startWorkInputSchema } from '@shared/types'
 
 export function registerIpc(): void {
   /* ---------- service ---------- */
@@ -82,4 +87,29 @@ export function registerIpc(): void {
   ipcMain.handle(IPC.chatInterrupt, (_e, sessionId: string) => chatManager.interrupt(String(sessionId)))
   ipcMain.handle(IPC.chatRename, (_e, sessionId: string, title: string) => chatManager.rename(String(sessionId), String(title)))
   ipcMain.handle(IPC.chatDelete, (_e, sessionId: string) => chatManager.remove(String(sessionId)))
+
+  /* ---------- jira ---------- */
+  ipcMain.handle(IPC.jiraStatus, () => ({
+    ...jiraAuth.status(),
+    capabilities: jiraMcp.connected ? jiraMcp.capabilities() : undefined
+  }))
+  ipcMain.handle(IPC.jiraConnect, async () => {
+    await jiraAuth.connect()
+    await jiraMcp.connect()
+    return jiraAuth.status()
+  })
+  ipcMain.handle(IPC.jiraDisconnect, async () => {
+    await jiraMcp.disconnect()
+    await jiraAuth.disconnect()
+    return jiraAuth.status()
+  })
+  ipcMain.handle(IPC.boardFetch, () => fetchBoard())
+
+  /* ---------- works (ticket pipeline) ---------- */
+  ipcMain.handle(IPC.workStart, (_e, input: unknown) => workManager.start(startWorkInputSchema.parse(input)))
+  ipcMain.handle(IPC.workList, () => workManager.list())
+  ipcMain.handle(IPC.workAbandon, (_e, id: string) => workManager.abandon(String(id)))
+  ipcMain.handle(IPC.workMessages, (_e, sessionId: string) => chatManager.messages(String(sessionId)))
+  ipcMain.handle(IPC.workPrompt, (_e, sessionId: string, text: string) => workManager.followUp(String(sessionId), String(text)))
+  ipcMain.handle(IPC.workInterrupt, (_e, sessionId: string) => workManager.interrupt(String(sessionId)))
 }

@@ -5,6 +5,9 @@ import { registerIpc } from './ipc'
 import { openCodeService } from './opencode/service'
 import { eventBus } from './opencode/bus'
 import { chatManager } from './opencode/chats'
+import { workManager } from './pipeline/works'
+import { jiraAuth } from './jira/auth'
+import { jiraMcp } from './jira/mcp'
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -44,6 +47,10 @@ app.whenReady().then(() => {
 
   eventBus.start()
   chatManager.wire()
+  workManager.wire()
+  void jiraAuth.load().then(() => {
+    if (jiraAuth.status().connected) void jiraMcp.connect().catch(() => undefined)
+  })
   void openCodeService.ensure().then((status) => {
     if (status.state === 'connected') void chatManager.reconcile()
   })

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowUp, Square } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -9,14 +9,39 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import type { ChatMessage } from '@shared/types'
 
-export function ChatView({ sessionId }: { sessionId: string }): React.JSX.Element {
-  const qc = useQueryClient()
-  const chats = useQuery({ queryKey: ['chats'], queryFn: () => window.revva.chat.list() })
-  const chat = chats.data?.find((c) => c.sessionId === sessionId)
+/** Everything a transcript surface needs, so chats and ticket cockpit share one view. */
+export interface TranscriptDrive {
+  /** Stable cache key prefix, e.g. ['chat-messages'] or ['work-messages']. */
+  queryKey: readonly unknown[]
+  load(sessionId: string): Promise<ChatMessage[]>
+  send(sessionId: string, text: string): Promise<void>
+  interrupt(sessionId: string): Promise<void>
+  /**
+   * Subscribe to streaming for this session. `onDelta` receives the FULL accumulated
+   * text (callers normalize increment-vs-accumulate); `onDone` fires on completion.
+   */
+  subscribe(
+    sessionId: string,
+    onDelta: (accumulated: string) => void,
+    onDone: () => void
+  ): () => void
+}
 
+export function TranscriptView({
+  sessionId,
+  drive,
+  header,
+  emptyHint
+}: {
+  sessionId: string
+  drive: TranscriptDrive
+  header: ReactNode
+  emptyHint: string
+}): React.JSX.Element {
+  const qc = useQueryClient()
   const messages = useQuery({
-    queryKey: ['chat-messages', sessionId],
-    queryFn: () => window.revva.chat.messages(sessionId),
+    queryKey: [...drive.queryKey, sessionId],
+    queryFn: () => drive.load(sessionId),
     refetchInterval: (q) => (q.state.status === 'error' ? 5000 : false)
   })
 
@@ -31,15 +56,15 @@ export function ChatView({ sessionId }: { sessionId: string }): React.JSX.Elemen
   }, [sessionId])
 
   useEffect(() => {
-    return window.revva.events.on((event) => {
-      if (event.kind === 'chat.delta' && event.sessionId === sessionId) {
-        setStreamingText(event.text)
-      } else if (event.kind === 'chat.idle' && (event.sessionId === sessionId || event.sessionId === '*')) {
+    return drive.subscribe(
+      sessionId,
+      (text) => setStreamingText(text),
+      () => {
         setStreamingText(null)
-        void qc.invalidateQueries({ queryKey: ['chat-messages', sessionId] })
+        void qc.invalidateQueries({ queryKey: [...drive.queryKey, sessionId] })
       }
-    })
-  }, [sessionId, qc])
+    )
+  }, [sessionId, drive, qc])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
@@ -50,22 +75,21 @@ export function ChatView({ sessionId }: { sessionId: string }): React.JSX.Elemen
       const text = input.trim()
       if (!text) return
       setInput('')
-      await window.revva.chat.prompt(sessionId, text)
-      // optimistic: show a placeholder user row, then live history from OpenCode
+      await drive.send(sessionId, text)
       setStreamingText((prev) => prev ?? '')
-      qc.setQueryData<ChatMessage[]>(['chat-messages', sessionId], (old) => [
+      qc.setQueryData<ChatMessage[]>([...drive.queryKey, sessionId], (old) => [
         ...(old ?? []),
         { id: `pending-${Date.now()}`, role: 'user', text, createdAt: Date.now() }
       ])
     },
     onSettled: () => {
-      // Fetch full history shortly after to reconcile server-side ids/order.
-      setTimeout(() => void qc.invalidateQueries({ queryKey: ['chat-messages', sessionId] }), 400)
+      // Refetch shortly after to reconcile server-side ids/order.
+      setTimeout(() => void qc.invalidateQueries({ queryKey: [...drive.queryKey, sessionId] }), 400)
     }
   })
 
   const interrupt = useMutation({
-    mutationFn: () => window.revva.chat.interrupt(sessionId),
+    mutationFn: () => drive.interrupt(sessionId),
     onSettled: () => setStreamingText(null)
   })
 
@@ -73,27 +97,13 @@ export function ChatView({ sessionId }: { sessionId: string }): React.JSX.Elemen
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex h-10 shrink-0 items-center gap-2 border-b px-4">
-        <span className="truncate text-[13px] font-medium">{chat?.title ?? 'Chat'}</span>
-        {chat && (
-          <Badge variant="outline" className="max-w-72 truncate font-mono text-[10px] font-normal">
-            {chat.directory}
-          </Badge>
-        )}
-        {running && (
-          <Badge variant="secondary" className="ml-auto animate-pulse text-[10px]">
-            running…
-          </Badge>
-        )}
-      </div>
+      <div className="flex h-10 shrink-0 items-center gap-2 border-b px-4">{header}</div>
 
       <ScrollArea className="min-h-0 flex-1">
         <div className="mx-auto flex max-w-3xl flex-col gap-4 px-6 py-5">
           {messages.isLoading && <Skeleton className="h-16 w-full" />}
           {!messages.isLoading && rows.length === 0 && !running && (
-            <p className="mt-10 text-center text-sm text-muted-foreground">
-              Ask anything about this project — this chat is not attached to a ticket.
-            </p>
+            <p className="mt-10 text-center text-sm text-muted-foreground">{emptyHint}</p>
           )}
           {rows.map((m) => (
             <MessageRow key={m.id} message={m} />
@@ -144,7 +154,7 @@ export function ChatView({ sessionId }: { sessionId: string }): React.JSX.Elemen
   )
 }
 
-function MessageRow({ message, streaming }: { message: ChatMessage; streaming?: boolean }): React.JSX.Element {
+export function MessageRow({ message, streaming }: { message: ChatMessage; streaming?: boolean }): React.JSX.Element {
   const isUser = message.role === 'user'
   return (
     <div className={cn('flex', isUser ? 'justify-end' : 'justify-start')}>
@@ -159,5 +169,50 @@ function MessageRow({ message, streaming }: { message: ChatMessage; streaming?: 
         {streaming && message.text !== '' && <span className="animate-pulse">▍</span>}
       </div>
     </div>
+  )
+}
+
+export function RunningBadge({ running }: { running: boolean }): React.JSX.Element | null {
+  if (!running) return null
+  return (
+    <Badge variant="secondary" className="ml-auto animate-pulse text-[10px]">
+      running…
+    </Badge>
+  )
+}
+
+/* ---------- Concrete drives ---------- */
+
+export const chatDrive: TranscriptDrive = {
+  queryKey: ['chat-messages'],
+  load: (id) => window.revva.chat.messages(id),
+  send: (id, text) => window.revva.chat.prompt(id, text),
+  interrupt: (id) => window.revva.chat.interrupt(id),
+  subscribe: (id, onDelta, onDone) =>
+    window.revva.events.on((event) => {
+      if (event.kind === 'chat.delta' && event.sessionId === id) onDelta(event.text)
+      else if (event.kind === 'chat.idle' && (event.sessionId === id || event.sessionId === '*')) onDone()
+    })
+}
+
+export function ChatView({ sessionId }: { sessionId: string }): React.JSX.Element {
+  const chats = useQuery({ queryKey: ['chats'], queryFn: () => window.revva.chat.list() })
+  const chat = chats.data?.find((c) => c.sessionId === sessionId)
+  return (
+    <TranscriptView
+      sessionId={sessionId}
+      drive={chatDrive}
+      emptyHint="Ask anything about this project — this chat is not attached to a ticket."
+      header={
+        <>
+          <span className="truncate text-[13px] font-medium">{chat?.title ?? 'Chat'}</span>
+          {chat && (
+            <Badge variant="outline" className="max-w-72 truncate font-mono text-[10px] font-normal">
+              {chat.directory}
+            </Badge>
+          )}
+        </>
+      }
+    />
   )
 }
