@@ -7,6 +7,10 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 ## [Unreleased]
 
+- (nothing yet)
+
+## [0.3.0] - 2026-10-28
+
 - **Conversation scrolling** — switching conversations opens the transcript at the latest messages.
 - **`/new` chat command** — type `/new` in a chat composer (or pick it from the `/` menu) to start a fresh session with the same directory, agent, model, and ticket/PR links; a context reset that keeps the old chat in the sidebar.
 - **Conversation context** — chats and work transcripts show the last reported token usage, model context limit, and percentage used when available.
