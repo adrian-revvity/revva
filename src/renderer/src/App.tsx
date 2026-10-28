@@ -87,8 +87,9 @@ export default function App(): React.JSX.Element {
     })
   }
   const abandonWork = (workId: string, ticketKey: string): void => {
-    if (!confirm(`Abandon ${ticketKey}? The worktree is removed and the build session deleted. Branch/commits stay in the repo.`)) return
-    void window.revva.work.abandon(workId).then(() => {
+    if (!confirm(`Abandon ${ticketKey}? The worktree is removed and the build session deleted. The branch is only deleted if fully merged — otherwise revva keeps it.`)) return
+    void window.revva.work.abandon(workId).then((note) => {
+      if (note) alert(note)
       qc.invalidateQueries({ queryKey: ['works'] })
       if (view.kind === 'work' && view.workId === workId) setView({ kind: 'board' })
     })

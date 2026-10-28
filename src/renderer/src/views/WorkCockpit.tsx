@@ -1,4 +1,5 @@
 import { useEffect, useMemo } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { CircleDot, GitBranch, FolderGit2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import type { PushEvent, WorkSummary } from '@shared/types'
@@ -27,6 +28,25 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
   const sessionId = work.sessionId
   const allPending = useInbox()
   const pending = allPending.filter((p) => p.sessionID === sessionId)
+  const qc = useQueryClient()
+
+  // Orca lesson: push events alone go stale (e.g. the agent commits while the window
+  // is hidden). Refetch the panels' data whenever the window regains focus too.
+  useEffect(() => {
+    const refresh = (): void => {
+      if (document.visibilityState !== 'visible') return
+      void qc.invalidateQueries({ queryKey: ['reviews', work.id] })
+      void qc.invalidateQueries({ queryKey: ['ship-checks', work.id] })
+      void qc.invalidateQueries({ queryKey: ['comments'] })
+      void qc.invalidateQueries({ queryKey: ['work-messages'] })
+    }
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', refresh)
+    return () => {
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('visibilitychange', refresh)
+    }
+  }, [qc, work.id])
 
   // work.delta carries per-token increments; accumulate per message for the shared transcript.
   const drive = useMemo<TranscriptDrive>(() => {

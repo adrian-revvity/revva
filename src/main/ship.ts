@@ -193,6 +193,9 @@ class ShipManager {
       const parent = getDb().prepare('SELECT branch FROM work WHERE id = ?').get(work.parent_work_id) as { branch: string } | undefined
       if (parent) return parent.branch
     }
+    // Lineage recorded at worktree creation survives outside our DB.
+    const recorded = await this.probe('git', ['-C', work.worktree_dir, 'config', 'branch.' + work.branch + '.base'])
+    if (recorded.ok && recorded.out.trim()) return recorded.out.trim().replace('origin/', '')
     const head = await this.probe('git', ['-C', work.worktree_dir, 'symbolic-ref', 'refs/remotes/origin/HEAD', '--short'])
     if (head.ok) return head.out.trim().replace('origin/', '')
     return 'main'

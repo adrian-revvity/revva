@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { existsSync } from 'node:fs'
+import { mkdir } from 'node:fs/promises'
 import { join, basename } from 'node:path'
 import { BrowserWindow } from 'electron'
 import { openCodeService, describeError } from '../opencode/service'
@@ -205,11 +206,16 @@ class WorkManager {
     ].join('\n')
   }
 
-  /** OpenCode worktree API first, `git worktree add` fallback. */
+  /**
+   * OpenCode worktree API first, then a crash-safe `git worktree add`:
+   * the worktree is created locked with an ownership receipt in the lock reason
+   * (revva's pid+uuid), the branch is (re)pointed at the base, only then checked
+   * out and unlocked. A crashed create leaves a locked, identifiable worktree.
+   * Same-branch reruns adopt the existing branch; a taken directory gets a suffix.
+   */
   private async createWorktree(repoDir: string, branch: string, baseRef?: string): Promise<string> {
     const root = settingGet<string>('worktreeRoot') || join(repoDir, '..', `${basename(repoDir)}-worktrees`)
     const name = branch.replace(/\//g, '-')
-    const target = join(root, name)
 
     // Prefer the service-managed worktree API.
     try {
@@ -229,12 +235,43 @@ class WorkManager {
       // fall through to git
     }
 
-    await exec('git', ['-C', repoDir, 'fetch', '--all', '--prune']).catch(() => undefined)
-    const base = baseRef ?? (await defaultBranch(repoDir))
+    // Lazy fetch: only hit the network when the requested base isn't already local.
+    let base = baseRef ?? (await defaultBranch(repoDir))
+    if (!(await refExists(repoDir, base))) {
+      await exec('git', ['-C', repoDir, 'fetch', '--all', '--prune'], { timeout: 120_000 }).catch(() => undefined)
+      if (!(await refExists(repoDir, base))) base = await defaultBranch(repoDir)
+    }
+
+    await mkdir(root, { recursive: true }).catch(() => undefined)
+    // Directory collision (crashed run left a worktree, or same ticket twice): bump a suffix.
+    let target = join(root, name)
+    for (let i = 2; existsSync(target); i++) target = join(root, `${name}-${i}`)
+
+    const receipt = `revva-create:${process.pid}:${randomUUID()}`
+    // Existing branch (rerun after a crashed/removed worktree): adopt it as-is rather
+    // than fail or reset — its commits are the point. Same policy as a taken directory.
+    const branchExists = await refExists(repoDir, `refs/heads/${branch}`)
     try {
-      await exec('git', ['-C', repoDir, 'worktree', 'add', '-B', branch, target, base])
+      // Phase 1: locked, detached, no checkout — ours by receipt alone; branch untouched.
+      await exec('git', [
+        '-C', repoDir, 'worktree', 'add', '--detach', '--no-checkout', '--lock', '--reason', receipt, target, base
+      ], { timeout: 120_000 })
+      // Phase 2: attach the branch (created fresh at base, or adopted), record lineage, release.
+      if (branchExists) {
+        await exec('git', ['-C', target, 'checkout', branch], { timeout: 120_000 })
+      } else {
+        await exec('git', ['-C', target, 'checkout', '-b', branch, base], { timeout: 120_000 })
+      }
+      await exec('git', ['-C', target, 'config', 'branch.' + branch + '.base', base])
+      await exec('git', ['-C', repoDir, 'worktree', 'unlock', target]).catch(() => undefined)
     } catch (err) {
-      throw new Error(`git worktree add failed: ${describeError(err)}`)
+      // Leave nothing half-built: only remove what our receipt still owns.
+      await exec('git', ['-C', repoDir, 'worktree', 'remove', '--force', target]).catch(() => undefined)
+      throw new Error(
+        `git worktree add failed: ${describeError(err)}${
+          branchExists ? ` (branch ${branch} exists — it may be checked out in a live worktree)` : ''
+        }`
+      )
     }
     return target
   }
@@ -302,13 +339,25 @@ class WorkManager {
     }
   }
 
-  async abandon(id: string): Promise<void> {
+  /** Removes the worktree and tries to delete the branch — with `branch -d` only,
+   *  never `-D`: unmerged work is never discarded silently. Returns a note when the
+   *  branch was preserved. */
+  async abandon(id: string): Promise<string | undefined> {
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(id) as WorkRow | undefined
     if (!work) return
     await reviewManager.cancelWork(id)
     if (work.session_id) await openCodeService.api.session.remove({ sessionID: work.session_id }).catch(() => undefined)
     await exec('git', ['-C', work.repo_dir, 'worktree', 'remove', '--force', work.worktree_dir]).catch(() => undefined)
+    let note: string | undefined
+    try {
+      await exec('git', ['-C', work.repo_dir, 'branch', '-d', work.branch])
+    } catch (err) {
+      const e = err as { stderr?: string; message?: string }
+      const reason = (e.stderr || e.message || 'not fully merged').trim().slice(0, 160)
+      note = `Branch ${work.branch} kept (git refused to delete it: ${reason})`
+    }
     this.setState(id, 'ABANDONED')
+    return note
   }
 
   /** Follow-up message into a running/finished build session. */
@@ -330,6 +379,15 @@ class WorkManager {
 
   private touch(id: string): void {
     getDb().prepare('UPDATE work SET updated_at = ? WHERE id = ?').run(Date.now(), id)
+  }
+}
+
+async function refExists(repoDir: string, ref: string): Promise<boolean> {
+  try {
+    await exec('git', ['-C', repoDir, 'rev-parse', '--verify', '--quiet', ref])
+    return true
+  } catch {
+    return false
   }
 }
 

@@ -448,7 +448,7 @@ export interface RevvaApi {
   work: {
     start(input: StartWorkInput): Promise<WorkSummary>
     list(): Promise<WorkSummary[]>
-    abandon(id: string): Promise<void>
+    abandon(id: string): Promise<string | undefined>
     messages(sessionId: string): Promise<ChatMessage[]>
     prompt(sessionId: string, text: string): Promise<void>
     interrupt(sessionId: string): Promise<void>
