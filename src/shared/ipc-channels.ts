@@ -33,6 +33,8 @@ export const IPC = {
   workMessages: 'revva:work:messages',
   workReviews: 'revva:work:reviews',
   workReviewStart: 'revva:work:review-start',
+  workShipCheck: 'revva:work:ship-check',
+  workShip: 'revva:work:ship',
   roleConfigList: 'revva:role-config:list',
   roleConfigSave: 'revva:role-config:save',
   inboxList: 'revva:inbox:list',

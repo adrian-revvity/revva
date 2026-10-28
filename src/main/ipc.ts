@@ -14,6 +14,7 @@ import { jiraMcp } from './jira/mcp'
 import { fetchBoard } from './jira/board'
 import { workManager } from './pipeline/works'
 import { reviewManager } from './review'
+import { shipManager } from './ship'
 import { scriptManager } from './scripts'
 import { getDb, settingGet, settingSet, roleConfigList, roleConfigSet } from './db'
 import { startWorkInputSchema, inboxAnswerSchema, permissionDecisionSchema, scriptInputSchema, roleConfigSchema } from '@shared/types'
@@ -120,6 +121,8 @@ export function registerIpc(): void {
     const round = reviewManager.latestRound(String(workId)) + 1
     await reviewManager.startRound(String(workId), round)
   })
+  ipcMain.handle(IPC.workShipCheck, (_e, workId: string) => shipManager.checks(String(workId)))
+  ipcMain.handle(IPC.workShip, (_e, workId: string) => shipManager.ship(String(workId)))
 
   /* ---------- role config (per-role agent/model defaults) ---------- */
   ipcMain.handle(IPC.roleConfigList, () => roleConfigList())

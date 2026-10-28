@@ -17,6 +17,7 @@ import { eventBus, type RawEvent } from './opencode/bus'
 import { listSkills } from './opencode/inventory'
 import { getDb, roleConfigGet, settingGet } from './db'
 import { workManager } from './pipeline/works'
+import { shipManager } from './ship'
 import {
   IPC,
   type ModelRef,
@@ -332,8 +333,14 @@ class ReviewManager {
       return
     }
     if (changes.length === 0) {
-      workManager.setReviewState(workId, 'APPROVED')
+      const work = getDb().prepare('SELECT mode FROM work WHERE id = ?').get(workId) as { mode: string } | undefined
       this.audit(workId, round, 'approved', rows.map((r) => `${r.role}: approved`).join(', '))
+      if (work?.mode === 'auto') {
+        // AUTO: ship immediately after all gates pass — no routine pinging.
+        void shipManager.autoShip(workId)
+      } else {
+        workManager.setReviewState(workId, 'APPROVED')
+      }
       return
     }
     const maxRounds = Math.min(settingGet<number>('reviewMaxRounds') ?? 3, 5)

@@ -33,6 +33,7 @@ interface WorkRow {
   state: string
   session_id: string | null
   review_sel: string | null
+  pr_url: string | null
   created_at: number
   updated_at: number
 }
@@ -86,6 +87,7 @@ class WorkManager {
       mode: r.mode as WorkSummary['mode'],
       state: r.state as WorkSummary['state'],
       sessionId: r.session_id ?? undefined,
+      prUrl: r.pr_url ?? undefined,
       updatedAt: r.updated_at
     }
   }

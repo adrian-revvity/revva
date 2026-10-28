@@ -206,6 +206,7 @@ export const workSummarySchema = z.object({
   mode: workModeSchema,
   state: workStateSchema,
   sessionId: z.string().optional(),
+  prUrl: z.string().optional(),
   updatedAt: z.number()
 })
 export type WorkSummary = z.infer<typeof workSummarySchema>
@@ -229,6 +230,23 @@ export const startWorkInputSchema = z.object({
     .optional()
 })
 export type StartWorkInput = z.infer<typeof startWorkInputSchema>
+
+/* ---------- Ship (M5) ---------- */
+
+export const shipCheckSchema = z.object({
+  name: z.string(),
+  ok: z.boolean(),
+  detail: z.string(),
+  /** false ⇒ informational only (e.g. Jira offline); undefined/true ⇒ blocks Ship. */
+  fatal: z.boolean().optional()
+})
+export type ShipCheck = z.infer<typeof shipCheckSchema>
+
+export const shipResultSchema = z.object({
+  prUrl: z.string(),
+  alreadyShipped: z.boolean()
+})
+export type ShipResult = z.infer<typeof shipResultSchema>
 
 /* ---------- Inbox (M2) ---------- */
 
@@ -372,6 +390,10 @@ export interface RevvaApi {
     reviews(workId: string): Promise<ReviewRow[]>
     /** Manually start another review round (e.g. after resolving a blocker). */
     reviewStart(workId: string): Promise<void>
+    /** Pre-flight checks for shipping (push/PR/Jira). */
+    shipCheck(workId: string): Promise<ShipCheck[]>
+    /** Push + PR + Jira sync; opens the PR in the browser. */
+    ship(workId: string): Promise<ShipResult>
   }
   roleConfig: {
     list(): Promise<RoleConfig[]>

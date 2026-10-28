@@ -44,11 +44,11 @@ Each milestone ships something you can use daily. Order assumes evenings/weekend
 - Provider-aware concurrency limits may queue a whole reviewer batch when necessary, but may not silently serialize gates or mark queued gates approved.
 - **Exit test (done manually):** build finished → sol + test-audit reviewers ran concurrently (impeccable skipped: no UI files), test-audit requested changes → fixer ran → round 2 → round 3 → rounds capped at 3 → WAITING_HUMAN with the reason in the decision ledger. Role defaults live in Setup; per-run overrides in Start Work. Remaining later: verify multiple arbitrary models by taste while using the app.
 
-## M5 — Ship + Jira sync (≈0.5d)
+## M5 — Ship + Jira sync (≈0.5d) — DONE 2026-10-28
 - Commit-tree check, push, `gh pr create` (open browser), `gh stack submit` path for dep chains, Jira transition + summary comment, stack base wiring.
 - In AUTO mode, push/create/open PR automatically after all review gates and repository checks pass; Interactive mode retains an explicit Ship action. Neither mode merges; never force-push.
 - AUTO activity log records choices, assumptions, permission decisions, outcomes, and blockers; notify only for blocker or completion.
-- **Exit test:** two dependent tickets → stacked PRs (child base = parent branch) → both tickets transition with links.
+- **Exit test (done manually 2026-10-28, single-ticket):** APPROVED → Ship dialog checks all green → push → `gh pr create` (correct base/title/body, opened in browser) → Jira transitioned to "Ready for Test" + summary comment → state SHIPPED with PR link in the cockpit. Stacked two-ticket run still to try organically on real tickets (base = parent branch is already wired via parentWorkId).
 - **AUTO exit test:** a clear ticket completes from Start Work to PR without routine user prompts; a high-impact ambiguous question, missing auth, or unsafe permission pauses for the user; no PR is merged.
 
 ## M6 — Comment watcher + rework (≈1d)

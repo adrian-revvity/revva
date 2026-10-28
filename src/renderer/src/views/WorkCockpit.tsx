@@ -5,6 +5,7 @@ import type { PushEvent, WorkSummary } from '@shared/types'
 import { TranscriptView, type TranscriptDrive } from './Chat'
 import { FormCard, PermissionCard, useInbox } from './InboxView'
 import { ReviewPanel, ReviewRerunButton } from './ReviewPanel'
+import { ShipPanel } from './ShipPanel'
 
 const stateClasses: Record<string, string> = {
   BUILDING: 'bg-sky-500/15 text-sky-700 dark:text-sky-400 border-sky-500/30',
@@ -61,6 +62,7 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <ReviewPanel workId={work.id} />
+      <ShipPanel work={work} />
       {pending.length > 0 && (
         <div className="max-h-64 shrink-0 space-y-2 overflow-y-auto border-b bg-amber-500/5 p-3">
           <p className="text-[11px] font-medium text-amber-700 dark:text-amber-400">
