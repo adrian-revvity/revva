@@ -1,9 +1,10 @@
 /**
  * Typed IPC surface. Renderer never touches node/electron APIs directly.
  */
-import { ipcMain, dialog, BrowserWindow } from 'electron'
+import { app, ipcMain, dialog, shell, BrowserWindow } from 'electron'
 import { randomUUID } from 'node:crypto'
-import { statSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import { IPC, settingsKeySchema, chatCreateInputSchema, type Workspace } from '@shared/types'
 import { openCodeService } from './opencode/service'
 import { chatManager } from './opencode/chats'
@@ -14,6 +15,7 @@ import { jiraMcp } from './jira/mcp'
 import { fetchBoard } from './jira/board'
 import { commentWatcher } from './jira/watch'
 import { workManager } from './pipeline/works'
+import { worktreeManager } from './worktrees'
 import { reviewManager } from './review'
 import { shipManager } from './ship'
 import { scriptManager } from './scripts'
@@ -27,8 +29,35 @@ import {
   permissionDecisionSchema,
   scriptInputSchema,
   roleConfigSchema,
-  taskSessionInputSchema
+  taskSessionInputSchema,
+  promptImageSchema,
+  promptRefsSchema,
+  worktreeRemoveInputSchema,
+  type PromptImage,
+  type PromptRefs
 } from '@shared/types'
+
+/** Validate the image array arriving from the renderer (untrusted). */
+function promptImageList(images: unknown): PromptImage[] {
+  if (!Array.isArray(images)) return []
+  return images.map((img) => promptImageSchema.parse(img))
+}
+
+/** Validate composer skill/file refs (untrusted); absent or invalid → none. */
+function promptRefs(refs: unknown): PromptRefs {
+  if (!refs || typeof refs !== 'object') return { skills: [], files: [] }
+  return promptRefsSchema.parse(refs)
+}
+
+/** Working directory of a chat or work session ('' when unknown) — scopes @-file search. */
+function sessionDirectory(sessionId: string): string {
+  const chat = getDb().prepare('SELECT directory FROM chat WHERE session_id = ?').get(sessionId) as { directory: string } | undefined
+  if (chat) return chat.directory
+  const work = getDb().prepare('SELECT worktree_dir AS directory FROM work WHERE session_id = ?').get(sessionId) as
+    | { directory: string }
+    | undefined
+  return work?.directory ?? ''
+}
 
 export function registerIpc(): void {
   /* ---------- service ---------- */
@@ -93,15 +122,53 @@ export function registerIpc(): void {
     })
     return res.canceled ? null : (res.filePaths[0] ?? null)
   })
+  ipcMain.handle(IPC.shellOpenExternal, async (_e, url: string) => {
+    // Only web links from chat markdown; never file:// or arbitrary schemes.
+    try {
+      const parsed = new URL(String(url))
+      if (parsed.protocol === 'https:' || parsed.protocol === 'http:') await shell.openExternal(parsed.toString())
+    } catch {
+      /* malformed URL — ignore */
+    }
+  })
+  ipcMain.handle(IPC.appMeta, () => {
+    // CHANGELOG.md ships inside the app package (see electron-builder files).
+    let changelog = ''
+    try {
+      changelog = readFileSync(join(app.getAppPath(), 'CHANGELOG.md'), 'utf8')
+    } catch {
+      /* dev mode from a source tree without one — renderer shows a fallback */
+    }
+    return { version: app.getVersion(), changelog }
+  })
 
   /* ---------- chats ---------- */
   ipcMain.handle(IPC.chatList, () => chatManager.list())
   ipcMain.handle(IPC.chatCreate, (_e, input: unknown) => chatManager.create(chatCreateInputSchema.parse(input)))
   ipcMain.handle(IPC.chatMessages, (_e, sessionId: string) => chatManager.messages(String(sessionId)))
-  ipcMain.handle(IPC.chatPrompt, (_e, sessionId: string, text: string) => chatManager.prompt(String(sessionId), String(text)))
+  ipcMain.handle(IPC.chatPrompt, (_e, sessionId: string, text: string, images?: unknown, queued?: unknown, refs?: unknown) =>
+    chatManager.prompt(String(sessionId), String(text), promptImageList(images), Boolean(queued), promptRefs(refs))
+  )
   ipcMain.handle(IPC.chatInterrupt, (_e, sessionId: string) => chatManager.interrupt(String(sessionId)))
+  ipcMain.handle(IPC.chatSeen, (_e, sessionId: string) => chatManager.markSeen(String(sessionId)))
   ipcMain.handle(IPC.chatRename, (_e, sessionId: string, title: string) => chatManager.rename(String(sessionId), String(title)))
   ipcMain.handle(IPC.chatDelete, (_e, sessionId: string) => chatManager.remove(String(sessionId)))
+  ipcMain.handle(IPC.sessionModel, async (_e, sessionId: string) => {
+    const session = await openCodeService.api.session.get({ sessionID: String(sessionId) })
+    return session.model ?? null
+  })
+  ipcMain.handle(IPC.sessionActive, async () => Object.keys(await openCodeService.api.session.active()))
+  ipcMain.handle(IPC.sessionQueue, (_e, sessionId: string) => chatManager.queue(String(sessionId)))
+  ipcMain.handle(IPC.sessionQueueCancel, (_e, sessionId: string, inboxId: string) =>
+    chatManager.cancelQueued(String(sessionId), String(inboxId))
+  )
+
+  /* ---------- worktree cleanup ---------- */
+  ipcMain.handle(IPC.worktreeList, () => worktreeManager.list())
+  ipcMain.handle(IPC.worktreeRemove, (_e, input: unknown) => {
+    const parsed = worktreeRemoveInputSchema.parse(input)
+    return worktreeManager.remove(parsed.repoDir, parsed.directory, parsed.force)
+  })
 
   /* ---------- jira ---------- */
   ipcMain.handle(IPC.jiraStatus, () => ({
@@ -125,7 +192,9 @@ export function registerIpc(): void {
   ipcMain.handle(IPC.workList, () => workManager.list())
   ipcMain.handle(IPC.workAbandon, (_e, id: string) => workManager.abandon(String(id)))
   ipcMain.handle(IPC.workMessages, (_e, sessionId: string) => chatManager.messages(String(sessionId)))
-  ipcMain.handle(IPC.workPrompt, (_e, sessionId: string, text: string) => workManager.followUp(String(sessionId), String(text)))
+  ipcMain.handle(IPC.workPrompt, (_e, sessionId: string, text: string, images?: unknown, queued?: unknown, refs?: unknown) =>
+    workManager.followUp(String(sessionId), String(text), promptImageList(images), Boolean(queued), promptRefs(refs))
+  )
   ipcMain.handle(IPC.workInterrupt, (_e, sessionId: string) => workManager.interrupt(String(sessionId)))
   ipcMain.handle(IPC.workReviews, (_e, workId: string) => reviewManager.reviewsFor(String(workId)))
   ipcMain.handle(IPC.workReviewStart, async (_e, workId: string) => {
@@ -161,6 +230,7 @@ export function registerIpc(): void {
     if (!parsed?.url) throw new Error('Pass a full PR URL or owner/repo#123 (bare numbers are ambiguous across projects).')
     return githubManager.startReview(parsed.url)
   })
+  ipcMain.handle(IPC.githubSeen, (_e, prUrl: string) => githubManager.markSeen(String(prUrl)))
   ipcMain.handle(IPC.taskTicketSession, (_e, input: unknown) => {
     const parsed = taskSessionInputSchema.parse({ ...((input ?? {}) as object), kind: 'ticket' })
     if (parsed.kind !== 'ticket') throw new Error('invalid input')
@@ -168,6 +238,24 @@ export function registerIpc(): void {
   })
   ipcMain.handle(IPC.modelsFavorites, () => favoriteModels())
   ipcMain.handle(IPC.modelsFavoriteToggle, (_e, key: string) => toggleFavoriteModel(String(key)))
+  ipcMain.handle(IPC.fileFind, async (_e, sessionId: string, query: string) => {
+    const q = String(query)
+    if (!q) return []
+    const directory = sessionDirectory(String(sessionId))
+    if (!directory) return []
+    try {
+      const res = await openCodeService.api.file.find({
+        location: { directory },
+        query: q,
+        type: 'file',
+        limit: 20
+      })
+      return res.data.map((entry) => ({ path: entry.path, type: entry.type }))
+    } catch {
+      // dir missing / service hiccup — the picker just stays empty
+      return []
+    }
+  })
 
   /* ---------- scripts (one-click shell, incl. Morning) ---------- */
   ipcMain.handle(IPC.scriptList, () => scriptManager.list())

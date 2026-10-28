@@ -19,7 +19,8 @@ import { getTicket } from '../jira/board'
 import { getDb, settingGet } from '../db'
 import { reviewManager } from '../review'
 import { renderPrompt, DEFAULT_START_PROMPT } from '@shared/prompts'
-import { IPC, type StartWorkInput, type WorkState, type WorkSummary } from '@shared/types'
+import { IPC, type PromptImage, type PromptRefs, type StartWorkInput, type WorkState, type WorkSummary } from '@shared/types'
+import { fileAttachments, skillAttachments } from '../opencode/prompt-refs'
 
 const exec = promisify(execFile)
 
@@ -361,14 +362,37 @@ class WorkManager {
   }
 
   /** Follow-up message into a running/finished build session. */
-  async followUp(sessionId: string, text: string): Promise<void> {
+  async followUp(sessionId: string, text: string, images: PromptImage[] = [], queued = false, refs?: PromptRefs): Promise<void> {
     const work = this.workBySession(sessionId)
     if (work) {
       // A human re-prompting a settled build takes it back through review.
       if (['WAITING_HUMAN', 'APPROVED', 'REVIEW', 'FIXING'].includes(work.state)) this.setState(work.id, 'BUILDING')
       this.touch(work.id)
     }
-    await openCodeService.api.session.prompt({ sessionID: sessionId, text })
+    const files = [
+      ...images.map((img) => {
+        const base64 = img.data.startsWith('data:') ? img.data.slice(img.data.indexOf(',') + 1) : img.data
+        return { uri: `data:${img.mime};base64,${base64}`, name: img.name }
+      }),
+      ...(refs && work ? fileAttachments(refs, work.worktree_dir) : [])
+    ]
+    const skills = refs ? skillAttachments(refs) : []
+    const payload = {
+      sessionID: sessionId,
+      text,
+      ...(files.length ? { files } : {}),
+      ...(skills.length ? { skills } : {}),
+      delivery: (queued ? 'queue' : 'steer') as 'queue' | 'steer'
+    }
+    try {
+      await openCodeService.api.session.prompt(payload)
+    } catch (err) {
+      // Steer refused (session state raced) — park the follow-up so it is not lost.
+      const msg = String((err as Error)?.message ?? err ?? '')
+      const conflict = (err as { status?: unknown })?.status === 409 || /409|conflict|busy|already running/i.test(msg)
+      if (!queued && conflict) await openCodeService.api.session.prompt({ ...payload, delivery: 'queue' })
+      else throw err
+    }
   }
 
   async interrupt(sessionId: string): Promise<void> {

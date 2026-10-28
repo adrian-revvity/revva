@@ -22,14 +22,31 @@ const api: RevvaApi = {
     remove: (id) => ipcRenderer.invoke(IPC.workspaceRemove, id),
     pickFolder: () => ipcRenderer.invoke(IPC.dialogPickFolder)
   },
+  shell: {
+    openExternal: (url) => ipcRenderer.invoke(IPC.shellOpenExternal, url)
+  },
+  app: {
+    meta: () => ipcRenderer.invoke(IPC.appMeta)
+  },
   chat: {
     list: () => ipcRenderer.invoke(IPC.chatList),
     create: (input) => ipcRenderer.invoke(IPC.chatCreate, input),
     messages: (sessionId) => ipcRenderer.invoke(IPC.chatMessages, sessionId),
-    prompt: (sessionId, text) => ipcRenderer.invoke(IPC.chatPrompt, sessionId, text),
+    prompt: (sessionId, text, images, queued, refs) => ipcRenderer.invoke(IPC.chatPrompt, sessionId, text, images, queued, refs),
     interrupt: (sessionId) => ipcRenderer.invoke(IPC.chatInterrupt, sessionId),
     rename: (sessionId, title) => ipcRenderer.invoke(IPC.chatRename, sessionId, title),
+    markSeen: (sessionId) => ipcRenderer.invoke(IPC.chatSeen, sessionId),
     remove: (sessionId) => ipcRenderer.invoke(IPC.chatDelete, sessionId)
+  },
+  session: {
+    model: (sessionId) => ipcRenderer.invoke(IPC.sessionModel, sessionId),
+    active: () => ipcRenderer.invoke(IPC.sessionActive),
+    queue: (sessionId) => ipcRenderer.invoke(IPC.sessionQueue, sessionId),
+    cancelQueued: (sessionId, inboxId) => ipcRenderer.invoke(IPC.sessionQueueCancel, sessionId, inboxId)
+  },
+  worktrees: {
+    list: () => ipcRenderer.invoke(IPC.worktreeList),
+    remove: (input) => ipcRenderer.invoke(IPC.worktreeRemove, input)
   },
   jira: {
     status: () => ipcRenderer.invoke(IPC.jiraStatus),
@@ -42,7 +59,7 @@ const api: RevvaApi = {
     list: () => ipcRenderer.invoke(IPC.workList),
     abandon: (id) => ipcRenderer.invoke(IPC.workAbandon, id),
     messages: (sessionId) => ipcRenderer.invoke(IPC.workMessages, sessionId),
-    prompt: (sessionId, text) => ipcRenderer.invoke(IPC.workPrompt, sessionId, text),
+    prompt: (sessionId, text, images, queued, refs) => ipcRenderer.invoke(IPC.workPrompt, sessionId, text, images, queued, refs),
     interrupt: (sessionId) => ipcRenderer.invoke(IPC.workInterrupt, sessionId),
     reviews: (workId) => ipcRenderer.invoke(IPC.workReviews, workId),
     reviewStart: (workId) => ipcRenderer.invoke(IPC.workReviewStart, workId),
@@ -59,7 +76,8 @@ const api: RevvaApi = {
   },
   github: {
     list: (scope) => ipcRenderer.invoke(IPC.githubList, scope),
-    review: (prUrl) => ipcRenderer.invoke(IPC.githubReview, prUrl)
+    review: (prUrl) => ipcRenderer.invoke(IPC.githubReview, prUrl),
+    markSeen: (prUrl) => ipcRenderer.invoke(IPC.githubSeen, prUrl)
   },
   task: {
     ticketSession: (input) => ipcRenderer.invoke(IPC.taskTicketSession, input)
@@ -67,6 +85,9 @@ const api: RevvaApi = {
   models: {
     favorites: () => ipcRenderer.invoke(IPC.modelsFavorites),
     toggleFavorite: (key) => ipcRenderer.invoke(IPC.modelsFavoriteToggle, key)
+  },
+  file: {
+    find: (sessionId, query) => ipcRenderer.invoke(IPC.fileFind, sessionId, query)
   },
   inbox: {
     list: () => ipcRenderer.invoke(IPC.inboxList),

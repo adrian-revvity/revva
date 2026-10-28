@@ -6,7 +6,7 @@
  * session-scoped listings (global /api/form is location-scoped, so we go per session).
  * Every answer is written to an audit table.
  */
-import { BrowserWindow } from 'electron'
+import { BrowserWindow, Notification } from 'electron'
 import { getDb } from '../db'
 import { openCodeService, describeError } from './service'
 import { eventBus, type RawEvent } from './bus'
@@ -147,6 +147,7 @@ class InboxManager {
           owner: this.ownerLabel(form.sessionID)
         })
         this.markSessionWaiting(form.sessionID)
+        this.notify(this.pending.get(`form:${form.id}`)!)
         this.push()
         break
       }
@@ -171,6 +172,7 @@ class InboxManager {
           owner: this.ownerLabel(req.sessionID)
         })
         this.markSessionWaiting(req.sessionID)
+        this.notify(this.pending.get(`perm:${req.id}`)!)
         this.push()
         break
       }
@@ -203,6 +205,27 @@ class InboxManager {
         `INSERT INTO inbox_audit(session_id, kind, ref_id, answer, answered_at) VALUES(?,?,?,?,?)`
       )
       .run(sessionID, kind, refId, JSON.stringify(answer), Date.now())
+  }
+
+  /** macOS notification so a blocked session is noticed without the window focused. */
+  private notify(item: PendingItem): void {
+    if (!Notification.isSupported()) return
+    const notification = new Notification({
+      title: item.kind === 'form' ? 'Question from agent' : 'Permission request',
+      body: `${item.owner ?? item.directory}\n${item.title}`,
+      silent: false
+    })
+    notification.on('click', () => this.focusWindow())
+    notification.show()
+  }
+
+  /** Bring Revva to the front when the notification is clicked. */
+  private focusWindow(): void {
+    const win = BrowserWindow.getAllWindows()[0]
+    if (!win) return
+    if (win.isMinimized()) win.restore()
+    win.show()
+    win.focus()
   }
 
   private push(): void {

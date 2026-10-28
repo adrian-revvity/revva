@@ -156,9 +156,9 @@ function ReviewTranscript({ row, onClose }: { row: ReviewRow; onClose: () => voi
         header={
           <>
             <Badge variant="outline" className="text-[10px]">
-              {roleMeta[row.role]?.label ?? row.role} · {row.model ? `${row.model.providerID}/${row.model.id}` : 'service default'}
+              {roleMeta[row.role]?.label ?? row.role}
             </Badge>
-            <Button size="sm" variant="ghost" className="ml-auto h-6 px-2 text-[11px]" onClick={onClose}>
+            <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={onClose}>
               close
             </Button>
           </>

@@ -17,6 +17,7 @@ const NAME_CLASSES: Array<{ re: RegExp; cls: string }> = [
 const CATEGORY_CLASSES: Record<string, string> = {
   todo: 'bg-slate-500/15 text-slate-700 dark:text-slate-300 border-slate-500/30',
   indeterminate: 'bg-sky-500/15 text-sky-700 dark:text-sky-300 border-sky-500/30',
+  inprogress: 'bg-sky-500/15 text-sky-700 dark:text-sky-300 border-sky-500/30',
   done: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30'
 }
 
@@ -29,7 +30,8 @@ const HASH_POOL = Object.values(CATEGORY_CLASSES).concat(
 
 export function jiraStatusClasses(status: string, category?: string): string {
   for (const { re, cls } of NAME_CLASSES) if (re.test(status)) return cls
-  const cat = (category ?? '').toLowerCase()
+  // board.ts stores the category *name* ("To Do", "In Progress"); some feeds give the *key* ("todo").
+  const cat = (category ?? '').toLowerCase().replace(/[\s_-]+/g, '')
   if (CATEGORY_CLASSES[cat]) return CATEGORY_CLASSES[cat]!
   let h = 0
   for (const ch of status) h = (h * 31 + ch.charCodeAt(0)) >>> 0

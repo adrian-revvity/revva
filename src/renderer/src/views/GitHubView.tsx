@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ExternalLink, RefreshCw, ScanEye, Github } from 'lucide-react'
+import { Check, CircleDot, ExternalLink, MessageSquareDot, RefreshCw, ScanEye, Github, X } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -29,6 +29,7 @@ export function GitHubView({
     mutationFn: (prUrl: string) => window.revva.github.review(prUrl),
     onSuccess: (res) => {
       void qc.invalidateQueries({ queryKey: ['chats'] })
+      void qc.invalidateQueries({ queryKey: ['gh-prs'] })
       onOpenChat(res.sessionId)
     }
   })
@@ -74,7 +75,13 @@ export function GitHubView({
         )}
 
         {prs.data?.map((pr: PullRequest) => (
-          <div key={pr.url} className="flex items-center gap-3 rounded-lg border p-3">
+          <div
+            key={pr.url}
+            className={cn(
+              'flex items-center gap-3 rounded-lg border p-3',
+              pr.hasNewComments && 'border-primary/50 bg-primary/5'
+            )}
+          >
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
                 <a
@@ -87,17 +94,44 @@ export function GitHubView({
                   <ExternalLink className="ml-1 inline size-3 opacity-60" />
                 </a>
                 {pr.isDraft && <Badge variant="outline" className="text-[10px]">draft</Badge>}
+                <ReviewBadge pr={pr} />
+                {pr.hasNewComments && (
+                  <Badge variant="secondary" className="gap-1 text-[10px]">
+                    <MessageSquareDot className="size-3" />
+                    new comment{pr.latestOtherCommentAuthor ? ` · ${pr.latestOtherCommentAuthor}` : ''}
+                  </Badge>
+                )}
               </div>
               <p className="mt-0.5 font-mono text-[11px] text-muted-foreground">
-                {pr.repo}#{pr.number} · {timeAgo(pr.updatedAt)}
+                {pr.repo}#{pr.number} ·{' '}
+                {pr.hasNewComments && pr.latestOtherCommentAt
+                  ? `comment ${timeAgo(pr.latestOtherCommentAt)}`
+                  : timeAgo(pr.updatedAt)}
+                {typeof pr.commentsCount === 'number' && pr.commentsCount > 0
+                  ? ` · ${pr.commentsCount} comment${pr.commentsCount > 1 ? 's' : ''}`
+                  : ''}
               </p>
             </div>
+            {pr.hasNewComments && (
+              <Button
+                size="sm"
+                variant="ghost"
+                title="Mark comments as seen"
+                onClick={() => {
+                  void window.revva.github.markSeen(pr.url)
+                  void qc.invalidateQueries({ queryKey: ['gh-prs'] })
+                }}
+              >
+                <Check className="size-4" />
+              </Button>
+            )}
             <Button
               size="sm"
               variant="outline"
               disabled={busyUrl === pr.url || review.isPending}
               onClick={() => {
                 setBusyUrl(pr.url)
+                void window.revva.github.markSeen(pr.url)
                 review.mutate(pr.url, { onSettled: () => setBusyUrl(null) })
               }}
             >
@@ -109,6 +143,35 @@ export function GitHubView({
       </div>
     </div>
   )
+}
+
+/** "Accepted or not": merged / approved / changes-requested / awaiting review. */
+function ReviewBadge({ pr }: { pr: PullRequest }): React.JSX.Element | null {
+  if (pr.merged)
+    return (
+      <Badge variant="secondary" className="gap-1 border-transparent bg-violet-500/15 text-[10px] text-violet-500">
+        merged
+      </Badge>
+    )
+  if (pr.reviewDecision === 'APPROVED')
+    return (
+      <Badge variant="secondary" className="gap-1 border-transparent bg-green-500/15 text-[10px] text-green-600 dark:text-green-400">
+        <Check className="size-3" /> approved
+      </Badge>
+    )
+  if (pr.reviewDecision === 'CHANGES_REQUESTED')
+    return (
+      <Badge variant="secondary" className="gap-1 border-transparent bg-red-500/15 text-[10px] text-red-500">
+        <X className="size-3" /> changes requested
+      </Badge>
+    )
+  if (pr.reviewDecision === 'REVIEW_REQUIRED')
+    return (
+      <Badge variant="outline" className="gap-1 text-[10px] text-muted-foreground">
+        <CircleDot className="size-3" /> awaiting review
+      </Badge>
+    )
+  return null
 }
 
 function timeAgo(ts: number): string {

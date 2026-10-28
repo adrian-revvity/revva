@@ -46,6 +46,10 @@ function createWindow(): void {
 
 app.whenReady().then(() => {
   app.setAboutPanelOptions({ applicationName: 'Revva' })
+  // Electron's development executable otherwise shows its default Dock icon.
+  if (process.platform === 'darwin' && !app.isPackaged) {
+    app.dock?.setIcon(join(app.getAppPath(), 'build/icon.png'))
+  }
   registerIpc()
   createWindow()
 

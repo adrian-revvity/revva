@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # typecheck gate, then package dmg + zip into release/
+      - run: pnpm typecheck && pnpm dist
+
+      - name: Release notes from CHANGELOG
+        id: notes
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          # Print the section between "## [<version>]" and the next "## [" heading.
+          NOTES=$(awk -v tag="$VER" '
+            $0 ~ "^## \\[" tag "\\]" { in_sec=1; next }
+            in_sec && /^## \[/ { in_sec=0 }
+            in_sec { print }
+          ' CHANGELOG.md)
+          if [ -z "$NOTES" ]; then NOTES="See [CHANGELOG.md](https://github.com/$GITHUB_REPOSITORY/blob/main/CHANGELOG.md)."; fi
+          { echo "notes<<EOF"; echo "$NOTES"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: ${{ steps.notes.outputs.notes }}
+          files: |
+            release/*.dmg
+            release/*.zip
+            release/*.yml

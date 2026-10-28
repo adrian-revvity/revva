@@ -1,16 +1,19 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
-import { FolderPlus, Trash2, CircleCheck, CircleX, CircleDashed, Star } from 'lucide-react'
+import { FolderPlus, Trash2, CircleCheck, CircleX, CircleDashed, Star, Plug, FolderKanban, Bot, ScrollText } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { RoleSelectors, DEFAULT, selOrUndefined } from './RoleSelectors'
 import { FeaturesDialogButton } from './FeaturesDialog'
+import { ChangelogDialogButton } from './ChangelogDialog'
 import {
   DEFAULT_START_PROMPT,
   DEFAULT_TACKLE_PROMPT,
@@ -23,9 +26,12 @@ import type { PipelineRole, SettingsKey } from '@shared/types'
  * First-run setup + settings (REQ-SETUP-1/2): OpenCode connection status, workspace folders,
  * and the live inventory discovered from the user's own service. Jira/AWS arrive in M1/M3.
  */
+type InventoryCategory = 'models' | 'agents' | 'skills'
+
 export function SetupView(): React.JSX.Element {
   const qc = useQueryClient()
   const [newFolder, setNewFolder] = useState('')
+  const [category, setCategory] = useState<InventoryCategory>('models')
 
   const status = useQuery({ queryKey: ['service-status'], queryFn: () => window.revva.service.status(), refetchInterval: 5000 })
   const workspaces = useQuery({ queryKey: ['workspaces'], queryFn: () => window.revva.workspace.list() })
@@ -57,136 +63,165 @@ export function SetupView(): React.JSX.Element {
               Revva drives whatever your own OpenCode service exposes — no imported config required.
             </p>
           </div>
-          <FeaturesDialogButton />
+          <div className="flex items-center gap-1">
+            <ChangelogDialogButton />
+            <FeaturesDialogButton />
+          </div>
         </header>
 
-        <section className="space-y-2">
-          <h2 className="text-sm font-medium">OpenCode connection</h2>
-          <div className="flex items-center justify-between rounded-lg border p-3">
-            <div className="flex items-center gap-2 text-sm">
-              {status.data?.state === 'connected' ? (
-                <CircleCheck className="size-4 text-emerald-600 dark:text-emerald-400" />
-              ) : status.data?.state === 'missing' ? (
-                <CircleX className="size-4 text-destructive" />
-              ) : (
-                <CircleDashed className="size-4 animate-spin text-muted-foreground" />
-              )}
-              <span>
-                {status.data?.state === 'connected'
-                  ? `Connected — v${status.data.version} @ ${status.data.url}`
-                  : (status.data?.message ?? 'Connecting…')}
-              </span>
-            </div>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() =>
-                void window.revva.service.retry().then((s) => qc.setQueryData(['service-status'], s))
-              }
-            >
-              Retry
-            </Button>
-          </div>
-          {status.data?.state === 'missing' && (
-            <p className="text-xs text-muted-foreground">
-              Install OpenCode (https://opencode.ai), make sure the <code>opencode</code> command is on PATH, then Retry.
-            </p>
-          )}
-        </section>
+        <Tabs defaultValue="connections">
+          <TabsList className="w-full">
+            <TabsTrigger value="connections">
+              <Plug className="size-3.5" /> Connections
+            </TabsTrigger>
+            <TabsTrigger value="projects">
+              <FolderKanban className="size-3.5" /> Projects
+            </TabsTrigger>
+            <TabsTrigger value="agents">
+              <Bot className="size-3.5" /> Agents &amp; prompts
+            </TabsTrigger>
+            <TabsTrigger value="models">
+              <Star className="size-3.5" /> Models
+            </TabsTrigger>
+          </TabsList>
 
-        <section className="space-y-2">
-          <h2 className="text-sm font-medium">Jira</h2>
-          <JiraSection />
-        </section>
-
-        <section className="space-y-2">
-          <h2 className="text-sm font-medium">Project folders</h2>
-          <p className="text-xs text-muted-foreground">
-            Folders Revva may create sessions and worktrees in. Add repos you work on (Jira tickets attach in M1).
-          </p>
-          <div className="space-y-1.5">
-            {workspaces.data?.map((w) => (
-              <div key={w.id} className="flex items-center justify-between rounded-md border px-3 py-1.5 text-sm">
-                <span className="truncate font-mono text-xs">{w.path}</span>
+          <TabsContent value="connections" className="mt-4 space-y-6">
+            <section className="space-y-2">
+              <h2 className="text-sm font-medium">OpenCode connection</h2>
+              <div className="flex items-center justify-between rounded-lg border p-3">
+                <div className="flex items-center gap-2 text-sm">
+                  {status.data?.state === 'connected' ? (
+                    <CircleCheck className="size-4 text-emerald-600 dark:text-emerald-400" />
+                  ) : status.data?.state === 'missing' ? (
+                    <CircleX className="size-4 text-destructive" />
+                  ) : (
+                    <CircleDashed className="size-4 animate-spin text-muted-foreground" />
+                  )}
+                  <span>
+                    {status.data?.state === 'connected'
+                      ? `Connected — v${status.data.version} @ ${status.data.url}`
+                      : (status.data?.message ?? 'Connecting…')}
+                  </span>
+                </div>
                 <Button
-                  size="icon"
-                  variant="ghost"
-                  className="size-6"
-                  onClick={() => void window.revva.workspace.remove(w.id).then(() => workspaces.refetch())}
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    void window.revva.service.retry().then((s) => qc.setQueryData(['service-status'], s))
+                  }
                 >
-                  <Trash2 className="size-3.5" />
+                  Retry
                 </Button>
               </div>
-            ))}
-          </div>
-          <div className="flex gap-2">
-            <Input
-              placeholder="/path/to/repo (or leave empty to browse)"
-              value={newFolder}
-              onChange={(e) => setNewFolder(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && addFolder.mutate(newFolder)}
-              className="font-mono text-xs"
-            />
-            <Button size="sm" variant="outline" onClick={() => addFolder.mutate('')}>
-              <FolderPlus className="size-4" /> Add
-            </Button>
-          </div>
-          {addFolder.error instanceof Error && addFolder.error.message !== 'cancelled' && (
-            <p className="text-xs text-destructive">{addFolder.error.message}</p>
-          )}
-        </section>
+              {status.data?.state === 'missing' && (
+                <p className="text-xs text-muted-foreground">
+                  Install OpenCode (https://opencode.ai), make sure the <code>opencode</code> command is on PATH, then Retry.
+                </p>
+              )}
+            </section>
 
-        <section className="space-y-2">
-          <h2 className="text-sm font-medium">Agent / model defaults by role</h2>
-          <p className="text-xs text-muted-foreground">
-            Any run can override these. Empty = whatever your OpenCode service defaults to.
-          </p>
-          <RoleDefaults />
-        </section>
+            <section className="space-y-2">
+              <h2 className="text-sm font-medium">Jira</h2>
+              <JiraSection />
+            </section>
+          </TabsContent>
 
-        <section className="space-y-2">
-          <h2 className="text-sm font-medium">Prompt templates</h2>
-          <p className="text-xs text-muted-foreground">
-            What the one-click buttons tell the agent. Edit freely; placeholders are filled in per run.
-          </p>
-          <PromptTuning />
-        </section>
-
-        <section className={cn('space-y-2', !connected && 'opacity-50')}>
-          <h2 className="text-sm font-medium">Favorite models</h2>
-          <p className="text-xs text-muted-foreground">
-            Star the models you use most — they pin to the top of every picker.
-          </p>
-          {connected && <ModelFavorites />}
-        </section>
-
-        <section className={cn('space-y-2', !connected && 'opacity-50')}>
-          <h2 className="text-sm font-medium">Discovered from your OpenCode</h2>
-          {!connected && <p className="text-xs text-muted-foreground">Available once connected.</p>}
-          {connected && (
-            <div className="space-y-3 text-sm">
-              <InventoryRow
-                label={`Agents (${agents.data?.length ?? '…'})`}
-                items={(agents.data ?? []).map((a) => a.id)}
-                loading={agents.isLoading}
-              />
-              <InventoryRow
-                label={`Models (${models.data?.length ?? '…'})`}
-                items={(models.data ?? []).map((m) => `${m.providerID}/${m.id}`)}
-                loading={models.isLoading}
-              />
-              <InventoryRow
-                label={`Skills (${skills.data?.length ?? '…'})`}
-                items={(skills.data ?? []).map((s) => s.id)}
-                loading={skills.isLoading}
-              />
+          <TabsContent value="projects" className="mt-4 space-y-2">
+            <p className="text-xs text-muted-foreground">
+              Folders Revva may create sessions and worktrees in. Add repos you work on (Jira tickets attach in M1).
+            </p>
+            <div className="space-y-1.5">
+              {workspaces.data?.map((w) => (
+                <div key={w.id} className="flex items-center justify-between rounded-md border px-3 py-1.5 text-sm">
+                  <span className="truncate font-mono text-xs">{w.path}</span>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="size-6"
+                    onClick={() => void window.revva.workspace.remove(w.id).then(() => workspaces.refetch())}
+                  >
+                    <Trash2 className="size-3.5" />
+                  </Button>
+                </div>
+              ))}
             </div>
-          )}
-        </section>
+            <div className="flex gap-2">
+              <Input
+                placeholder="/path/to/repo (or leave empty to browse)"
+                value={newFolder}
+                onChange={(e) => setNewFolder(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && addFolder.mutate(newFolder)}
+                className="font-mono text-xs"
+              />
+              <Button size="sm" variant="outline" onClick={() => addFolder.mutate('')}>
+                <FolderPlus className="size-4" /> Add
+              </Button>
+            </div>
+            {addFolder.error instanceof Error && addFolder.error.message !== 'cancelled' && (
+              <p className="text-xs text-destructive">{addFolder.error.message}</p>
+            )}
+            <p className="pt-2 text-xs text-muted-foreground">
+              Pick a project folder, then use “New chat” to start a general session or open Jira to start work on a ticket.
+            </p>
+          </TabsContent>
+
+          <TabsContent value="agents" className="mt-4 space-y-6">
+            <section className="space-y-2">
+              <h2 className="text-sm font-medium">Agent / model defaults by role</h2>
+              <p className="text-xs text-muted-foreground">
+                Any run can override these. Empty = whatever your OpenCode service defaults to.
+              </p>
+              <RoleDefaults />
+            </section>
+
+            <section className="space-y-2">
+              <h2 className="text-sm font-medium">Prompt templates</h2>
+              <p className="text-xs text-muted-foreground">
+                What the one-click buttons tell the agent. Edit freely; placeholders are filled in per run.
+              </p>
+              <PromptTuning />
+            </section>
+          </TabsContent>
+
+          <TabsContent value="models" className={cn('mt-4 space-y-2', !connected && 'opacity-50')}>
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="flex items-center gap-1.5 text-sm font-medium">
+                <ScrollText className="size-4 text-muted-foreground" /> Discovered from your OpenCode
+              </h2>
+              {connected && (
+                <Select value={category} onValueChange={(v) => setCategory(v as InventoryCategory)}>
+                  <SelectTrigger size="sm" aria-label="Inventory category">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="models">Models ({models.data?.length ?? '…'})</SelectItem>
+                    <SelectItem value="agents">Agents ({agents.data?.length ?? '…'})</SelectItem>
+                    <SelectItem value="skills">Skills ({skills.data?.length ?? '…'})</SelectItem>
+                  </SelectContent>
+                </Select>
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {category === 'models'
+                ? 'Sorted alphabetically. Star the models you use most — favorites pin to a group on top and to every picker.'
+                : 'Sorted alphabetically, straight from your running service.'}
+            </p>
+            {!connected ? (
+              <p className="text-xs text-muted-foreground">Available once connected.</p>
+            ) : category === 'models' ? (
+              <ModelList loading={models.isLoading} />
+            ) : (
+              <InventoryRow
+                items={(category === 'agents' ? (agents.data ?? []).map((a) => a.id) : (skills.data ?? []).map((s) => s.id)).sort((a, b) => a.localeCompare(b))}
+                loading={category === 'agents' ? agents.isLoading : skills.isLoading}
+              />
+            )}
+          </TabsContent>
+        </Tabs>
 
         <Separator />
         <section className="space-y-1 text-xs text-muted-foreground">
-          <p>Pick a project folder above, then use “New chat” to start a general session or open the Board to start work on a ticket.</p>
+          <p>Everything here is read live from your machine — nothing is imported or copied.</p>
         </section>
       </div>
     </div>
@@ -308,47 +343,71 @@ function PromptField({
   )
 }
 
-function ModelFavorites(): React.JSX.Element {
+function ModelList({ loading }: { loading: boolean }): React.JSX.Element {
   const qc = useQueryClient()
   const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models() })
+
+  const byName = (a: { name?: string; id: string }, b: { name?: string; id: string }): number =>
+    (a.name || a.id).localeCompare(b.name || b.id)
+
+  const all = models.data ?? []
+  const favorites = all.filter((m) => m.favorite).sort(byName)
+  const providers = [...new Set(all.filter((m) => !m.favorite).map((m) => m.providerID))].sort()
+
+  const toggle = (key: string): void => {
+    void window.revva.models.toggleFavorite(key).then(() => {
+      void qc.invalidateQueries({ queryKey: ['models'] })
+      void qc.invalidateQueries({ queryKey: ['role-config'] })
+    })
+  }
+
+  if (loading) return <Skeleton className="h-32 w-full" />
+
+  const renderRow = (m: (typeof all)[number]): React.JSX.Element => (
+    <button
+      key={`${m.providerID}::${m.id}`}
+      onClick={() => toggle(`${m.providerID}::${m.id}`)}
+      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors hover:bg-accent"
+    >
+      <Star className={cn('size-3.5 shrink-0', m.favorite ? 'fill-amber-500 text-amber-500' : 'text-muted-foreground/50')} />
+      <span className="truncate">{m.name || m.id}</span>
+      <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground">{m.providerID}</span>
+    </button>
+  )
+
   return (
-    <div className="flex flex-wrap gap-1.5">
-      {(models.data ?? []).map((m) => (
-        <button
-          key={`${m.providerID}::${m.id}`}
-          onClick={() =>
-            void window.revva.models.toggleFavorite(`${m.providerID}::${m.id}`).then(() => {
-              void qc.invalidateQueries({ queryKey: ['models'] })
-              void qc.invalidateQueries({ queryKey: ['role-config'] })
-            })
-          }
-          className={cn(
-            'flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition-colors hover:bg-accent',
-            m.favorite && 'border-amber-500/50 bg-amber-500/10'
-          )}
-        >
-          <Star className={cn('size-3', m.favorite ? 'fill-amber-500 text-amber-500' : 'text-muted-foreground')} />
-          {m.name || m.id}
-          <span className="text-muted-foreground">{m.providerID}</span>
-        </button>
+    <div className="divide-y rounded-md border">
+      {favorites.length > 0 && (
+        <div>
+          <div className="bg-muted/50 px-3 py-1 text-[11px] font-medium text-muted-foreground">
+            ★ Favorites ({favorites.length})
+          </div>
+          {favorites.map(renderRow)}
+        </div>
+      )}
+      {providers.map((provider) => (
+        <div key={provider}>
+          <div className="bg-muted/50 px-3 py-1 font-mono text-[11px] text-muted-foreground">{provider}</div>
+          {all.filter((m) => m.providerID === provider && !m.favorite).sort(byName).map(renderRow)}
+        </div>
       ))}
+      {all.length === 0 && <p className="px-3 py-4 text-xs text-muted-foreground">No models discovered.</p>}
     </div>
   )
 }
 
-function InventoryRow({ label, items, loading }: { label: string; items: string[]; loading: boolean }): React.JSX.Element {  return (
+function InventoryRow({ items, loading }: { items: string[]; loading: boolean }): React.JSX.Element {
+  return (
     <div>
-      <div className="mb-1 text-xs font-medium text-muted-foreground">{label}</div>
       {loading ? (
         <Skeleton className="h-6 w-full" />
       ) : (
         <div className="flex flex-wrap gap-1">
-          {items.slice(0, 40).map((i) => (
+          {items.map((i) => (
             <Badge key={i} variant="secondary" className="font-mono text-[10px]">
               {i}
             </Badge>
           ))}
-          {items.length > 40 && <Badge variant="outline" className="text-[10px]">+{items.length - 40}</Badge>}
         </div>
       )}
     </div>

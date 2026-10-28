@@ -13,7 +13,7 @@ import { join, basename } from 'node:path'
 import { app } from 'electron'
 import { openCodeService, describeError } from './opencode/service'
 import { chatManager } from './opencode/chats'
-import { roleConfigGet, settingGet } from './db'
+import { roleConfigGet, settingGet, settingSet } from './db'
 import { renderPrompt, DEFAULT_PR_REVIEW_PROMPT } from '@shared/prompts'
 import type { PrDetail, PullRequest, TaskSessionResult } from '@shared/types'
 
@@ -29,32 +29,68 @@ async function gh(args: string[], cwd?: string): Promise<{ ok: boolean; out: str
   }
 }
 
+type Row = {
+  repository?: { nameWithOwner?: string }
+  title?: string
+  url?: string
+  number?: number
+  isDraft?: boolean
+  updatedAt?: string
+  state?: string
+  commentsCount?: number
+}
+
+/** Per-PR "what I've already seen" watermark, persisted across restarts. */
+type PrSeen = { latestOtherAt: number; total: number }
+const SEEN_KEY = 'githubPrSeen'
+const MERGED_LOOKBACK_DAYS = 14
+
+function todayMinus(days: number): string {
+  return new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10)
+}
+
 class GitHubManager {
+  private login: string | undefined
+  /** url → latest enrichment info, so markSeen does not refetch. */
+  private lastInfo = new Map<string, PrSeen>()
+
   /** Feature-detect for the UI (tab shows a hint instead of errors when gh is missing). */
   async available(): Promise<boolean> {
     return (await gh(['--version'])).ok
   }
 
-  /** Open PRs I authored, or PRs where my review is requested. */
+  private async myLogin(): Promise<string | undefined> {
+    if (this.login !== undefined) return this.login
+    const res = await gh(['api', 'user', '--jq', '.login'])
+    this.login = res.ok ? res.out.trim() : undefined
+    return this.login
+  }
+
+  /** Open PRs I authored (plus recently merged), or PRs where my review is requested. */
   async list(scope: 'mine' | 'review' = 'mine'): Promise<PullRequest[]> {
-    const args =
+    const fields = 'repository,title,url,number,isDraft,updatedAt,state,commentsCount'
+    const searches: string[][] =
       scope === 'mine'
-        ? ['search', 'prs', '--author=@me', '--state=open', '--sort=updated', '--order=desc', '--limit', '40']
-        : ['search', 'prs', '--review-requested=@me', '--state=open', '--sort=updated', '--order=desc', '--limit', '40']
-    const res = await gh([...args, '--json', 'repository,title,url,number,isDraft,updatedAt,state'])
-    if (!res.ok) throw new Error(res.err.trim().split('\n')[0] || 'gh search failed — is `gh auth login` done?')
-    type Row = {
-      repository?: { nameWithOwner?: string }
-      title?: string
-      url?: string
-      number?: number
-      isDraft?: boolean
-      updatedAt?: string
-      state?: string
+        ? [
+            ['search', 'prs', '--author=@me', '--state=open', '--sort=updated', '--order=desc', '--limit', '40'],
+            // "accepted or not" also means merged — show recent wins next to the open ones.
+            ['search', 'prs', '--author=@me', '--merged', '--merged-at', `>=${todayMinus(MERGED_LOOKBACK_DAYS)}`, '--sort=updated', '--order=desc', '--limit', '10']
+          ]
+        : [['search', 'prs', '--review-requested=@me', '--state=open', '--sort=updated', '--order=desc', '--limit', '40']]
+    const rows: Row[] = []
+    let errored = ''
+    for (const args of searches) {
+      const res = await gh([...args, '--json', fields])
+      if (!res.ok) {
+        errored = errored || res.err.trim().split('\n')[0] || 'gh search failed — is `gh auth login` done?'
+        continue
+      }
+      rows.push(...(JSON.parse(res.out || '[]') as Row[]))
     }
-    const rows = JSON.parse(res.out || '[]') as Row[]
-    return rows
-      .filter((r) => r.url && r.number)
+    if (rows.length === 0 && errored) throw new Error(errored)
+    const seenUrls = new Set<string>()
+    const prs = rows
+      .filter((r) => r.url && r.number && !seenUrls.has(r.url) && !!seenUrls.add(r.url))
       .map((r) => ({
         repo: r.repository?.nameWithOwner ?? 'unknown',
         number: r.number!,
@@ -62,8 +98,89 @@ class GitHubManager {
         url: r.url!,
         state: r.state ?? 'open',
         isDraft: !!r.isDraft,
-        updatedAt: Date.parse(r.updatedAt ?? '') || Date.now()
+        updatedAt: Date.parse(r.updatedAt ?? '') || Date.now(),
+        commentsCount: r.commentsCount
       }))
+    await this.enrich(prs)
+    return prs
+  }
+
+  /**
+   * One batched GraphQL call adds reviewDecision + merged state + recent comments,
+   * then flags PRs with a not-yet-seen comment from someone else (first sighting of
+   * a PR only sets the baseline — no false "new" for pre-existing comments).
+   */
+  private async enrich(prs: PullRequest[]): Promise<void> {
+    if (prs.length === 0) return
+    const byRepo = new Map<string, PullRequest[]>()
+    for (const pr of prs) {
+      const list = byRepo.get(pr.repo) ?? []
+      list.push(pr)
+      byRepo.set(pr.repo, list)
+    }
+    let q = '{'
+    const refs: Array<{ path: [string, string]; pr: PullRequest }> = []
+    let ri = 0
+    for (const [repo, list] of byRepo) {
+      const [owner, name] = repo.split('/')
+      if (!owner || !name) continue
+      const rAlias = `r${ri++}`
+      q += ` ${rAlias}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {`
+      list.forEach((pr, pi) => {
+        const pAlias = `p${pi}`
+        q += ` ${pAlias}: pullRequest(number: ${pr.number}) { reviewDecision state mergedAt comments(last: 10) { totalCount nodes { author { login } createdAt } } }`
+        refs.push({ path: [rAlias, pAlias], pr })
+      })
+      q += ' }'
+    }
+    q += '}'
+    const res = await gh(['api', 'graphql', '--field', `query=${q}`])
+    if (!res.ok) return // enrichment is best-effort; the list still renders without badges
+    type Node = { author?: { login?: string } | null; createdAt?: string }
+    type PrNode = { reviewDecision?: string; state?: string; mergedAt?: string | null; comments?: { totalCount?: number; nodes?: Node[] } }
+    const data = (JSON.parse(res.out) as { data?: Record<string, Record<string, PrNode>> }).data ?? {}
+    const me = await this.myLogin()
+    const seenMap = settingGet<Record<string, PrSeen>>(SEEN_KEY) ?? {}
+    let seenDirty = false
+
+    for (const { path, pr } of refs) {
+      const node = data[path[0]]?.[path[1]]
+      if (!node) continue
+      pr.reviewDecision = node.reviewDecision || undefined
+      if (node.mergedAt || node.state === 'MERGED') {
+        pr.merged = true
+        pr.state = 'merged'
+      }
+      const others = (node.comments?.nodes ?? [])
+        .filter((n) => n.author?.login && n.author.login !== me)
+        .map((n) => ({ author: n.author!.login!, at: Date.parse(n.createdAt ?? '') || 0 }))
+        .filter((n) => n.at > 0)
+        .sort((a, b) => b.at - a.at)
+      const total = node.comments?.totalCount ?? pr.commentsCount ?? 0
+      pr.commentsCount = total
+      const latest = others[0]
+      this.lastInfo.set(pr.url, { latestOtherAt: latest?.at ?? 0, total })
+      pr.latestOtherCommentAuthor = latest?.author
+      pr.latestOtherCommentAt = latest?.at
+      const seen = seenMap[pr.url]
+      if (!seen) {
+        seenMap[pr.url] = { latestOtherAt: latest?.at ?? 0, total }
+        seenDirty = true
+        pr.hasNewComments = false
+      } else {
+        pr.hasNewComments = !!latest && latest.at > seen.latestOtherAt
+      }
+    }
+    if (seenDirty) settingSet(SEEN_KEY, seenMap)
+  }
+
+  /** Dismiss the "new comment" flag (called on Review click and by the ✓ button). */
+  markSeen(prUrl: string): void {
+    const info = this.lastInfo.get(prUrl)
+    if (!info) return
+    const seenMap = settingGet<Record<string, PrSeen>>(SEEN_KEY) ?? {}
+    seenMap[prUrl] = info
+    settingSet(SEEN_KEY, seenMap)
   }
 
   async detail(prUrl: string): Promise<PrDetail> {

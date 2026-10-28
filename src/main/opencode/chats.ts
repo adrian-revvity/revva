@@ -11,9 +11,77 @@ import { openCodeService, describeError } from './service'
 import { eventBus, type RawEvent } from './bus'
 import { getDb } from '../db'
 import { parsePrRef, repoFromGitRemote, resolvePrRef } from '@shared/pr-ref'
-import { IPC, type ChatCreateInput, type ChatMessage, type ChatSummary, type PushEvent } from '@shared/types'
+import { IPC, type ChatCreateInput, type ChatMessage, type ChatSummary, type PromptImage, type PromptRefs, type PushEvent, type QueuedMessage } from '@shared/types'
+import { fileAttachments, skillAttachments } from './prompt-refs'
 
 const exec = promisify(execFile)
+
+/** The SDK error for "session busy" / conflicts carries status 409. */
+function isConflict(err: unknown): boolean {
+  const e = err as { status?: unknown; name?: unknown; message?: unknown }
+  if (e?.status === 409) return true
+  const msg = String(e?.message ?? err ?? '')
+  return msg.includes('409') || /conflict|busy|already running/i.test(msg)
+}
+
+/** Pull a compact, human-meaningful summary out of one OpenCode tool part. */
+function summarizeToolPart(p: Record<string, unknown>): NonNullable<ChatMessage['tools']>[number] {
+  const state = (p.state ?? {}) as Record<string, unknown>
+  const status = String(state.status ?? 'running')
+  const input = state.input
+  let detail: string | undefined
+  if (typeof input === 'string') detail = input
+  else if (input && typeof input === 'object') {
+    const obj = input as Record<string, unknown>
+    // Preferred one-liners per common tool, then first short string arg.
+    const pick = ['command', 'cmd', 'path', 'filePath', 'file_path', 'pattern', 'query', 'url', 'prompt', 'description']
+      .map((k) => (typeof obj[k] === 'string' ? (obj[k] as string) : undefined))
+      .find(Boolean)
+    detail =
+      pick ??
+      Object.entries(obj)
+        .filter(([, v]) => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')
+        .map(([k, v]) => `${k}: ${String(v)}`)
+        .join(' · ')
+  }
+  let output: string | undefined
+  if (status === 'completed') {
+    const content = state.content
+    if (Array.isArray(content)) {
+      output = content
+        .map((c) => {
+          const item = c as Record<string, unknown>
+          return typeof item.text === 'string' ? item.text : ''
+        })
+        .filter(Boolean)
+        .join('\n')
+    }
+  } else if (status === 'error') {
+    const err = state.error as Record<string, unknown> | undefined
+    output = typeof err?.message === 'string' ? err.message : typeof err?.type === 'string' ? String(err.type) : undefined
+    if (!output && Array.isArray(state.content)) {
+      output = (state.content as Array<Record<string, unknown>>)
+        .map((c) => (typeof c.text === 'string' ? c.text : ''))
+        .filter(Boolean)
+        .join('\n')
+    }
+  }
+  const truncate = (s: string | undefined): string | undefined => {
+    if (!s) return undefined
+    const t = s.trim()
+    if (!t) return undefined
+    return t.length > 2000 ? `${t.slice(0, 2000)}\n…` : t
+  }
+  return {
+    id: String(p.id ?? `${String(p.name ?? 'tool')}-${String((p.time as Record<string, unknown> | undefined)?.created ?? Date.now())}`),
+    name: String(p.name ?? 'tool'),
+    state: (['streaming', 'running', 'completed', 'error'] as const).includes(status as never)
+      ? (status as 'streaming' | 'running' | 'completed' | 'error')
+      : 'running',
+    detail: truncate(detail),
+    output: truncate(output)
+  }
+}
 
 /** Resolve a possibly-bare PR ref ("#12") against the directory's GitHub remote. */
 async function resolvePrLink(raw: string | undefined, directory: string): Promise<string | undefined> {
@@ -44,12 +112,18 @@ interface ChatRow {
   pr_url: string | null
   created_at: number
   updated_at: number
+  seen_at: number | null
 }
 
 function ensureSchema(): void {
   const cols = getDb().prepare('PRAGMA table_info(chat)').all() as Array<{ name: string }>
   if (!cols.some((c) => c.name === 'ticket_key')) getDb().exec('ALTER TABLE chat ADD COLUMN ticket_key TEXT')
   if (!cols.some((c) => c.name === 'pr_url')) getDb().exec('ALTER TABLE chat ADD COLUMN pr_url TEXT')
+  if (!cols.some((c) => c.name === 'seen_at')) {
+    getDb().exec('ALTER TABLE chat ADD COLUMN seen_at INTEGER')
+    // Existing chats were last seen "now", otherwise every row dots up after upgrading.
+    getDb().exec('UPDATE chat SET seen_at = updated_at WHERE seen_at IS NULL')
+  }
 }
 
 function rowToSummary(row: ChatRow): ChatSummary {
@@ -62,7 +136,9 @@ function rowToSummary(row: ChatRow): ChatSummary {
     modelID: row.model_id ?? undefined,
     ticketKey: row.ticket_key ?? undefined,
     prUrl: row.pr_url ?? undefined,
-    updatedAt: row.updated_at
+    updatedAt: row.updated_at,
+    // updated_at is touched on every completion; seen_at when the user last looked.
+    unread: (row.seen_at ?? 0) < row.updated_at
   }
 }
 
@@ -161,24 +237,86 @@ class ChatManager {
     const out: ChatMessage[] = []
     for (const m of res.data) {
       if (m.type === 'user') {
-        out.push({ id: m.id, role: 'user', text: m.text ?? '', createdAt: m.time?.created ?? 0 })
+        const images = (m.files ?? [])
+          .filter((f) => f.mime.startsWith('image/') && f.data)
+          .map((f) => ({ name: f.name ?? undefined, mime: f.mime, data: `data:${f.mime};base64,${f.data}` }))
+        const text = m.text ?? ''
+        if (!text && images.length === 0) continue
+        out.push({ id: m.id, role: 'user', text, images: images.length ? images : undefined, createdAt: m.time?.created ?? 0 })
       } else if (m.type === 'assistant') {
         let text = ''
+        let thinking = ''
+        const tools: ChatMessage['tools'] = []
         for (const part of m.content ?? []) {
           const p = part as Record<string, unknown>
           if (p.type === 'text' && typeof p.text === 'string') text += p.text
-          else if (p.type === 'tool') text += `\n[tool · ${String(p.name ?? p.tool ?? '?')}]\n`
+          else if (p.type === 'reasoning' && typeof p.text === 'string') thinking += p.text
+          else if (p.type === 'tool') tools.push(summarizeToolPart(p))
         }
-        out.push({ id: m.id, role: 'assistant', text: text.trim(), createdAt: m.time?.created ?? 0 })
+        const msg: ChatMessage = {
+          id: m.id,
+          role: 'assistant',
+          text: text.trim(),
+          tools: tools.length ? tools : undefined,
+          thinking: thinking.trim() || undefined,
+          createdAt: m.time?.created ?? 0
+        }
+        if (!msg.text && !msg.tools && !msg.thinking) continue
+        out.push(msg)
       }
     }
-    return out.filter((m) => m.text.length > 0)
+    return out
   }
 
-  async prompt(sessionId: string, text: string): Promise<void> {
+  /** Messages waiting in OpenCode's inbox (queued follow-ups). */
+  async queue(sessionId: string): Promise<QueuedMessage[]> {
+    try {
+      const items = await openCodeService.api.session.inbox.list({ sessionID: sessionId })
+      return items
+        .filter((i) => i.type === 'user')
+        .map((i) => ({
+          id: i.id,
+          text: i.payload.text ?? '',
+          imageCount: (i.payload.files ?? []).length,
+          createdAt: i.time?.created ?? 0
+        }))
+    } catch {
+      return []
+    }
+  }
+
+  async cancelQueued(sessionId: string, inboxId: string): Promise<void> {
+    await openCodeService.api.session.inbox.cancel({ sessionID: sessionId, inboxID: inboxId })
+  }
+
+  async prompt(sessionId: string, text: string, images: PromptImage[] = [], queued = false, refs?: PromptRefs): Promise<void> {
     const api = openCodeService.api
     getDb().prepare('UPDATE chat SET updated_at = ? WHERE session_id = ?').run(Date.now(), sessionId)
-    await api.session.prompt({ sessionID: sessionId, text })
+    const dir = this.directoryOf(sessionId)
+    const files = [
+      ...images.map((img) => {
+        const base64 = img.data.startsWith('data:') ? img.data.slice(img.data.indexOf(',') + 1) : img.data
+        return { uri: `data:${img.mime};base64,${base64}`, name: img.name }
+      }),
+      ...(refs && dir ? fileAttachments(refs, dir) : [])
+    ]
+    const skills = refs ? skillAttachments(refs) : []
+    const payload = {
+      sessionID: sessionId,
+      text,
+      ...(files.length ? { files } : {}),
+      ...(skills.length ? { skills } : {}),
+      delivery: (queued ? 'queue' : 'steer') as 'queue' | 'steer'
+    }
+    try {
+      // 'steer' only matters while the session runs: inject at the next step.
+      // 'queue' waits for the current run to finish. Idle sessions run immediately.
+      await api.session.prompt(payload)
+    } catch (err) {
+      // Steer refused (409, session state raced) — park the message instead of losing it.
+      if (!queued && isConflict(err)) await api.session.prompt({ ...payload, delivery: 'queue' })
+      else throw err
+    }
   }
 
   async interrupt(sessionId: string): Promise<void> {
@@ -200,6 +338,18 @@ class ChatManager {
 
   private touch(sessionId: string): void {
     getDb().prepare('UPDATE chat SET updated_at = ? WHERE session_id = ?').run(Date.now(), sessionId)
+  }
+
+  /** "I've looked at it": clears the sidebar unread dot. MAX() so a completion
+   *  landing in the same millisecond does not immediately re-flag it. */
+  markSeen(sessionId: string): void {
+    getDb().prepare('UPDATE chat SET seen_at = MAX(?, updated_at) WHERE session_id = ?').run(Date.now(), sessionId)
+  }
+
+  /** The chat's working directory ('' when the index row is gone). */
+  private directoryOf(sessionId: string): string {
+    const row = getDb().prepare('SELECT directory FROM chat WHERE session_id = ?').get(sessionId) as { directory: string } | undefined
+    return row?.directory ?? ''
   }
 
   private isChat(sessionId: string): boolean {

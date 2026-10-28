@@ -6,6 +6,8 @@
  * `stream:reconnect` so subsystems can resync.
  */
 import { EventEmitter } from 'node:events'
+import { BrowserWindow } from 'electron'
+import { IPC, type PushEvent } from '@shared/types'
 import { openCodeService } from './service'
 
 class EventBus extends EventEmitter {
@@ -46,6 +48,9 @@ class EventBus extends EventEmitter {
           backoff = 1000
           if (process.env.REVVA_DEBUG_EVENTS) console.log('[bus]', (event as RawEvent).type)
           this.emit('event', event)
+          this.pushActivity(event as RawEvent)
+          this.pushInbox(event as RawEvent)
+          this.pushModel(event as RawEvent)
         }
       } catch {
         // stream error — fall through to reconnect
@@ -56,6 +61,42 @@ class EventBus extends EventEmitter {
       await new Promise((r) => setTimeout(r, backoff))
       backoff = Math.min(backoff * 2, 15_000)
     }
+  }
+
+  private pushActivity(event: RawEvent): void {
+    const sessionId = event.data?.sessionID
+    if (typeof sessionId !== 'string') return
+    let running: boolean | undefined
+    if (event.type === 'session.execution.started') running = true
+    else if (
+      event.type === 'session.execution.succeeded' ||
+      event.type === 'session.execution.failed' ||
+      event.type === 'session.execution.interrupted'
+    ) running = false
+    else if (event.type === 'session.status') {
+      const status = event.data?.status as { type?: unknown } | undefined
+      if (status?.type === 'busy' || status?.type === 'retry') running = true
+      else if (status?.type === 'idle') running = false
+    }
+    if (running === undefined) return
+    const update: PushEvent = { kind: 'session.activity', sessionId, running }
+    for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IPC.eventPush, update)
+  }
+
+  private pushInbox(event: RawEvent): void {
+    const sessionId = event.data?.sessionID
+    if (typeof sessionId !== 'string') return
+    if (!event.type.startsWith('session.inbox.')) return
+    const update: PushEvent = { kind: 'session.queue', sessionId }
+    for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IPC.eventPush, update)
+  }
+
+  private pushModel(event: RawEvent): void {
+    if (event.type !== 'session.model.selected') return
+    const sessionId = event.data?.sessionID
+    if (typeof sessionId !== 'string') return
+    const update: PushEvent = { kind: 'session.model', sessionId }
+    for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IPC.eventPush, update)
   }
 }
 

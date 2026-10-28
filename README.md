@@ -38,6 +38,51 @@ Jira sprint board ──▶ pick tickets ──▶ worktree + branch per ticket
 
 The same list is available in-app: **Setup → Features**.
 
+## Run Revva
+
+From the project folder, install dependencies once and start the app:
+
+```sh
+pnpm install
+pnpm dev
+```
+
+After the first install, just run `pnpm dev`. Leave the terminal running while
+you use Revva; press `Ctrl+C` there to stop it. OpenCode must be installed for
+agent features; Jira and GitHub can be connected as needed in Setup.
+
+For quicker launches on macOS, add an alias to `~/.zshrc`, replacing the path
+with your checkout's location (run `pwd` in the project folder to find it):
+
+```sh
+alias revva='cd /path/to/revva && pnpm dev'
+```
+
+Open a new terminal, then run `revva` from anywhere. This is a development
+launch, not an installed app — for installers see Releases below.
+
+## Releases & changelog
+
+Versioning lives in `package.json` (semver); user-facing changes are recorded in
+[CHANGELOG.md](CHANGELOG.md) under `[Unreleased]` as they happen.
+
+To cut a release (from a clean `main`):
+
+```sh
+pnpm release:patch   # or release:minor / release:major
+```
+
+This bumps the version, seals the `[Unreleased]` changelog section under the new
+version, commits, tags `vX.Y.Z`, and pushes. The tag triggers
+`.github/workflows/release.yml`, which builds the macOS DMG + ZIP on GitHub
+and publishes them on the [Releases page](https://github.com/adrian-revvity/revva/releases)
+with the matching changelog section as release notes. Builds are unsigned for
+now (Developer ID signing can be added later with `CSC_LINK` secrets) — the
+first launch may need right-click → Open.
+
+In-app: **Setup → v0.x.x → Changelog** shows the bundled changelog and links to
+downloads.
+
 ## What it is not
 
 Not a server platform. No Vercel/Neon, no sandboxes, no second agent runtime. revva is a local **cockpit over opencode**. It discovers each user's OpenCode models, agents, skills, and configuration; it does not assume the providers or files currently configured on the original developer's machine.

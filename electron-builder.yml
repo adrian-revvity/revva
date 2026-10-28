@@ -2,8 +2,19 @@ appId: dev.revva.app
 productName: Revva
 directories:
   buildResources: build
+  output: release
 files:
   - out/**
+  - CHANGELOG.md
   - '!node_modules/**/{*.md,LICENSE,license,*.map}'
 asarUnpack:
   - node_modules/better-sqlite3/**
+mac:
+  icon: build/icon.icns
+  category: public.app-category.developer-tools
+  target:
+    - target: dmg
+      arch: [arm64]
+    - target: zip
+      arch: [arm64]
+artifactName: ${name}-${version}-${arch}.${ext}

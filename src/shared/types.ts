@@ -90,7 +90,9 @@ export const chatSummarySchema = z.object({
   modelID: z.string().optional(),
   ticketKey: z.string().optional(),
   prUrl: z.string().optional(),
-  updatedAt: z.number()
+  updatedAt: z.number(),
+  /** Finished a run since the user last opened it (sidebar dot). */
+  unread: z.boolean().optional()
 })
 export type ChatSummary = z.infer<typeof chatSummarySchema>
 
@@ -107,14 +109,111 @@ export type ChatCreateInput = z.infer<typeof chatCreateInputSchema>
 
 export type ChatRole = 'user' | 'assistant' | 'system' | 'tool'
 
+/** One image rendered inside a transcript bubble (base64 data URL). */
+export const chatImageSchema = z.object({
+  name: z.string().optional(),
+  mime: z.string(),
+  data: z.string()
+})
+export type ChatImage = z.infer<typeof chatImageSchema>
+
+/** A tool invocation summarized from OpenCode message parts. */
+export const chatToolCallSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  state: z.enum(['streaming', 'running', 'completed', 'error']),
+  /** One-line summary of the input (command, path, pattern…). */
+  detail: z.string().optional(),
+  /** Truncated text output or error message. */
+  output: z.string().optional()
+})
+export type ChatToolCall = z.infer<typeof chatToolCallSchema>
+
 export const chatMessageSchema = z.object({
   id: z.string(),
   role: z.enum(['user', 'assistant', 'system', 'tool']),
   text: z.string(),
   toolName: z.string().optional(),
+  /** Images attached to a user message (composer attachments, pasted screenshots). */
+  images: z.array(chatImageSchema).optional(),
+  /** One collapsed step per tool call the assistant made (rendered expandable). */
+  tools: z.array(chatToolCallSchema).optional(),
+  /** Model reasoning/thinking text, when the provider surfaced it. */
+  thinking: z.string().optional(),
   createdAt: z.number()
 })
 export type ChatMessage = z.infer<typeof chatMessageSchema>
+
+/* ---------- Composer attachments ---------- */
+
+const MAX_ATTACHMENTS = 8
+
+/** Renderer sends images as base64 (data URLs or bare base64); main forwards them to OpenCode. */
+export const promptImageSchema = z.object({
+  name: z.string().max(300).optional(),
+  mime: z.enum(['image/png', 'image/jpeg', 'image/gif', 'image/webp']),
+  data: z.string().min(1).max(14_000_000)
+})
+export type PromptImage = z.infer<typeof promptImageSchema>
+
+/** One message waiting in OpenCode's session inbox. */
+export const queuedMessageSchema = z.object({
+  id: z.string(),
+  text: z.string(),
+  imageCount: z.number(),
+  createdAt: z.number()
+})
+export type QueuedMessage = z.infer<typeof queuedMessageSchema>
+
+/* ---------- Worktree cleanup ---------- */
+
+export const worktreeInfoSchema = z.object({
+  /** Main checkout that owns the worktree. */
+  repoDir: z.string(),
+  directory: z.string(),
+  branch: z.string().optional(),
+  detached: z.boolean().optional(),
+  locked: z.string().optional(),
+  /** Git says the admin entry is stale (directory gone). */
+  prunable: z.boolean().optional(),
+  /** Lives under revva's worktree root. */
+  inWorktreeRoot: z.boolean(),
+  /** A revva work row references this directory. */
+  revva: z.boolean(),
+  ticketKey: z.string().optional(),
+  /** Revva work still live — removal must go through abandon. */
+  busy: z.boolean().optional()
+})
+export type WorktreeInfo = z.infer<typeof worktreeInfoSchema>
+
+export const worktreeRemoveInputSchema = z.object({
+  repoDir: z.string().min(1),
+  directory: z.string().min(1),
+  force: z.boolean().default(true)
+})
+export type WorktreeRemoveInput = z.infer<typeof worktreeRemoveInputSchema>
+
+/* ---------- Composer autocomplete ---------- */
+
+/** One file hit from `file.find` in the session's directory (slash/@ command menus). */
+export const fileHitSchema = z.object({
+  path: z.string(),
+  type: z.enum(['file', 'directory'])
+})
+export type FileHit = z.infer<typeof fileHitSchema>
+
+/** A skill or file the composer tokenized out of the message text (`/skill`, `@file`). */
+export const promptRefsSchema = z.object({
+  skills: z
+    .array(z.object({ id: z.string(), name: z.string(), start: z.number().int(), end: z.number().int(), text: z.string() }))
+    .max(8)
+    .default([]),
+  files: z
+    .array(z.object({ path: z.string().max(1000), start: z.number().int(), end: z.number().int(), text: z.string().max(1000) }))
+    .max(12)
+    .default([])
+})
+export type PromptRefs = z.infer<typeof promptRefsSchema>
 
 /* ---------- Jira board / works ---------- */
 
@@ -286,7 +385,16 @@ export const pullRequestSchema = z.object({
   url: z.string(),
   state: z.string(),
   isDraft: z.boolean(),
-  updatedAt: z.number()
+  updatedAt: z.number(),
+  /** Enriched from GraphQL: APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED / ... */
+  reviewDecision: z.string().optional(),
+  /** True when merged (search lists recently-merged PRs too). */
+  merged: z.boolean().optional(),
+  commentsCount: z.number().optional(),
+  /** Unseen (by the user) comments from someone else exist on this PR. */
+  hasNewComments: z.boolean().optional(),
+  latestOtherCommentAuthor: z.string().optional(),
+  latestOtherCommentAt: z.number().optional()
 })
 export type PullRequest = z.infer<typeof pullRequestSchema>
 
@@ -395,6 +503,10 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('chat.message'), sessionId: z.string(), message: chatMessageSchema }),
   z.object({ kind: z.literal('chat.idle'), sessionId: z.string() }),
   z.object({ kind: z.literal('chat.tool'), sessionId: z.string(), tool: z.string(), state: z.string() }),
+  /** Queue contents or the session's selected model changed — renderer refetches. */
+  z.object({ kind: z.literal('session.queue'), sessionId: z.string() }),
+  z.object({ kind: z.literal('session.model'), sessionId: z.string() }),
+  z.object({ kind: z.literal('session.activity'), sessionId: z.string(), running: z.boolean() }),
   z.object({ kind: z.literal('work.updated'), workId: z.string(), state: workStateSchema }),
   z.object({ kind: z.literal('work.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
   z.object({ kind: z.literal('inbox'), items: z.array(pendingItemSchema) }),
@@ -430,14 +542,38 @@ export interface RevvaApi {
     remove(id: string): Promise<void>
     pickFolder(): Promise<string | null>
   }
+  shell: {
+    /** Open an http(s) URL in the user's default browser. */
+    openExternal(url: string): Promise<void>
+  }
+  app: {
+    /** App version + bundled CHANGELOG.md text. */
+    meta(): Promise<{ version: string; changelog: string }>
+  }
   chat: {
     list(): Promise<ChatSummary[]>
     create(input: ChatCreateInput): Promise<ChatSummary>
     messages(sessionId: string): Promise<ChatMessage[]>
-    prompt(sessionId: string, text: string): Promise<void>
+    /** `queued` = park in the inbox behind the running turn instead of steering into it. */
+    prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs): Promise<void>
     interrupt(sessionId: string): Promise<void>
     rename(sessionId: string, title: string): Promise<void>
+    /** Clears the unread dot after the user has looked at the chat. */
+    markSeen(sessionId: string): Promise<void>
     remove(sessionId: string): Promise<void>
+  }
+  session: {
+    model(sessionId: string): Promise<(ModelRef & { variant?: string }) | null>
+    active(): Promise<string[]>
+    /** Messages waiting in OpenCode's inbox for this session. */
+    queue(sessionId: string): Promise<QueuedMessage[]>
+    cancelQueued(sessionId: string, inboxId: string): Promise<void>
+  }
+  worktrees: {
+    /** Linked worktrees across known repos (revva-created or not). */
+    list(): Promise<WorktreeInfo[]>
+    /** Removes the worktree; deletes its branch only when git allows (`-d`). Returns a note. */
+    remove(input: WorktreeRemoveInput): Promise<string | undefined>
   }
   jira: {
     status(): Promise<JiraStatus>
@@ -450,7 +586,7 @@ export interface RevvaApi {
     list(): Promise<WorkSummary[]>
     abandon(id: string): Promise<string | undefined>
     messages(sessionId: string): Promise<ChatMessage[]>
-    prompt(sessionId: string, text: string): Promise<void>
+    prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs): Promise<void>
     interrupt(sessionId: string): Promise<void>
     /** Review ledger for one work (all rounds). */
     reviews(workId: string): Promise<ReviewRow[]>
@@ -472,10 +608,12 @@ export interface RevvaApi {
     tackle(workId: string): Promise<void>
   }
   github: {
-    /** Open PRs authored by / reviewing for the gh user. */
+    /** Open PRs authored by / reviewing for the gh user (plus recently merged in "mine"). */
     list(scope?: 'mine' | 'review'): Promise<PullRequest[]>
     /** Spin up a PR-review agent session (worktree checked out in the background). */
     review(prUrl: string): Promise<TaskSessionResult>
+    /** Clear the "new comment" flag for a PR. */
+    markSeen(prUrl: string): Promise<void>
   }
   task: {
     /** Ad-hoc session linked to a ticket (no pipeline), in that ticket's repo or a chosen folder. */
@@ -485,6 +623,10 @@ export interface RevvaApi {
     favorites(): Promise<string[]>
     /** key = `providerID::modelID`; returns the new favorite list. */
     toggleFavorite(key: string): Promise<string[]>
+  }
+  file: {
+    /** Fuzzy file paths in the session's directory, for the composer's @ picker. */
+    find(sessionId: string, query: string): Promise<FileHit[]>
   }
   inbox: {
     list(): Promise<PendingItem[]>
