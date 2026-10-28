@@ -14,6 +14,7 @@ import { promisify } from 'node:util'
 import { BrowserWindow } from 'electron'
 import { openCodeService, describeError } from './opencode/service'
 import { eventBus, type RawEvent } from './opencode/bus'
+import { streamBuffer } from './opencode/stream-buffer'
 import { listSkills } from './opencode/inventory'
 import { getDb, roleConfigGet, settingGet } from './db'
 import { workManager } from './pipeline/works'
@@ -229,15 +230,13 @@ class ReviewManager {
     switch (e.type) {
       case 'session.text.delta': {
         // Forward live text so the cockpit can show reviewers thinking in real time.
-        for (const win of BrowserWindow.getAllWindows()) {
-          win.webContents.send(IPC.eventPush, {
-            kind: 'review.delta',
-            workId: tracked.workId,
-            sessionId,
-            messageId: String(data.assistantMessageID ?? ''),
-            text: String(data.delta ?? '')
-          })
-        }
+        streamBuffer.push({
+          kind: 'review.delta',
+          workId: tracked.workId,
+          sessionId,
+          messageId: String(data.assistantMessageID ?? ''),
+          text: String(data.delta ?? '')
+        })
         break
       }
       case 'session.execution.succeeded':
@@ -258,6 +257,8 @@ class ReviewManager {
     if (!t) return
     this.sessions.delete(sessionId)
     clearTimeout(t.timer)
+    // Last streamed text must reach renderers before the review.updated push below.
+    streamBuffer.flush(sessionId)
 
     let status: ReviewStatus = forcedStatus ?? 'changes'
     let text = findings ?? ''

@@ -115,8 +115,6 @@ function ReviewTranscript({ row, onClose }: { row: ReviewRow; onClose: () => voi
   const running = row.status === 'running' || row.status === 'pending'
 
   const drive = useMemo<TranscriptDrive>(() => {
-    let buffer = ''
-    let currentMessage = ''
     return {
       queryKey: ['review-messages'],
       load: (id) => window.revva.work.messages(id),
@@ -126,20 +124,12 @@ function ReviewTranscript({ row, onClose }: { row: ReviewRow; onClose: () => voi
       interrupt: (id) => window.revva.work.interrupt(id),
       subscribe: (_id, onDelta, onDone) =>
         window.revva.events.on((event: PushEvent) => {
+          // review.delta carries accumulated text (main buffers per message).
           if (event.kind === 'review.delta' && event.sessionId === _id) {
-            if (event.messageId !== currentMessage) {
-              currentMessage = event.messageId
-              buffer = ''
-            }
-            buffer += event.text
-            onDelta(buffer)
+            onDelta(event.text)
           } else if (event.kind === 'review.updated') {
             const fresh = (qc.getQueryData<ReviewRow[]>(['reviews', event.workId]) ?? []).find((r) => r.id === row.id)
-            if (fresh && fresh.status !== 'running' && fresh.status !== 'pending') {
-              buffer = ''
-              currentMessage = ''
-              onDone()
-            }
+            if (fresh && fresh.status !== 'running' && fresh.status !== 'pending') onDone()
           }
         })
     }

@@ -11,6 +11,7 @@ import { BrowserWindow } from 'electron'
 import { jiraMcp } from './mcp'
 import { getDb, settingGet } from '../db'
 import { sessionIndex } from '../opencode/session-index'
+import { streamBuffer } from '../opencode/stream-buffer'
 import { openCodeService, describeError } from '../opencode/service'
 import { eventBus, type RawEvent } from '../opencode/bus'
 import { shipManager } from '../ship'
@@ -185,23 +186,23 @@ class CommentWatcher {
 
     switch (e.type) {
       case 'session.text.delta':
-        for (const win of BrowserWindow.getAllWindows()) {
-          win.webContents.send(IPC.eventPush, {
-            kind: 'work.delta',
-            workId,
-            sessionId,
-            messageId: String(data.assistantMessageID ?? ''),
-            text: String(data.delta ?? '')
-          })
-        }
+        streamBuffer.push({
+          kind: 'work.delta',
+          workId,
+          sessionId,
+          messageId: String(data.assistantMessageID ?? ''),
+          text: String(data.delta ?? '')
+        })
         break
       case 'session.execution.succeeded':
         this.reworking.delete(sessionId)
+        streamBuffer.flush(sessionId)
         void this.finishRework(workId, sessionId)
         break
       case 'session.execution.failed':
       case 'session.execution.interrupted':
         this.reworking.delete(sessionId)
+        streamBuffer.flush(sessionId)
         workManager.setReviewState(workId, 'WAITING_HUMAN')
         break
     }

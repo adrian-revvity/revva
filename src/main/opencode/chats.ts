@@ -9,6 +9,7 @@ import { promisify } from 'node:util'
 import { BrowserWindow } from 'electron'
 import { openCodeService, describeError } from './service'
 import { eventBus, type RawEvent } from './bus'
+import { streamBuffer } from './stream-buffer'
 import { getDb } from '../db'
 import { sessionIndex } from './session-index'
 import { parsePrRef, repoFromGitRemote, resolvePrRef } from '@shared/pr-ref'
@@ -139,7 +140,6 @@ function send(event: PushEvent): void {
 class ChatManager {
   private wired = false
   /** messageID → accumulated streamed text, for live transcript updates. */
-  private streaming = new Map<string, { sessionId: string; text: string }>()
 
   wire(): void {
     if (this.wired) return
@@ -350,11 +350,12 @@ class ChatManager {
     if (sessionIndex.kindOf(sessionId) !== 'chat') return
     switch (e.type) {
       case 'session.text.delta': {
-        const msgId = String(data.assistantMessageID ?? '')
-        const entry = this.streaming.get(msgId) ?? { sessionId, text: '' }
-        entry.text += typeof data.delta === 'string' ? data.delta : ''
-        this.streaming.set(msgId, entry)
-        send({ kind: 'chat.delta', sessionId, messageId: msgId, text: entry.text })
+        streamBuffer.push({
+          kind: 'chat.delta',
+          sessionId,
+          messageId: String(data.assistantMessageID ?? ''),
+          text: typeof data.delta === 'string' ? data.delta : ''
+        })
         break
       }
       case 'session.tool.called': {
@@ -368,7 +369,9 @@ class ChatManager {
         // Primary completion signal for API-driven sessions is session.execution.*;
         // session.idle may also fire but must not be required.
         this.touch(sessionId)
-        this.streaming.clear()
+        // Flush accumulated text before idle so the renderer's final refetch
+        // never races a missing tail (ordering: last text, then idle).
+        streamBuffer.flush(sessionId)
         send({ kind: 'chat.idle', sessionId })
         break
       }

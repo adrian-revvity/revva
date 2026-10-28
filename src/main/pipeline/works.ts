@@ -18,6 +18,7 @@ import { eventBus, type RawEvent } from '../opencode/bus'
 import { getTicket } from '../jira/board'
 import { getDb, settingGet } from '../db'
 import { sessionIndex } from '../opencode/session-index'
+import { streamBuffer } from '../opencode/stream-buffer'
 import { reviewManager } from '../review'
 import { renderPrompt, DEFAULT_START_PROMPT } from '@shared/prompts'
 import { IPC, type PromptImage, type PromptRefs, type StartWorkInput, type WorkState, type WorkSummary } from '@shared/types'
@@ -294,20 +295,18 @@ class WorkManager {
     switch (e.type) {
       case 'session.text.delta': {
         if (work.state !== 'BUILDING') return
-        const msgId = String(data.assistantMessageID ?? '')
-        for (const win of BrowserWindow.getAllWindows()) {
-          win.webContents.send(IPC.eventPush, {
-            kind: 'work.delta',
-            workId: work.id,
-            sessionId,
-            messageId: msgId,
-            text: String(data.delta ?? '')
-          })
-        }
+        streamBuffer.push({
+          kind: 'work.delta',
+          workId: work.id,
+          sessionId,
+          messageId: String(data.assistantMessageID ?? ''),
+          text: String(data.delta ?? '')
+        })
         break
       }
       case 'session.execution.succeeded': {
         if (work.state !== 'BUILDING') return
+        streamBuffer.flush(sessionId)
         // M4: build finished → concurrent read-only reviewer fan-out (no more auto-approve).
         this.setState(work.id, 'REVIEW')
         void reviewManager.startRound(work.id, 1).catch((err) => {
@@ -318,6 +317,7 @@ class WorkManager {
       }
       case 'session.execution.failed':
       case 'session.execution.interrupted': {
+        streamBuffer.flush(sessionId)
         if (work.state === 'BUILDING') this.setState(work.id, 'WAITING_HUMAN')
         break
       }
