@@ -12,12 +12,16 @@ import {
 /** Kept in sync with README "Features" (single source of truth lives in the README). */
 const FEATURES: Array<{ title: string; body: string }> = [
   {
-    title: 'Sprint board',
+    title: 'Dashboard',
+    body: 'Landing view summarizing everything: OpenCode health, Jira sprint progress, inbox, active pipeline work, PRs needing attention, script status, recent chats. Every card deep-links into its view.'
+  },
+  {
+    title: 'Sprint board (Jira)',
     body: 'Current-sprint tickets assigned to you, via the Atlassian MCP over revva\u2019s own OAuth connection.'
   },
   {
     title: 'Start work',
-    body: 'Git worktree + branch per ticket in a workspace folder you pick; optionally branch from another ticket\u2019s branch (stacked work, gh-stack-compatible PR bases).'
+    body: 'Git worktree + branch per ticket in a workspace folder you pick; optionally branch from another ticket\u2019s branch (stacked work, gh-stack-compatible PR bases). A worktree cleanup dialog lists stale worktrees across your repos and removes them safely.'
   },
   {
     title: 'Optional grill-me intake',
