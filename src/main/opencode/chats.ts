@@ -15,16 +15,10 @@ import { sessionIndex } from './session-index'
 import { parsePrRef, repoFromGitRemote, resolvePrRef } from '@shared/pr-ref'
 import { IPC, type ChatCreateInput, type ChatMessage, type ChatSummary, type PromptImage, type PromptRefs, type PushEvent, type QueuedMessage } from '@shared/types'
 import { fileAttachments, skillAttachments } from './prompt-refs'
+import { pushToWindows } from '../push'
+import { isConflict, promptImageFiles } from '../util'
 
 const exec = promisify(execFile)
-
-/** The SDK error for "session busy" / conflicts carries status 409. */
-function isConflict(err: unknown): boolean {
-  const e = err as { status?: unknown; name?: unknown; message?: unknown }
-  if (e?.status === 409) return true
-  const msg = String(e?.message ?? err ?? '')
-  return msg.includes('409') || /conflict|busy|already running/i.test(msg)
-}
 
 /** Pull a compact, human-meaningful summary out of one OpenCode tool part. */
 function summarizeToolPart(p: Record<string, unknown>): NonNullable<ChatMessage['tools']>[number] {
@@ -133,10 +127,6 @@ function rowToSummary(row: ChatRow): ChatSummary {
   }
 }
 
-function send(event: PushEvent): void {
-  for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IPC.eventPush, event)
-}
-
 class ChatManager {
   private wired = false
   /** messageID → accumulated streamed text, for live transcript updates. */
@@ -146,7 +136,7 @@ class ChatManager {
     this.wired = true
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
     // SSE is live-only: after a reconnect the renderer refetches via its queries.
-    eventBus.on('stream:reconnect', () => send({ kind: 'chat.idle', sessionId: '*' }))
+    eventBus.on('stream:reconnect', () => pushToWindows({ kind: 'chat.idle', sessionId: '*' }))
   }
 
   list(): ChatSummary[] {
@@ -283,13 +273,7 @@ class ChatManager {
     const api = openCodeService.api
     getDb().prepare('UPDATE chat SET updated_at = ? WHERE session_id = ?').run(Date.now(), sessionId)
     const dir = this.directoryOf(sessionId)
-    const files = [
-      ...images.map((img) => {
-        const base64 = img.data.startsWith('data:') ? img.data.slice(img.data.indexOf(',') + 1) : img.data
-        return { uri: `data:${img.mime};base64,${base64}`, name: img.name }
-      }),
-      ...(refs && dir ? fileAttachments(refs, dir) : [])
-    ]
+    const files = [...promptImageFiles(images), ...(refs && dir ? fileAttachments(refs, dir) : [])]
     const skills = refs ? skillAttachments(refs) : []
     const payload = {
       sessionID: sessionId,
@@ -359,7 +343,7 @@ class ChatManager {
         break
       }
       case 'session.tool.called': {
-        send({ kind: 'chat.tool', sessionId, tool: String(data.name ?? data.tool ?? 'tool'), state: 'called' })
+        pushToWindows({ kind: 'chat.tool', sessionId, tool: String(data.name ?? data.tool ?? 'tool'), state: 'called' })
         break
       }
       case 'session.execution.succeeded':
@@ -372,7 +356,7 @@ class ChatManager {
         // Flush accumulated text before idle so the renderer's final refetch
         // never races a missing tail (ordering: last text, then idle).
         streamBuffer.flush(sessionId)
-        send({ kind: 'chat.idle', sessionId })
+        pushToWindows({ kind: 'chat.idle', sessionId })
         break
       }
     }

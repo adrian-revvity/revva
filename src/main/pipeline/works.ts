@@ -19,6 +19,8 @@ import { getTicket } from '../jira/board'
 import { getDb, settingGet } from '../db'
 import { sessionIndex } from '../opencode/session-index'
 import { streamBuffer } from '../opencode/stream-buffer'
+import { pushToWindows } from '../push'
+import { collectAdfText, isConflict, promptImageFiles } from '../util'
 import { reviewManager } from '../review'
 import { renderPrompt, DEFAULT_START_PROMPT } from '@shared/prompts'
 import { IPC, type PromptImage, type PromptRefs, type StartWorkInput, type WorkState, type WorkSummary } from '@shared/types'
@@ -274,9 +276,7 @@ class WorkManager {
   }
 
   private emit(id: string, state: WorkState): void {
-    for (const win of BrowserWindow.getAllWindows()) {
-      win.webContents.send(IPC.eventPush, { kind: 'work.updated', workId: id, state })
-    }
+    pushToWindows({ kind: 'work.updated', workId: id, state })
   }
 
   private workBySession(sessionId: string): WorkRow | undefined {
@@ -356,13 +356,7 @@ class WorkManager {
       if (['WAITING_HUMAN', 'APPROVED', 'REVIEW', 'FIXING'].includes(work.state)) this.setState(work.id, 'BUILDING')
       this.touch(work.id)
     }
-    const files = [
-      ...images.map((img) => {
-        const base64 = img.data.startsWith('data:') ? img.data.slice(img.data.indexOf(',') + 1) : img.data
-        return { uri: `data:${img.mime};base64,${base64}`, name: img.name }
-      }),
-      ...(refs && work ? fileAttachments(refs, work.worktree_dir) : [])
-    ]
+    const files = [...promptImageFiles(images), ...(refs && work ? fileAttachments(refs, work.worktree_dir) : [])]
     const skills = refs ? skillAttachments(refs) : []
     const payload = {
       sessionID: sessionId,
@@ -375,9 +369,7 @@ class WorkManager {
       await openCodeService.api.session.prompt(payload)
     } catch (err) {
       // Steer refused (session state raced) — park the follow-up so it is not lost.
-      const msg = String((err as Error)?.message ?? err ?? '')
-      const conflict = (err as { status?: unknown })?.status === 409 || /409|conflict|busy|already running/i.test(msg)
-      if (!queued && conflict) await openCodeService.api.session.prompt({ ...payload, delivery: 'queue' })
+      if (!queued && isConflict(err)) await openCodeService.api.session.prompt({ ...payload, delivery: 'queue' })
       else throw err
     }
   }
@@ -423,17 +415,7 @@ function extractDescription(raw: unknown): string {
   if (typeof d === 'string') return d
   if (d && typeof d === 'object') {
     // ADF → crude text extraction; rich rendering lands with the UI polish pass.
-    const texts: string[] = []
-    const walk = (n: unknown): void => {
-      if (Array.isArray(n)) return void n.forEach(walk)
-      if (n && typeof n === 'object') {
-        const o = n as Record<string, unknown>
-        if (typeof o.text === 'string') texts.push(o.text)
-        if (o.content) walk(o.content)
-      }
-    }
-    walk(d)
-    return texts.join('\n')
+    return collectAdfText(d).join('\n')
   }
   return ''
 }

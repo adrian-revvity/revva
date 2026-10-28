@@ -7,8 +7,9 @@
  */
 import { Service, type Endpoint } from '@opencode/client/service'
 import { OpenCode } from '@opencode/client'
-import { BrowserWindow, app } from 'electron'
-import { IPC, type ServiceStatus } from '@shared/types'
+import { app } from 'electron'
+import type { ServiceStatus } from '@shared/types'
+import { pushToWindows } from '../push'
 
 type Listener = (status: ServiceStatus) => void
 
@@ -113,9 +114,7 @@ export class OpenCodeService {
   private setStatus(next: ServiceStatus): void {
     this.status = next
     for (const fn of this.listeners) fn(next)
-    for (const win of BrowserWindow.getAllWindows()) {
-      win.webContents.send(IPC.eventPush, { kind: 'service', status: next })
-    }
+    pushToWindows({ kind: 'service', status: next })
   }
 
   dispose(): void {

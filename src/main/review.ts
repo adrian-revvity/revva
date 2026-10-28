@@ -15,6 +15,8 @@ import { BrowserWindow } from 'electron'
 import { openCodeService, describeError } from './opencode/service'
 import { eventBus, type RawEvent } from './opencode/bus'
 import { streamBuffer } from './opencode/stream-buffer'
+import { pushToWindows } from './push'
+import { fetchLastAssistantText } from './util'
 import { listSkills } from './opencode/inventory'
 import { getDb, roleConfigGet, settingGet } from './db'
 import { workManager } from './pipeline/works'
@@ -264,12 +266,7 @@ class ReviewManager {
     let text = findings ?? ''
     if (!forcedStatus) {
       try {
-        const res = await openCodeService.api.message.list({ sessionID: sessionId, order: 'asc', limit: 200 })
-        const lastAssistant = [...res.data].reverse().find((m) => m.type === 'assistant')
-        for (const part of (lastAssistant as { content?: unknown[] })?.content ?? []) {
-          const p = part as Record<string, unknown>
-          if (p.type === 'text' && typeof p.text === 'string') text += p.text
-        }
+        text = await fetchLastAssistantText(sessionId)
         status = t.role === 'fixer' ? 'approved' : parseVerdict(text)
       } catch (err) {
         status = 'error'
@@ -430,10 +427,7 @@ class ReviewManager {
   }
 
   private push(workId: string, round: number): void {
-    const reviews = this.reviewsFor(workId)
-    for (const win of BrowserWindow.getAllWindows()) {
-      win.webContents.send(IPC.eventPush, { kind: 'review.updated', workId, round, reviews })
-    }
+    pushToWindows({ kind: 'review.updated', workId, round, reviews: this.reviewsFor(workId) })
   }
 }
 

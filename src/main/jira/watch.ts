@@ -12,6 +12,8 @@ import { jiraMcp } from './mcp'
 import { getDb, settingGet } from '../db'
 import { sessionIndex } from '../opencode/session-index'
 import { streamBuffer } from '../opencode/stream-buffer'
+import { pushToWindows } from '../push'
+import { collectAdfText, fetchLastAssistantText } from '../util'
 import { openCodeService, describeError } from '../opencode/service'
 import { eventBus, type RawEvent } from '../opencode/bus'
 import { shipManager } from '../ship'
@@ -36,10 +38,6 @@ interface NewCommentRow {
   created_at: number
   seen_at: number
   tackled_at: number | null
-}
-
-function send(event: PushEvent): void {
-  for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IPC.eventPush, event)
 }
 
 function toComment(r: NewCommentRow): JiraComment {
@@ -216,13 +214,7 @@ class CommentWatcher {
     if (!work) return
     try {
       // Agent's reply section → one Jira comment quoting what was tackled.
-      const messages = await openCodeService.api.message.list({ sessionID: sessionId, order: 'asc', limit: 200 })
-      const last = [...messages.data].reverse().find((m) => m.type === 'assistant')
-      let text = ''
-      for (const part of (last as { content?: unknown[] })?.content ?? []) {
-        const p = part as Record<string, unknown>
-        if (p.type === 'text' && typeof p.text === 'string') text += p.text
-      }
+      const text = await fetchLastAssistantText(sessionId)
       const reply = text.split(/REVVA-REPLY/i)[1]?.trim() ?? text.slice(-1500)
       await jiraMcp.addComment(
         work.ticket_key,
@@ -240,24 +232,14 @@ class CommentWatcher {
   }
 
   private pushPending(): void {
-    send({ kind: 'comments', items: this.pending() })
+    pushToWindows({ kind: 'comments', items: this.pending() })
   }
 }
 
 /** Jira comment bodies are ADF or markdown depending on the tool; extract plain text. */
 function extractText(body: unknown): string {
-  if (typeof body === 'string') return body
-  const texts: string[] = []
-  const walk = (n: unknown): void => {
-    if (Array.isArray(n)) return void n.forEach(walk)
-    if (n && typeof n === 'object') {
-      const o = n as Record<string, unknown>
-      if (typeof o.text === 'string') texts.push(o.text)
-      if (o.content) walk(o.content)
-    }
-  }
-  walk(body)
-  return texts.join(' ').trim()
+  // Space join on purpose: comments read as prose (descriptions keep newlines).
+  return typeof body === 'string' ? body : collectAdfText(body).join(' ').trim()
 }
 
 export const commentWatcher = new CommentWatcher()

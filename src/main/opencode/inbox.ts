@@ -11,7 +11,8 @@ import { getDb } from '../db'
 import { sessionIndex } from './session-index'
 import { openCodeService, describeError } from './service'
 import { eventBus, type RawEvent } from './bus'
-import { IPC, type PendingItem } from '@shared/types'
+import type { PendingItem } from '@shared/types'
+import { pushToWindows } from '../push'
 
 interface InboxRow {
   session_id: string
@@ -242,10 +243,7 @@ class InboxManager {
   }
 
   private push(): void {
-    const snapshot = this.list()
-    for (const win of BrowserWindow.getAllWindows()) {
-      win.webContents.send(IPC.eventPush, { kind: 'inbox', items: snapshot })
-    }
+    pushToWindows({ kind: 'inbox', items: this.list() })
   }
 }
 

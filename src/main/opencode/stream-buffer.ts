@@ -4,8 +4,8 @@
  * COALESCE_MS per message. Per-token IPC is quadratic in message length and
  * floods the renderer's render loop; 20 Hz is indistinguishable from "live".
  */
-import { BrowserWindow } from 'electron'
-import { IPC, type PushEvent } from '@shared/types'
+import type { PushEvent } from '@shared/types'
+import { pushToWindows } from '../push'
 
 const COALESCE_MS = 50
 
@@ -64,7 +64,7 @@ class StreamBuffer {
         : source.kind === 'work.delta'
           ? { kind: 'work.delta', workId: source.workId ?? '', sessionId: source.sessionId, messageId: source.messageId, text }
           : { kind: 'review.delta', workId: source.workId ?? '', sessionId: source.sessionId, messageId: source.messageId, text }
-    for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IPC.eventPush, event)
+    pushToWindows(event)
   }
 }
 
