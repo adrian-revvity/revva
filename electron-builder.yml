@@ -1,0 +1,9 @@
+appId: dev.revva.app
+productName: Revva
+directories:
+  buildResources: build
+files:
+  - out/**
+  - '!node_modules/**/{*.md,LICENSE,license,*.map}'
+asarUnpack:
+  - node_modules/better-sqlite3/**

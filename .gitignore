@@ -2,7 +2,6 @@ node_modules/
 out/
 dist/
 release/
-*.db
-*.db-*
+*.log
 .DS_Store
-*.local
+.vite/
