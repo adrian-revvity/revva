@@ -12,6 +12,10 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 ### Changed
 
 - Idle background polling removed: service status, session activity, model and queue strips, and script status are now driven purely by the push events main already sends (plus a 60s safety heartbeat and refetch-on-focus). The app does essentially no IPC work while you are not touching it.
+- Streaming transcripts are linear now: text is accumulated once in the main process and pushed at ~20 Hz instead of per token; completed rows are memoized and markdown renders once when a message finishes; auto-scroll no longer fights you when you scroll up mid-stream.
+- Inbox items keep their original waiting order and their "PROJ-123 / chat title" label across OpenCode reconnects (re-sync is also parallel now — ~10× faster with many sessions).
+- Jira comment checking defaults to every 5 minutes (as documented) instead of every 60 seconds; tune with the hidden `jira.commentPollSecs` setting. Polls also can no longer overlap each other.
+- SQLite schema now lives in one versioned migration list (`src/main/db/index.ts`); the ten scattered lazy `ensureSchema()` sites are gone. Existing databases upgrade in place.
 
 ## [0.1.0] - 2026-10-28
 

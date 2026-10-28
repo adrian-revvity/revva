@@ -21,14 +21,14 @@ All plans stamped commit `830a20f` (typecheck clean there as of 2026-10-28).
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
-| 004 | Replace idle IPC polling with existing push events | P1 | S | — | TODO |
-| 001 | Centralize SQLite schema into versioned migrations | P1 | M | — | TODO |
-| 002 | In-memory session index (no SQLite probe per SSE token) | P2 | S | 001 | TODO |
-| 003 | Linear transcript streaming (accumulate once, coalesce, memoize) | P1 | M | 002 | TODO |
-| 006 | Parallel `inbox.resync()` + preserve createdAt/owner | P2 | S | — (002 first if both pending) | TODO |
-| 005 | Comment watcher: 5-min configurable poll, overlap guard, bounded fetch | P2 | S | — | TODO |
-| 007 | Extract 5 copy-pasted main-process helpers | P2 | M | 001; after 002/003 | TODO |
-| 008 | Delete dead vendored UI (sidebar/dropdown/sheet) + `cn` dep | P3 | S | — | TODO |
+| 004 | Replace idle IPC polling with existing push events | P1 | S | — | DONE 2026-10-28 (advisor/perf-refactor; WorktreesDialog's open-only poll kept, owner's file) |
+| 001 | Centralize SQLite schema into versioned migrations | P1 | M | — | DONE 2026-10-28 (v2 block in db/index.ts; upgrade+idempotence proven against seeded v1 DB) |
+| 002 | In-memory session index (no SQLite probe per SSE token) | P2 | S | 001 | DONE 2026-10-28 |
+| 003 | Linear transcript streaming (accumulate once, coalesce, memoize) | P1 | M | 002 | DONE 2026-10-28 (stick-to-bottom variant; watch.ts rework deltas routed through the buffer too — beyond plan list, needed for parity) |
+| 006 | Parallel `inbox.resync()` + preserve createdAt/owner | P2 | S | — (002 first if both pending) | DONE 2026-10-28 |
+| 005 | Comment watcher: 5-min configurable poll, overlap guard, bounded fetch | P2 | S | — | DONE 2026-10-28 (hidden setting key jira.commentPollSecs) |
+| 007 | Extract 5 copy-pasted main-process helpers | P2 | M | 001; after 002/003 | DONE 2026-10-28 (+ fixed pushEvent script.status to array, pre-existing drift; worktrees.ts left for a follow-up per plan) |
+| 008 | Delete dead vendored UI (sidebar/dropdown/sheet) + `cn` dep | P3 | S | — | DONE 2026-10-28 (also dropped now-orphan hooks/use-mobile.ts) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
 
