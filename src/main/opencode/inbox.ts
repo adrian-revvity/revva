@@ -29,7 +29,6 @@ class InboxManager {
   wire(): void {
     if (this.wired) return
     this.wired = true
-    ensureSchema()
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
     eventBus.on('stream:reconnect', () => void this.resync())
     openCodeService.onStatus((s) => {
@@ -234,14 +233,6 @@ class InboxManager {
       win.webContents.send(IPC.eventPush, { kind: 'inbox', items: snapshot })
     }
   }
-}
-
-function ensureSchema(): void {
-  getDb().exec(`CREATE TABLE IF NOT EXISTS inbox_audit (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL, kind TEXT NOT NULL, ref_id TEXT NOT NULL,
-    answer TEXT, answered_at INTEGER NOT NULL
-  );`)
 }
 
 export const inboxManager = new InboxManager()

@@ -30,16 +30,6 @@ class ScriptManager {
   wire(): void {
     if (this.wired) return
     this.wired = true
-    getDb().exec(`
-      CREATE TABLE IF NOT EXISTS script (
-        id TEXT PRIMARY KEY, name TEXT NOT NULL, command TEXT NOT NULL,
-        cwd TEXT, interactive INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS script_run (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, script_id TEXT NOT NULL,
-        started_at INTEGER NOT NULL, ended_at INTEGER, exit_code INTEGER, output_tail TEXT
-      );
-    `)
   }
 
   list(): ScriptDef[] {

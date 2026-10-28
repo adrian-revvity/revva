@@ -115,17 +115,6 @@ interface ChatRow {
   seen_at: number | null
 }
 
-function ensureSchema(): void {
-  const cols = getDb().prepare('PRAGMA table_info(chat)').all() as Array<{ name: string }>
-  if (!cols.some((c) => c.name === 'ticket_key')) getDb().exec('ALTER TABLE chat ADD COLUMN ticket_key TEXT')
-  if (!cols.some((c) => c.name === 'pr_url')) getDb().exec('ALTER TABLE chat ADD COLUMN pr_url TEXT')
-  if (!cols.some((c) => c.name === 'seen_at')) {
-    getDb().exec('ALTER TABLE chat ADD COLUMN seen_at INTEGER')
-    // Existing chats were last seen "now", otherwise every row dots up after upgrading.
-    getDb().exec('UPDATE chat SET seen_at = updated_at WHERE seen_at IS NULL')
-  }
-}
-
 function rowToSummary(row: ChatRow): ChatSummary {
   return {
     sessionId: row.session_id,
@@ -154,7 +143,6 @@ class ChatManager {
   wire(): void {
     if (this.wired) return
     this.wired = true
-    ensureSchema()
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
     // SSE is live-only: after a reconnect the renderer refetches via its queries.
     eventBus.on('stream:reconnect', () => send({ kind: 'chat.idle', sessionId: '*' }))
@@ -168,7 +156,6 @@ class ChatManager {
   }
 
   async create(input: ChatCreateInput): Promise<ChatSummary> {
-    ensureSchema()
     const prUrl = await resolvePrLink(input.prUrl, input.directory)
     const api = openCodeService.api
     const title = input.title?.trim() || 'New chat'

@@ -31,15 +31,6 @@ interface NewCommentRow {
   tackled_at: number | null
 }
 
-function ensureSchema(): void {
-  getDb().exec(`CREATE TABLE IF NOT EXISTS jira_comment (
-    work_id TEXT NOT NULL, ticket_key TEXT NOT NULL, comment_id TEXT NOT NULL,
-    author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL,
-    seen_at INTEGER NOT NULL, tackled_at INTEGER,
-    PRIMARY KEY (work_id, comment_id)
-  );`)
-}
-
 function send(event: PushEvent): void {
   for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IPC.eventPush, event)
 }
@@ -65,7 +56,6 @@ class CommentWatcher {
   wire(): void {
     if (this.wired) return
     this.wired = true
-    ensureSchema()
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
     this.timer = setInterval(() => void this.poll().catch(() => undefined), POLL_MS)
     void this.poll().catch(() => undefined)
@@ -77,7 +67,6 @@ class CommentWatcher {
 
   /** Undismissed alerts (comments not yet tackled). */
   pending(): JiraComment[] {
-    ensureSchema()
     return (
       getDb()
         .prepare('SELECT * FROM jira_comment WHERE tackled_at IS NULL ORDER BY created_at ASC')

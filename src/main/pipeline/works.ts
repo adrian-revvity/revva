@@ -42,26 +42,6 @@ interface WorkRow {
   updated_at: number
 }
 
-function ensureSchema(): void {
-  getDb().exec(`CREATE TABLE IF NOT EXISTS work (
-    id TEXT PRIMARY KEY, ticket_key TEXT NOT NULL, workspace_id TEXT, repo_dir TEXT NOT NULL,
-    branch TEXT NOT NULL, worktree_dir TEXT NOT NULL, parent_work_id TEXT,
-    mode TEXT NOT NULL, state TEXT NOT NULL, session_id TEXT,
-    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-  );`)
-  // Forward-only column additions (M4).
-  const cols = getDb().prepare('PRAGMA table_info(work)').all() as Array<{ name: string }>
-  if (!cols.some((c) => c.name === 'review_sel')) {
-    getDb().exec('ALTER TABLE work ADD COLUMN review_sel TEXT')
-  }
-  if (!cols.some((c) => c.name === 'ship_on_approve')) {
-    getDb().exec('ALTER TABLE work ADD COLUMN ship_on_approve INTEGER')
-  }
-  if (!cols.some((c) => c.name === 'pr_url')) {
-    getDb().exec('ALTER TABLE work ADD COLUMN pr_url TEXT')
-  }
-}
-
 function slugBranch(key: string): string {
   return `revva/${key.toLowerCase()}`
 }
@@ -72,12 +52,10 @@ class WorkManager {
   wire(): void {
     if (this.wired) return
     this.wired = true
-    ensureSchema()
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
   }
 
   list(): WorkSummary[] {
-    ensureSchema()
     const rows = getDb().prepare('SELECT * FROM work ORDER BY updated_at DESC').all() as WorkRow[]
     return rows.map((r) => this.toSummary(r))
   }
@@ -104,7 +82,6 @@ class WorkManager {
 
   async start(input: StartWorkInput): Promise<WorkSummary> {
     if (!openCodeService.connected) throw new Error('Connect OpenCode first.')
-    ensureSchema()
 
     const ticket = await getTicket(input.ticketKey)
     if (!ticket) throw new Error(`Ticket ${input.ticketKey} not found. Refresh the board first.`)

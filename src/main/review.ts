@@ -48,22 +48,6 @@ interface ReviewDbRow {
   updated_at: number
 }
 
-function ensureSchema(): void {
-  getDb().exec(`CREATE TABLE IF NOT EXISTS review (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    work_id TEXT NOT NULL, round INTEGER NOT NULL, role TEXT NOT NULL,
-    session_id TEXT, status TEXT NOT NULL, findings TEXT NOT NULL DEFAULT '',
-    error TEXT, agent_id TEXT, provider_id TEXT, model_id TEXT,
-    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_review_work ON review(work_id, round);
-  CREATE TABLE IF NOT EXISTS auto_decision (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    work_id TEXT NOT NULL, round INTEGER, kind TEXT NOT NULL,
-    detail TEXT NOT NULL, created_at INTEGER NOT NULL
-  );`)
-}
-
 function toRow(r: ReviewDbRow): ReviewRow {
   return {
     id: r.id,
@@ -119,7 +103,6 @@ class ReviewManager {
   wire(): void {
     if (this.wired) return
     this.wired = true
-    ensureSchema()
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
     // Sessions cannot survive an app restart: mark anything still 'running' as errored.
     const stale = getDb().prepare("SELECT * FROM review WHERE status IN ('pending','running')").all() as ReviewDbRow[]
@@ -129,7 +112,6 @@ class ReviewManager {
   }
 
   reviewsFor(workId: string): ReviewRow[] {
-    ensureSchema()
     const rows = getDb()
       .prepare('SELECT * FROM review WHERE work_id = ? ORDER BY round ASC, id ASC')
       .all(workId) as ReviewDbRow[]
@@ -145,7 +127,6 @@ class ReviewManager {
 
   /** Kick off reviewer fan-out for a round. Called after a build settles or on demand. */
   async startRound(workId: string, round: number): Promise<void> {
-    ensureSchema()
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(workId) as
       | { id: string; ticket_key: string; branch: string; worktree_dir: string; mode: string; review_sel: string | null }
       | undefined
@@ -443,7 +424,6 @@ class ReviewManager {
   }
 
   private audit(workId: string, round: number | null, kind: string, detail: string): void {
-    ensureSchema()
     console.log(`[review:${kind}] ${workId} round=${round}: ${detail}`)
     getDb().prepare('INSERT INTO auto_decision(work_id, round, kind, detail, created_at) VALUES(?,?,?,?,?)').run(workId, round, kind, detail, Date.now())
   }

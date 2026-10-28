@@ -80,10 +80,6 @@ export async function fetchBoard(): Promise<JiraTicket[]> {
 function cacheTickets(tickets: JiraTicket[]): void {
   const db = getDb()
   const now = Date.now()
-  db.exec(`CREATE TABLE IF NOT EXISTS ticket (
-    key TEXT PRIMARY KEY, jira_id TEXT, summary TEXT, status TEXT, status_category TEXT,
-    points REAL, depends_on TEXT, raw TEXT, synced_at INTEGER
-  );`)
   const stmt = db.prepare(
     `INSERT INTO ticket(key, jira_id, summary, status, status_category, points, depends_on, raw, synced_at)
      VALUES(?,?,?,?,?,?,?,?,?)

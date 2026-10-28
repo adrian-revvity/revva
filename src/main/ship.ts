@@ -26,11 +26,6 @@ interface ShipWorkRow {
   pr_url: string | null
 }
 
-function ensureSchema(): void {
-  const cols = getDb().prepare('PRAGMA table_info(work)').all() as Array<{ name: string }>
-  if (!cols.some((c) => c.name === 'pr_url')) getDb().exec('ALTER TABLE work ADD COLUMN pr_url TEXT')
-}
-
 function audit(workId: string, kind: string, detail: string): void {
   console.log(`[ship:${kind}] ${workId}: ${detail}`)
   getDb().prepare('INSERT INTO auto_decision(work_id, round, kind, detail, created_at) VALUES(?,?,?,? ,?)').run(workId, null, kind, detail, Date.now())
@@ -45,7 +40,6 @@ export function parseGitHubRemote(url: string): { owner: string; repo: string } 
 class ShipManager {
   /** Cheap pre-flight; every check says what to fix. ok=true ⇒ Ship is safe. */
   async checks(workId: string): Promise<ShipCheck[]> {
-    ensureSchema()
     const work = this.requireWork(workId)
     const checks: ShipCheck[] = []
 
@@ -107,7 +101,6 @@ class ShipManager {
   /** Push + PR + Jira. With an already-linked PR this just pushes to it (update);
    *  otherwise it creates one. Throws with a readable message when a fatal check fails. */
   async ship(workId: string): Promise<ShipResult> {
-    ensureSchema()
     const checks = await this.checks(workId)
     const fatal = checks.find((c) => !c.ok && c.fatal !== false)
     if (fatal) throw new Error(`Cannot ship: ${fatal.name} — ${fatal.detail}`)
@@ -266,7 +259,6 @@ class ShipManager {
   }
 
   private requireWork(workId: string): ShipWorkRow {
-    ensureSchema()
     const work = getDb()
       .prepare('SELECT id, ticket_key, repo_dir, branch, worktree_dir, mode, state, parent_work_id, pr_url FROM work WHERE id = ?')
       .get(workId) as ShipWorkRow | undefined
