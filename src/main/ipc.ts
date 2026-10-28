@@ -13,9 +13,10 @@ import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
 import { fetchBoard } from './jira/board'
 import { workManager } from './pipeline/works'
+import { reviewManager } from './review'
 import { scriptManager } from './scripts'
-import { getDb, settingGet, settingSet } from './db'
-import { startWorkInputSchema, inboxAnswerSchema, permissionDecisionSchema, scriptInputSchema } from '@shared/types'
+import { getDb, settingGet, settingSet, roleConfigList, roleConfigSet } from './db'
+import { startWorkInputSchema, inboxAnswerSchema, permissionDecisionSchema, scriptInputSchema, roleConfigSchema } from '@shared/types'
 
 export function registerIpc(): void {
   /* ---------- service ---------- */
@@ -114,7 +115,18 @@ export function registerIpc(): void {
   ipcMain.handle(IPC.workMessages, (_e, sessionId: string) => chatManager.messages(String(sessionId)))
   ipcMain.handle(IPC.workPrompt, (_e, sessionId: string, text: string) => workManager.followUp(String(sessionId), String(text)))
   ipcMain.handle(IPC.workInterrupt, (_e, sessionId: string) => workManager.interrupt(String(sessionId)))
+  ipcMain.handle(IPC.workReviews, (_e, workId: string) => reviewManager.reviewsFor(String(workId)))
+  ipcMain.handle(IPC.workReviewStart, async (_e, workId: string) => {
+    const round = reviewManager.latestRound(String(workId)) + 1
+    await reviewManager.startRound(String(workId), round)
+  })
 
+  /* ---------- role config (per-role agent/model defaults) ---------- */
+  ipcMain.handle(IPC.roleConfigList, () => roleConfigList())
+  ipcMain.handle(IPC.roleConfigSave, (_e, cfg: unknown) => {
+    const parsed = roleConfigSchema.parse(cfg)
+    roleConfigSet(parsed)
+  })
   /* ---------- inbox (M2) ---------- */
   ipcMain.handle(IPC.inboxList, () => inboxManager.list())
   ipcMain.handle(IPC.inboxReplyForm, (_e, sessionId: string, formId: string, answer: unknown) =>

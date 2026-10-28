@@ -21,8 +21,9 @@ import {
   SelectTrigger,
   SelectValue
 } from '@/components/ui/select'
-import type { Ticket, WorkSummary } from '@shared/types'
+import type { Ticket, WorkSummary, PipelineRole } from '@shared/types'
 import { modelKeyOf, parseModelKey } from './NewChatDialog'
+import { RoleSelectors, DEFAULT, selOrUndefined } from './RoleSelectors'
 
 /**
  * Per-run choices (REQ-PIPE: role defaults + per-run overrides).
@@ -48,6 +49,13 @@ export function StartWorkDialog({
   const [grill, setGrill] = useState(false)
   const [agentID, setAgentID] = useState('__default__')
   const [modelKey, setModelKey] = useState('__default__')
+  const [showReviewOverrides, setShowReviewOverrides] = useState(false)
+  const [reviewSel, setReviewSel] = useState<Record<PipelineRole, { agentID: string; modelKey: string }>>({
+    sol: { agentID: DEFAULT, modelKey: DEFAULT },
+    testAudit: { agentID: DEFAULT, modelKey: DEFAULT },
+    impeccable: { agentID: DEFAULT, modelKey: DEFAULT },
+    fixer: { agentID: DEFAULT, modelKey: DEFAULT }
+  })
 
   // Suggest a stacked parent: an active work whose ticket this one depends on.
   const suggestedParent = works.find(
@@ -66,7 +74,13 @@ export function StartWorkDialog({
         agentID: agentID === '__default__' ? undefined : agentID,
         model: modelKey === '__default__' ? undefined : parseModelKey(modelKey),
         parentWorkId: parentWorkId === '__none__' ? undefined : parentWorkId,
-        grill
+        grill,
+        reviewSel: {
+          sol: selOrUndefined(reviewSel.sol.agentID, reviewSel.sol.modelKey),
+          testAudit: selOrUndefined(reviewSel.testAudit.agentID, reviewSel.testAudit.modelKey),
+          impeccable: selOrUndefined(reviewSel.impeccable.agentID, reviewSel.impeccable.modelKey),
+          fixer: selOrUndefined(reviewSel.fixer.agentID, reviewSel.fixer.modelKey)
+        }
       })
       return work
     },
@@ -197,6 +211,34 @@ export function StartWorkDialog({
               </div>
               <Checkbox checked={grill} onCheckedChange={(c) => setGrill(c === true)} />
             </label>
+          </div>
+
+          <div className="space-y-2 rounded-md border p-3">
+            <button
+              type="button"
+              className="flex w-full items-center justify-between text-left text-xs font-medium"
+              onClick={() => setShowReviewOverrides((v) => !v)}
+            >
+              <span>
+                Review team{' '}
+                <span className="font-normal text-muted-foreground">
+                  — defaults apply; override per reviewer and fixer for this run
+                </span>
+              </span>
+              <span className="text-muted-foreground">{showReviewOverrides ? '−' : '+'}</span>
+            </button>
+            {showReviewOverrides &&
+              (['sol', 'testAudit', 'impeccable', 'fixer'] as const).map((role) => (
+                <div key={role} className="space-y-1">
+                  <Label className="text-[11px] capitalize">{role === 'testAudit' ? 'test audit' : role}</Label>
+                  <RoleSelectors
+                    agentID={reviewSel[role].agentID}
+                    modelKey={reviewSel[role].modelKey}
+                    onAgent={(v) => setReviewSel((s) => ({ ...s, [role]: { ...s[role], agentID: v } }))}
+                    onModel={(v) => setReviewSel((s) => ({ ...s, [role]: { ...s[role], modelKey: v } }))}
+                  />
+                </div>
+              ))}
           </div>
 
           {start.error instanceof Error && <p className="text-xs text-destructive">{start.error.message}</p>}

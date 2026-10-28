@@ -61,6 +61,7 @@ export const settingsKeySchema = z.enum([
   'generalChat.model',
   'worktreeRoot',
   'autoDefault',
+  'reviewMaxRounds',
   'jira.connected',
   'jira.siteUrl'
 ])
@@ -134,12 +135,65 @@ export const workStateSchema = z.enum([
   'READY',
   'BUILDING',
   'REVIEW',
+  'FIXING',
   'APPROVED',
   'WAITING_HUMAN',
   'SHIPPED',
   'ABANDONED'
 ])
 export type WorkState = z.infer<typeof workStateSchema>
+
+/* ---------- Review pipeline (M4) ---------- */
+
+/** Read-only reviewer roles, fanned out concurrently each round. */
+export const reviewRoleSchema = z.enum(['sol', 'testAudit', 'impeccable'])
+export type ReviewRole = z.infer<typeof reviewRoleSchema>
+
+/** Human labels for roles (renderer). */
+export const roleLabels: Record<PipelineRole, string> = {
+  sol: 'Sol-loop',
+  testAudit: 'Test audit',
+  impeccable: 'UI review',
+  fixer: 'Fixer'
+}
+
+/** Pipeline roles that take an agent/model selection (reviewers + the fixer). */
+export const pipelineRoleSchema = z.enum(['sol', 'testAudit', 'impeccable', 'fixer'])
+export type PipelineRole = z.infer<typeof pipelineRoleSchema>
+
+export const roleSelSchema = z.object({
+  agentID: z.string().optional(),
+  model: modelRefSchema.optional()
+})
+export type RoleSel = z.infer<typeof roleSelSchema>
+
+/** Role-level default (persisted; every role can be overridden per run). */
+export const roleConfigSchema = z.object({
+  role: pipelineRoleSchema,
+  agentID: z.string().optional(),
+  model: modelRefSchema.optional()
+})
+export type RoleConfig = z.infer<typeof roleConfigSchema>
+
+export const reviewStatusSchema = z.enum(['pending', 'running', 'approved', 'changes', 'error', 'skipped'])
+export type ReviewStatus = z.infer<typeof reviewStatusSchema>
+
+export const reviewRowSchema = z.object({
+  id: z.number(),
+  workId: z.string(),
+  round: z.number(),
+  role: pipelineRoleSchema,
+  sessionId: z.string().optional(),
+  status: reviewStatusSchema,
+  /** Reviewer's final report (findings or approval notes). */
+  findings: z.string(),
+  error: z.string().optional(),
+  agentID: z.string().optional(),
+  model: modelRefSchema.optional(),
+  createdAt: z.number(),
+  updatedAt: z.number()
+})
+export type ReviewRow = z.infer<typeof reviewRowSchema>
 
 export const workSummarySchema = z.object({
   id: z.string(),
@@ -163,7 +217,16 @@ export const startWorkInputSchema = z.object({
   agentID: z.string().optional(),
   model: modelRefSchema.optional(),
   parentWorkId: z.string().optional(),
-  grill: z.boolean().default(false)
+  grill: z.boolean().default(false),
+  /** Per-run reviewer/fixer selections; fall back to role defaults when omitted. */
+  reviewSel: z
+    .object({
+      sol: roleSelSchema.optional(),
+      testAudit: roleSelSchema.optional(),
+      impeccable: roleSelSchema.optional(),
+      fixer: roleSelSchema.optional()
+    })
+    .optional()
 })
 export type StartWorkInput = z.infer<typeof startWorkInputSchema>
 
@@ -253,6 +316,9 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('work.updated'), workId: z.string(), state: workStateSchema }),
   z.object({ kind: z.literal('work.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
   z.object({ kind: z.literal('inbox'), items: z.array(pendingItemSchema) }),
+  z.object({ kind: z.literal('review.updated'), workId: z.string(), round: z.number(), reviews: z.array(reviewRowSchema) }),
+  /** Live streamed text from a reviewer/fixer session. */
+  z.object({ kind: z.literal('review.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
   z.object({ kind: z.literal('script.output'), scriptId: z.string(), chunk: z.string() }),
   z.object({ kind: z.literal('script.status'), status: scriptStatusSchema })
 ])
@@ -302,6 +368,14 @@ export interface RevvaApi {
     messages(sessionId: string): Promise<ChatMessage[]>
     prompt(sessionId: string, text: string): Promise<void>
     interrupt(sessionId: string): Promise<void>
+    /** Review ledger for one work (all rounds). */
+    reviews(workId: string): Promise<ReviewRow[]>
+    /** Manually start another review round (e.g. after resolving a blocker). */
+    reviewStart(workId: string): Promise<void>
+  }
+  roleConfig: {
+    list(): Promise<RoleConfig[]>
+    save(cfg: RoleConfig): Promise<void>
   }
   inbox: {
     list(): Promise<PendingItem[]>

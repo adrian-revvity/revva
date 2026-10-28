@@ -1,14 +1,15 @@
 import { useMemo } from 'react'
-import { useQuery } from '@tanstack/react-query'
 import { CircleDot, GitBranch, FolderGit2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import type { PushEvent, WorkSummary } from '@shared/types'
 import { TranscriptView, type TranscriptDrive } from './Chat'
 import { FormCard, PermissionCard, useInbox } from './InboxView'
+import { ReviewPanel, ReviewRerunButton } from './ReviewPanel'
 
 const stateClasses: Record<string, string> = {
   BUILDING: 'bg-sky-500/15 text-sky-700 dark:text-sky-400 border-sky-500/30',
   REVIEW: 'bg-violet-500/15 text-violet-700 dark:text-violet-400 border-violet-500/30',
+  FIXING: 'bg-orange-500/15 text-orange-700 dark:text-orange-400 border-orange-500/30',
   APPROVED: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-500/30',
   WAITING_HUMAN: 'bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30',
   SHIPPED: 'bg-emerald-600/15 text-emerald-700 dark:text-emerald-400 border-emerald-600/30',
@@ -59,6 +60,7 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      <ReviewPanel workId={work.id} />
       {pending.length > 0 && (
         <div className="max-h-64 shrink-0 space-y-2 overflow-y-auto border-b bg-amber-500/5 p-3">
           <p className="text-[11px] font-medium text-amber-700 dark:text-amber-400">
@@ -83,6 +85,9 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
           </Badge>
           {work.mode === 'auto' && (
             <Badge className="text-[10px]">AUTO</Badge>
+          )}
+          {(work.state === 'APPROVED' || work.state === 'WAITING_HUMAN') && (
+            <ReviewRerunButton workId={work.id} />
           )}
           <Badge variant="outline" className="ml-auto max-w-56 truncate font-mono text-[10px] font-normal">
             <GitBranch className="mr-1 inline size-3" />

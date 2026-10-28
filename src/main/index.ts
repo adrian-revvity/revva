@@ -7,6 +7,7 @@ import { eventBus } from './opencode/bus'
 import { chatManager } from './opencode/chats'
 import { inboxManager } from './opencode/inbox'
 import { workManager } from './pipeline/works'
+import { reviewManager } from './review'
 import { scriptManager } from './scripts'
 import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
@@ -51,6 +52,7 @@ app.whenReady().then(() => {
   chatManager.wire()
   workManager.wire()
   inboxManager.wire()
+  reviewManager.wire()
   scriptManager.wire()
   void jiraAuth.load().then(() => {
     if (jiraAuth.status().connected) void jiraMcp.connect().catch(() => undefined)

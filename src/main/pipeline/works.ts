@@ -16,6 +16,7 @@ import { openCodeService, describeError } from '../opencode/service'
 import { eventBus, type RawEvent } from '../opencode/bus'
 import { getTicket } from '../jira/board'
 import { getDb, settingGet } from '../db'
+import { reviewManager } from '../review'
 import { IPC, type StartWorkInput, type WorkState, type WorkSummary } from '@shared/types'
 
 const exec = promisify(execFile)
@@ -31,6 +32,7 @@ interface WorkRow {
   mode: string
   state: string
   session_id: string | null
+  review_sel: string | null
   created_at: number
   updated_at: number
 }
@@ -42,6 +44,11 @@ function ensureSchema(): void {
     mode TEXT NOT NULL, state TEXT NOT NULL, session_id TEXT,
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
   );`)
+  // Forward-only column additions (M4).
+  const cols = getDb().prepare('PRAGMA table_info(work)').all() as Array<{ name: string }>
+  if (!cols.some((c) => c.name === 'review_sel')) {
+    getDb().exec('ALTER TABLE work ADD COLUMN review_sel TEXT')
+  }
 }
 
 function slugBranch(key: string): string {
@@ -107,10 +114,24 @@ class WorkManager {
     const now = Date.now()
     getDb()
       .prepare(
-        `INSERT INTO work(id, ticket_key, workspace_id, repo_dir, branch, worktree_dir, parent_work_id, mode, state, session_id, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`
+        `INSERT INTO work(id, ticket_key, workspace_id, repo_dir, branch, worktree_dir, parent_work_id, mode, state, session_id, review_sel, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
-      .run(id, ticket.key, null, input.repoDir, branch, worktreeDir, input.parentWorkId ?? null, input.mode, state, null, now, now)
+      .run(
+        id,
+        ticket.key,
+        null,
+        input.repoDir,
+        branch,
+        worktreeDir,
+        input.parentWorkId ?? null,
+        input.mode,
+        state,
+        null,
+        input.reviewSel ? JSON.stringify(input.reviewSel) : null,
+        now,
+        now
+      )
 
     // Build session in the worktree.
     const api = openCodeService.api
@@ -210,6 +231,14 @@ class WorkManager {
     this.emit(id, state)
   }
 
+  /** Called by the review pipeline (REVIEW/FIXING/APPROVED/WAITING_HUMAN). */
+  setReviewState(id: string, state: WorkState): void {
+    const work = getDb().prepare('SELECT state FROM work WHERE id = ?').get(id) as { state: string } | undefined
+    if (!work || work.state === 'ABANDONED' || work.state === 'SHIPPED') return
+    if (work.state === state) return
+    this.setState(id, state)
+  }
+
   private emit(id: string, state: WorkState): void {
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send(IPC.eventPush, { kind: 'work.updated', workId: id, state })
@@ -244,8 +273,12 @@ class WorkManager {
       }
       case 'session.execution.succeeded': {
         if (work.state !== 'BUILDING') return
-        // M4 replaces this with the review fan-out; M1 marks the build finished.
-        this.setState(work.id, 'APPROVED')
+        // M4: build finished → concurrent read-only reviewer fan-out (no more auto-approve).
+        this.setState(work.id, 'REVIEW')
+        void reviewManager.startRound(work.id, 1).catch((err) => {
+          console.warn('[work] review fan-out failed:', describeError(err))
+          this.setState(work.id, 'WAITING_HUMAN')
+        })
         break
       }
       case 'session.execution.failed':
@@ -259,6 +292,7 @@ class WorkManager {
   async abandon(id: string): Promise<void> {
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(id) as WorkRow | undefined
     if (!work) return
+    await reviewManager.cancelWork(id)
     if (work.session_id) await openCodeService.api.session.remove({ sessionID: work.session_id }).catch(() => undefined)
     await exec('git', ['-C', work.repo_dir, 'worktree', 'remove', '--force', work.worktree_dir]).catch(() => undefined)
     this.setState(id, 'ABANDONED')
@@ -267,7 +301,11 @@ class WorkManager {
   /** Follow-up message into a running/finished build session. */
   async followUp(sessionId: string, text: string): Promise<void> {
     const work = this.workBySession(sessionId)
-    if (work) getDb().prepare('UPDATE work SET updated_at = ? WHERE id = ?').run(Date.now(), work.id)
+    if (work) {
+      // A human re-prompting a settled build takes it back through review.
+      if (['WAITING_HUMAN', 'APPROVED', 'REVIEW', 'FIXING'].includes(work.state)) this.setState(work.id, 'BUILDING')
+      this.touch(work.id)
+    }
     await openCodeService.api.session.prompt({ sessionID: sessionId, text })
   }
 

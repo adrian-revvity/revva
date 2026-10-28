@@ -73,3 +73,44 @@ export function settingSet(key: string, value: unknown): void {
     .prepare('INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
     .run(key, JSON.stringify(value ?? null))
 }
+
+/* ---------- role_config (per-role agent/model defaults; every role overridable per run) ---------- */
+
+export interface RoleConfigRow {
+  role: string
+  agentID?: string
+  model?: { providerID: string; id: string }
+}
+
+export function roleConfigGet(role: string): RoleConfigRow | undefined {
+  const row = getDb()
+    .prepare('SELECT * FROM role_config WHERE role = ?')
+    .get(role) as { role: string; agent_id: string | null; provider_id: string | null; model_id: string | null } | undefined
+  if (!row) return undefined
+  return {
+    role: row.role,
+    agentID: row.agent_id ?? undefined,
+    model: row.provider_id && row.model_id ? { providerID: row.provider_id, id: row.model_id } : undefined
+  }
+}
+
+export function roleConfigList(): RoleConfigRow[] {
+  return (
+    getDb()
+      .prepare('SELECT * FROM role_config')
+      .all() as Array<{ role: string; agent_id: string | null; provider_id: string | null; model_id: string | null }>
+  ).map((row) => ({
+    role: row.role,
+    agentID: row.agent_id ?? undefined,
+    model: row.provider_id && row.model_id ? { providerID: row.provider_id, id: row.model_id } : undefined
+  }))
+}
+
+export function roleConfigSet(cfg: RoleConfigRow): void {
+  getDb()
+    .prepare(
+      `INSERT INTO role_config(role, agent_id, provider_id, model_id) VALUES(?,?,?,?)
+       ON CONFLICT(role) DO UPDATE SET agent_id = excluded.agent_id, provider_id = excluded.provider_id, model_id = excluded.model_id`
+    )
+    .run(cfg.role, cfg.agentID ?? null, cfg.model?.providerID ?? null, cfg.model?.id ?? null)
+}

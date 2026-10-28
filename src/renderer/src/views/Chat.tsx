@@ -31,12 +31,15 @@ export function TranscriptView({
   sessionId,
   drive,
   header,
-  emptyHint
+  emptyHint,
+  readOnly
 }: {
   sessionId: string
   drive: TranscriptDrive
   header: ReactNode
   emptyHint: string
+  /** Hides the composer (reviewer sessions are read-only). */
+  readOnly?: boolean
 }): React.JSX.Element {
   const qc = useQueryClient()
   const messages = useQuery({
@@ -118,38 +121,40 @@ export function TranscriptView({
         </div>
       </ScrollArea>
 
-      <div className="shrink-0 border-t px-6 py-3">
-        <form
-          className="mx-auto flex max-w-3xl items-end gap-2"
-          onSubmit={(e) => {
-            e.preventDefault()
-            if (!running) send.mutate()
-          }}
-        >
-          <Textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault()
-                if (!running) send.mutate()
-              }
+      {!readOnly && (
+        <div className="shrink-0 border-t px-6 py-3">
+          <form
+            className="mx-auto flex max-w-3xl items-end gap-2"
+            onSubmit={(e) => {
+              e.preventDefault()
+              if (!running) send.mutate()
             }}
-            placeholder="Message… (Enter to send, Shift+Enter for newline)"
-            rows={2}
-            className="min-h-[44px] resize-y"
-          />
-          {running ? (
-            <Button type="button" size="icon" variant="outline" onClick={() => interrupt.mutate()}>
-              <Square className="size-4" />
-            </Button>
-          ) : (
-            <Button type="submit" size="icon" disabled={!input.trim() || send.isPending}>
-              <ArrowUp className="size-4" />
-            </Button>
-          )}
-        </form>
-      </div>
+          >
+            <Textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault()
+                  if (!running) send.mutate()
+                }
+              }}
+              placeholder="Message… (Enter to send, Shift+Enter for newline)"
+              rows={2}
+              className="min-h-[44px] resize-y"
+            />
+            {running ? (
+              <Button type="button" size="icon" variant="outline" onClick={() => interrupt.mutate()}>
+                <Square className="size-4" />
+              </Button>
+            ) : (
+              <Button type="submit" size="icon" disabled={!input.trim() || send.isPending}>
+                <ArrowUp className="size-4" />
+              </Button>
+            )}
+          </form>
+        </div>
+      )}
     </div>
   )
 }

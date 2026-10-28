@@ -43,7 +43,13 @@ const api: RevvaApi = {
     abandon: (id) => ipcRenderer.invoke(IPC.workAbandon, id),
     messages: (sessionId) => ipcRenderer.invoke(IPC.workMessages, sessionId),
     prompt: (sessionId, text) => ipcRenderer.invoke(IPC.workPrompt, sessionId, text),
-    interrupt: (sessionId) => ipcRenderer.invoke(IPC.workInterrupt, sessionId)
+    interrupt: (sessionId) => ipcRenderer.invoke(IPC.workInterrupt, sessionId),
+    reviews: (workId) => ipcRenderer.invoke(IPC.workReviews, workId),
+    reviewStart: (workId) => ipcRenderer.invoke(IPC.workReviewStart, workId)
+  },
+  roleConfig: {
+    list: () => ipcRenderer.invoke(IPC.roleConfigList),
+    save: (cfg) => ipcRenderer.invoke(IPC.roleConfigSave, cfg)
   },
   inbox: {
     list: () => ipcRenderer.invoke(IPC.inboxList),

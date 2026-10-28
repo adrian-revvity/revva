@@ -8,6 +8,8 @@ import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
+import { RoleSelectors, DEFAULT, selOrUndefined } from './RoleSelectors'
+import type { PipelineRole } from '@shared/types'
 
 /**
  * First-run setup + settings (REQ-SETUP-1/2): OpenCode connection status, workspace folders,
@@ -123,6 +125,14 @@ export function SetupView(): React.JSX.Element {
           )}
         </section>
 
+        <section className="space-y-2">
+          <h2 className="text-sm font-medium">Review team defaults</h2>
+          <p className="text-xs text-muted-foreground">
+            Agent/model per pipeline role; any run can override these. Empty = whatever your OpenCode service defaults to.
+          </p>
+          <RoleDefaults />
+        </section>
+
         <section className={cn('space-y-2', !connected && 'opacity-50')}>
           <h2 className="text-sm font-medium">Discovered from your OpenCode</h2>
           {!connected && <p className="text-xs text-muted-foreground">Available once connected.</p>}
@@ -152,6 +162,52 @@ export function SetupView(): React.JSX.Element {
           <p>Pick a project folder above, then use “New chat” to start a general session or open the Board to start work on a ticket.</p>
         </section>
       </div>
+    </div>
+  )
+}
+
+const REVIEW_ROLES: Array<{ role: PipelineRole; label: string; hint: string }> = [
+  { role: 'sol', label: 'Sol-loop', hint: 'adversarial code review, every round' },
+  { role: 'testAudit', label: 'Test audit', hint: 'tests around changed code' },
+  { role: 'impeccable', label: 'UI review', hint: 'only when UI files change' },
+  { role: 'fixer', label: 'Fixer', hint: 'applies consolidated findings' }
+]
+
+function RoleDefaults(): React.JSX.Element {
+  const qc = useQueryClient()
+  const cfg = useQuery({ queryKey: ['role-config'], queryFn: () => window.revva.roleConfig.list() })
+  const byRole = new Map((cfg.data ?? []).map((c) => [c.role, c]))
+  return (
+    <div className="space-y-2">
+      {REVIEW_ROLES.map(({ role, label, hint }) => {
+        const saved = byRole.get(role)
+        return (
+          <div key={role} className="space-y-1.5 rounded-md border p-2.5">
+            <div className="text-xs font-medium">
+              {label} <span className="font-normal text-muted-foreground">— {hint}</span>
+            </div>
+            <RoleSelectors
+              agentID={saved?.agentID ?? DEFAULT}
+              modelKey={saved?.model ? `${saved.model.providerID}::${saved.model.id}` : DEFAULT}
+              onAgent={(v) =>
+                void window.revva.roleConfig
+                  .save({ role, agentID: v === DEFAULT ? undefined : v, model: saved?.model })
+                  .then(() => qc.invalidateQueries({ queryKey: ['role-config'] }))
+              }
+              onModel={(v) => {
+                let model: { providerID: string; id: string } | undefined
+                if (v !== DEFAULT) {
+                  const [providerID, id] = v.split('::')
+                  if (providerID && id) model = { providerID, id }
+                }
+                void window.revva.roleConfig
+                  .save({ role, agentID: saved?.agentID, model })
+                  .then(() => qc.invalidateQueries({ queryKey: ['role-config'] }))
+              }}
+            />
+          </div>
+        )
+      })}
     </div>
   )
 }

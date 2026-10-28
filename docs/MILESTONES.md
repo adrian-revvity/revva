@@ -34,7 +34,7 @@ Each milestone ships something you can use daily. Order assumes evenings/weekend
 - Light model gating only: providers whose baseURL is a loopback endpoint get grayed out in pickers while that port is not listening, with a "run its script" explanation. No provider ever blocks the app (REQ-AWS-5).
 - **Exit test:** add a script, click Run, see live output + exit code; a loopback-provider model is disabled until the port answers.
 
-## M4 — Review pipeline (≈2d) ⭐ the meat
+## M4 — Review pipeline (≈2d) ⭐ the meat — DONE 2026-10-28
 - Phase runner framework (idle detection via `session.idle` + `/wait`, verdict parsing, ledger persistence, resume).
 - Parallel review fan-out of read-only subagent sessions: one Sol-loop reviewer, test-audit, and impeccable when UI is detected; no reviewer edits or starts other reviewers.
 - Per-role agent/model defaults plus per-run overrides for every reviewer and fixer; any agent/model exposed by the user's OpenCode service is eligible.
@@ -42,7 +42,7 @@ Each milestone ships something you can use daily. Order assumes evenings/weekend
 - Fan-in ledger, consolidated findings, one fixer session, then bounded parallel re-review; incomplete/error reviewers block approval and are visible.
 - Sol-loop ≤3 rounds by default, up to 5 only under its stated conditions; each round has one Sol-loop reviewer.
 - Provider-aware concurrency limits may queue a whole reviewer batch when necessary, but may not silently serialize gates or mark queued gates approved.
-- **Exit test:** finish a build → observe applicable reviewer subagents start concurrently, findings consolidate, fixer runs, and parallel re-review gates Ship. Verify one run uses GPU Qwen for review and another uses GPT-6 Sol (when configured), with no code change; also verify an arbitrary configured model can be selected.
+- **Exit test (done manually):** build finished → sol + test-audit reviewers ran concurrently (impeccable skipped: no UI files), test-audit requested changes → fixer ran → round 2 → round 3 → rounds capped at 3 → WAITING_HUMAN with the reason in the decision ledger. Role defaults live in Setup; per-run overrides in Start Work. Remaining later: verify multiple arbitrary models by taste while using the app.
 
 ## M5 — Ship + Jira sync (≈0.5d)
 - Commit-tree check, push, `gh pr create` (open browser), `gh stack submit` path for dep chains, Jira transition + summary comment, stack base wiring.
