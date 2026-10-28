@@ -21,6 +21,7 @@ import { shipManager } from './ship'
 import { scriptManager } from './scripts'
 import { githubManager } from './github'
 import { startTicketSession } from './tasks'
+import { discoverRepositories } from './repositories'
 import { parsePrRef } from '@shared/pr-ref'
 import { getDb, settingGet, settingSet, roleConfigList, roleConfigSet, favoriteModels, toggleFavoriteModel } from './db'
 import {
@@ -91,6 +92,12 @@ export function registerIpc(): void {
       default_base_branch: string | null
     }>
     return rows.map((r) => ({ id: r.id, path: r.path, defaultBaseBranch: r.default_base_branch ?? undefined }) satisfies Workspace)
+  })
+  ipcMain.handle(IPC.workspaceRepositories, async (_e, id: unknown) => {
+    if (typeof id !== 'string') throw new Error('Invalid workspace.')
+    const row = getDb().prepare('SELECT path FROM workspace WHERE id = ?').get(id) as { path: string } | undefined
+    if (!row) throw new Error('Workspace not found. Refresh Setup and try again.')
+    return discoverRepositories(row.path)
   })
   ipcMain.handle(IPC.workspaceAdd, (_e, path: string) => {
     const resolved = path.trim()

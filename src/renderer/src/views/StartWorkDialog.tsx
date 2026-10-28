@@ -17,6 +17,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
   SelectTrigger,
   SelectValue
@@ -44,7 +45,8 @@ export function StartWorkDialog({
   const agents = useQuery({ queryKey: ['agents'], queryFn: () => window.revva.inventory.agents() })
   const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models() })
 
-  const [repoDir, setRepoDir] = useState<string>('')
+  const [workspaceId, setWorkspaceId] = useState('')
+  const [repoDir, setRepoDir] = useState('')
   const [auto, setAuto] = useState(false)
   const [grill, setGrill] = useState(false)
   const [shipOnApprove, setShipOnApprove] = useState(false)
@@ -58,16 +60,36 @@ export function StartWorkDialog({
     fixer: { agentID: DEFAULT, modelKey: DEFAULT }
   })
 
-  // Suggest a stacked parent: an active work whose ticket this one depends on.
+  const workspace = workspaces.data?.find((w) => w.id === workspaceId) ?? workspaces.data?.[0]
+  const repositories = useQuery({
+    queryKey: ['workspace-repositories', workspace?.id],
+    queryFn: () => window.revva.workspace.repositories(workspace!.id),
+    enabled: !!workspace,
+    staleTime: 0
+  })
+  const paths = repositories.data?.paths ?? []
+  const selectedRepo = paths.includes(repoDir) ? repoDir : paths.length === 1 ? paths[0] : undefined
+  const words = new Set(`${ticket.key.split('-')[0]} ${ticket.summary}`.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length >= 3))
+  const ranked = paths.map((path) => {
+    const previous = works.some((work) => work.ticketKey === ticket.key && work.repoDir === path)
+    const name = path.split('/').filter(Boolean).pop() ?? path
+    const matches = name.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length >= 3 && words.has(word))
+    return { path, previous, matches }
+  }).sort((a, b) => Number(b.previous) - Number(a.previous) || b.matches.length - a.matches.length || a.path.localeCompare(b.path))
+
+  // Suggest a stacked parent only when it belongs to the selected repository.
   const suggestedParent = works.find(
-    (w) => ticket.dependsOn.length > 0 && w.ticketKey && ticket.dependsOn.includes(w.ticketKey) && w.state !== 'ABANDONED'
+    (w) => w.repoDir === selectedRepo && ticket.dependsOn.includes(w.ticketKey) && w.state !== 'ABANDONED'
   )
-  const [parentWorkId, setParentWorkId] = useState<string>(suggestedParent?.id ?? '__none__')
+  const [parentChoice, setParentChoice] = useState<string | undefined>()
+  const parentWorkId = parentChoice ?? suggestedParent?.id ?? '__none__'
+  const validParent = parentWorkId === '__none__' || works.some((w) => w.id === parentWorkId && w.repoDir === selectedRepo && w.state !== 'ABANDONED')
 
   const start = useMutation({
     mutationFn: async () => {
-      const dir = repoDir || workspaces.data?.[0]?.path
-      if (!dir) throw new Error('Add a project folder in Setup first.')
+      const dir = selectedRepo
+      if (!dir) throw new Error('Choose a repository first.')
+      if (!validParent) throw new Error('Choose a parent from the selected repository.')
       const work = await window.revva.work.start({
         ticketKey: ticket.key,
         repoDir: dir,
@@ -89,11 +111,11 @@ export function StartWorkDialog({
     onSuccess: onStarted
   })
 
-  const hasRepo = !!repoDir || (workspaces.data?.length ?? 0) > 0
+  const hasRepo = !!selectedRepo && validParent && !repositories.isFetching && !repositories.isError
 
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[calc(100vh-2rem)] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <span className="font-mono">{ticket.key}</span>
@@ -104,35 +126,57 @@ export function StartWorkDialog({
 
         <div className="space-y-4">
           <div className="space-y-1.5">
-            <Label>Repository</Label>
-            <Select value={repoDir || workspaces.data?.[0]?.path || ''} onValueChange={(v) => setRepoDir(v ?? '')}>
-              <SelectTrigger size="sm" className="w-full">
-                <SelectValue placeholder="Add a project folder in Setup…" />
+            <Label htmlFor="work-workspace">Workspace</Label>
+            <Select value={workspace?.id ?? ''} onValueChange={(v) => { setWorkspaceId(v); setRepoDir(''); setParentChoice(undefined) }}>
+              <SelectTrigger id="work-workspace" size="sm" className="w-full">
+                <SelectValue placeholder="Add a folder in Setup…" />
               </SelectTrigger>
               <SelectContent>
-                {(workspaces.data ?? []).map((w) => (
-                  <SelectItem key={w.id} value={w.path} className="font-mono text-xs">
-                    {w.path.split('/').filter(Boolean).pop() || w.path}
-                  </SelectItem>
-                ))}
+                <SelectGroup>
+                  {(workspaces.data ?? []).map((w) => (
+                    <SelectItem key={w.id} value={w.id} className="font-mono text-xs">{w.path}</SelectItem>
+                  ))}
+                </SelectGroup>
               </SelectContent>
             </Select>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label htmlFor="work-repository">Repository</Label>
+            <Select value={selectedRepo ?? ''} onValueChange={(v) => { setRepoDir(v); setParentChoice(undefined) }} disabled={!paths.length || repositories.isFetching}>
+              <SelectTrigger id="work-repository" size="sm" className="w-full">
+                <SelectValue placeholder={repositories.isFetching ? 'Finding repositories…' : 'Choose a repository…'} />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {ranked.map(({ path, previous, matches }) => (
+                    <SelectItem key={path} value={path} className="font-mono text-xs">
+                      {path}{previous ? ' · previously used for this ticket' : matches.length ? ` · matches ${matches.join(', ')}` : ''}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            {repositories.isError && <p className="text-xs text-destructive">Could not scan this workspace. Check that the folder is accessible and try again.</p>}
+            {!repositories.isFetching && !repositories.isError && workspace && paths.length === 0 && <p className="text-xs text-muted-foreground">No repositories found within three folder levels. Add the repository folder in Setup.</p>}
+            {repositories.data?.incomplete && <p className="text-xs text-muted-foreground">The scan was limited or some folders could not be read; the list may be incomplete. Add the repository folder in Setup if needed.</p>}
+            {paths.length > 1 && <p className="text-xs text-muted-foreground">Choose a repository. Suggestions use prior ticket work and name matches, not a guarantee.</p>}
           </div>
 
           {ticket.dependsOn.length > 0 && (
             <div className="space-y-1.5 rounded-md border border-dashed p-3">
               <div className="flex items-center justify-between">
                 <Label>Stack on parent work</Label>
-                {suggestedParent && <Badge variant="secondary" className="text-[10px]">detected</Badge>}
+                {suggestedParent && parentWorkId === suggestedParent.id && <Badge variant="secondary" className="text-[10px]">detected</Badge>}
               </div>
-              <Select value={parentWorkId} onValueChange={(v) => setParentWorkId(v ?? '__none__')}>
+              <Select value={parentWorkId} onValueChange={(v) => setParentChoice(v ?? '__none__')}>
                 <SelectTrigger size="sm" className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__none__">Branch from default (main)</SelectItem>
+                  <SelectItem value="__none__">Branch from repository default</SelectItem>
                   {works
-                    .filter((w) => w.state !== 'ABANDONED')
+                    .filter((w) => w.state !== 'ABANDONED' && w.repoDir === selectedRepo)
                     .map((w) => (
                       <SelectItem key={w.id} value={w.id} className="text-xs">
                         {w.ticketKey} · {w.branch}

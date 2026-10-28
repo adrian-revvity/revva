@@ -12,6 +12,7 @@ export const IPC = {
   settingsSet: 'revva:settings:set',
   workspaceAdd: 'revva:workspace:add',
   workspaceList: 'revva:workspace:list',
+  workspaceRepositories: 'revva:workspace:repositories',
   workspaceRemove: 'revva:workspace:remove',
   chatList: 'revva:chat:list',
   chatCreate: 'revva:chat:create',

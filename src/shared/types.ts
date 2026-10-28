@@ -538,6 +538,7 @@ export interface RevvaApi {
   }
   workspace: {
     list(): Promise<Workspace[]>
+    repositories(id: string): Promise<{ paths: string[]; incomplete: boolean }>
     add(path: string): Promise<Workspace>
     remove(id: string): Promise<void>
     pickFolder(): Promise<string | null>
