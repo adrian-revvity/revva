@@ -4,11 +4,34 @@
  * all transcript state lives in OpenCode.
  */
 import { randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { BrowserWindow } from 'electron'
 import { openCodeService, describeError } from './service'
 import { eventBus, type RawEvent } from './bus'
 import { getDb } from '../db'
+import { parsePrRef, repoFromGitRemote, resolvePrRef } from '@shared/pr-ref'
 import { IPC, type ChatCreateInput, type ChatMessage, type ChatSummary, type PushEvent } from '@shared/types'
+
+const exec = promisify(execFile)
+
+/** Resolve a possibly-bare PR ref ("#12") against the directory's GitHub remote. */
+async function resolvePrLink(raw: string | undefined, directory: string): Promise<string | undefined> {
+  if (!raw?.trim()) return undefined
+  const ref = parsePrRef(raw)
+  if (!ref) throw new Error(`Could not read that PR reference: "${raw}"`)
+  if (ref.url && ref.repo) return ref.url
+  let contextRepo: string | undefined
+  try {
+    const res = await exec('git', ['-C', directory, 'remote', 'get-url', 'origin'], { timeout: 10_000 })
+    contextRepo = repoFromGitRemote(res.stdout)
+  } catch {
+    /* not a git repo / no remote → stays ambiguous */
+  }
+  const resolved = resolvePrRef(ref, contextRepo)
+  if (!resolved?.url) throw new Error(`PR "${raw}" is ambiguous — many GitHub projects: use owner/repo#n or the full PR URL.`)
+  return resolved.url
+}
 
 interface ChatRow {
   session_id: string
@@ -17,8 +40,16 @@ interface ChatRow {
   agent_id: string | null
   provider_id: string | null
   model_id: string | null
+  ticket_key: string | null
+  pr_url: string | null
   created_at: number
   updated_at: number
+}
+
+function ensureSchema(): void {
+  const cols = getDb().prepare('PRAGMA table_info(chat)').all() as Array<{ name: string }>
+  if (!cols.some((c) => c.name === 'ticket_key')) getDb().exec('ALTER TABLE chat ADD COLUMN ticket_key TEXT')
+  if (!cols.some((c) => c.name === 'pr_url')) getDb().exec('ALTER TABLE chat ADD COLUMN pr_url TEXT')
 }
 
 function rowToSummary(row: ChatRow): ChatSummary {
@@ -29,6 +60,8 @@ function rowToSummary(row: ChatRow): ChatSummary {
     agentID: row.agent_id ?? undefined,
     providerID: row.provider_id ?? undefined,
     modelID: row.model_id ?? undefined,
+    ticketKey: row.ticket_key ?? undefined,
+    prUrl: row.pr_url ?? undefined,
     updatedAt: row.updated_at
   }
 }
@@ -45,6 +78,7 @@ class ChatManager {
   wire(): void {
     if (this.wired) return
     this.wired = true
+    ensureSchema()
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
     // SSE is live-only: after a reconnect the renderer refetches via its queries.
     eventBus.on('stream:reconnect', () => send({ kind: 'chat.idle', sessionId: '*' }))
@@ -58,6 +92,8 @@ class ChatManager {
   }
 
   async create(input: ChatCreateInput): Promise<ChatSummary> {
+    ensureSchema()
+    const prUrl = await resolvePrLink(input.prUrl, input.directory)
     const api = openCodeService.api
     const title = input.title?.trim() || 'New chat'
     const session = await api.session.create({
@@ -65,15 +101,15 @@ class ChatManager {
       agent: input.agentID ?? null,
       model: input.model ? { providerID: input.model.providerID, id: input.model.id } : null,
       location: { directory: input.directory },
-      metadata: { revva: { kind: 'chat' } }
+      metadata: { revva: { kind: 'chat', ticketKey: input.ticketKey ?? null, prUrl: prUrl ?? null } }
     })
     const now = Date.now()
     getDb()
       .prepare(
-        `INSERT INTO chat(session_id, title, directory, agent_id, provider_id, model_id, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?)`
+        `INSERT INTO chat(session_id, title, directory, agent_id, provider_id, model_id, ticket_key, pr_url, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?)`
       )
-      .run(session.id, title, input.directory, input.agentID ?? null, input.model?.providerID ?? null, input.model?.id ?? null, now, now)
+      .run(session.id, title, input.directory, input.agentID ?? null, input.model?.providerID ?? null, input.model?.id ?? null, input.ticketKey ?? null, prUrl ?? null, now, now)
     return {
       sessionId: session.id,
       title,
@@ -81,6 +117,8 @@ class ChatManager {
       agentID: input.agentID,
       providerID: input.model?.providerID,
       modelID: input.model?.id,
+      ticketKey: input.ticketKey,
+      prUrl,
       updatedAt: now
     }
   }

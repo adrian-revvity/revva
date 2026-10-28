@@ -9,6 +9,8 @@ import {
   Kanban,
   Hammer,
   Terminal,
+  Github,
+  Trash2,
   Inbox as InboxIcon
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -24,6 +26,7 @@ import { BoardView } from '@/views/BoardView'
 import { WorkCockpit } from '@/views/WorkCockpit'
 import { InboxView, useInbox } from '@/views/InboxView'
 import { ScriptsView } from '@/views/ScriptsView'
+import { GitHubView } from '@/views/GitHubView'
 
 type View =
   | { kind: 'chat'; sessionId: string }
@@ -32,6 +35,7 @@ type View =
   | { kind: 'work'; workId: string }
   | { kind: 'inbox' }
   | { kind: 'scripts' }
+  | { kind: 'github' }
 
 const serviceStateLabels = {
   connecting: { label: 'Connecting…', cls: 'text-muted-foreground' },
@@ -71,8 +75,24 @@ export default function App(): React.JSX.Element {
   const activeWork =
     view.kind === 'work' ? works.data?.find((w) => w.id === view.workId) : undefined
   const runningWorks = (works.data ?? []).filter(
-    (w) => w.state === 'BUILDING' || w.state === 'REVIEW' || w.state === 'WAITING_HUMAN'
+    (w) => w.state === 'BUILDING' || w.state === 'REVIEW' || w.state === 'FIXING' || w.state === 'REWORK' || w.state === 'WAITING_HUMAN'
   )
+  const waitingCount = pending.length
+
+  const deleteChat = (sessionId: string, title: string): void => {
+    if (!confirm(`Delete chat "${title}"? The OpenCode session is removed too.`)) return
+    void window.revva.chat.remove(sessionId).then(() => {
+      qc.invalidateQueries({ queryKey: ['chats'] })
+      if (view.kind === 'chat' && view.sessionId === sessionId) setView({ kind: 'board' })
+    })
+  }
+  const abandonWork = (workId: string, ticketKey: string): void => {
+    if (!confirm(`Abandon ${ticketKey}? The worktree is removed and the build session deleted. Branch/commits stay in the repo.`)) return
+    void window.revva.work.abandon(workId).then(() => {
+      qc.invalidateQueries({ queryKey: ['works'] })
+      if (view.kind === 'work' && view.workId === workId) setView({ kind: 'board' })
+    })
+  }
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -101,6 +121,12 @@ export default function App(): React.JSX.Element {
             active={view.kind === 'scripts'}
             onClick={() => setView({ kind: 'scripts' })}
           />
+          <NavButton
+            icon={<Github className="size-4" />}
+            label="GitHub"
+            active={view.kind === 'github'}
+            onClick={() => setView({ kind: 'github' })}
+          />
           {runningWorks.map((w) => (
             <NavButton
               key={w.id}
@@ -113,6 +139,12 @@ export default function App(): React.JSX.Element {
               sublabel={w.state}
               active={view.kind === 'work' && view.workId === w.id}
               onClick={() => setView({ kind: 'work', workId: w.id })}
+              actions={
+                <NavAction
+                  title="Abandon work"
+                  onClick={() => abandonWork(w.id, w.ticketKey)}
+                />
+              }
             />
           ))}
         </div>
@@ -141,6 +173,7 @@ export default function App(): React.JSX.Element {
               label={c.title}
               active={view.kind === 'chat' && view.sessionId === c.sessionId}
               onClick={() => setView({ kind: 'chat', sessionId: c.sessionId })}
+              actions={<NavAction title="Delete chat" onClick={() => deleteChat(c.sessionId, c.title)} />}
             />
           ))}
         </div>
@@ -192,17 +225,61 @@ export default function App(): React.JSX.Element {
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col">
-        <div className="drag-region flex h-11 shrink-0 items-center justify-end gap-2 border-b px-3">
-          {works.data?.some((w) => w.state === 'BUILDING') && (
-            <Badge variant="outline" className="no-drag animate-pulse font-normal">
-              building…
-            </Badge>
+        <div className="drag-region flex h-11 shrink-0 items-center gap-2 border-b px-3">
+          <span className="no-drag text-[13px] font-medium capitalize text-muted-foreground">
+            {view.kind === 'work' ? activeWork?.ticketKey : view.kind === 'chat' ? 'Chat' : view.kind}
+          </span>
+          {runningWorks.slice(0, 3).map((w) => (
+            <button
+              key={w.id}
+              onClick={() => setView({ kind: 'work', workId: w.id })}
+              className={cn(
+                'no-drag flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] transition-colors hover:bg-accent',
+                w.state === 'BUILDING' && 'border-sky-500/40 text-sky-700 dark:text-sky-400',
+                w.state === 'REVIEW' && 'border-violet-500/40 text-violet-700 dark:text-violet-400',
+                w.state === 'FIXING' && 'border-orange-500/40 text-orange-700 dark:text-orange-400',
+                w.state === 'REWORK' && 'border-pink-500/40 text-pink-700 dark:text-pink-400',
+                w.state === 'WAITING_HUMAN' && 'border-amber-500/40 text-amber-700 dark:text-amber-400'
+              )}
+              title={`${w.ticketKey} · ${w.state}`}
+            >
+              <Hammer className={cn('size-3', (w.state === 'BUILDING' || w.state === 'REVIEW' || w.state === 'FIXING' || w.state === 'REWORK') && 'animate-pulse')} />
+              {w.ticketKey}
+              <span className="opacity-70">{w.state === 'WAITING_HUMAN' ? 'needs you' : w.state.toLowerCase()}</span>
+            </button>
+          ))}
+          {runningWorks.length > 3 && (
+            <Badge variant="outline" className="no-drag font-normal">+{runningWorks.length - 3} more</Badge>
           )}
-          {st?.state === 'connected' && (
-            <Badge variant="outline" className="no-drag font-normal">
-              opencode v{st.version}
-            </Badge>
-          )}
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              onClick={() => setView({ kind: 'inbox' })}
+              className={cn(
+                'no-drag flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors hover:bg-accent',
+                waitingCount > 0
+                  ? 'border-amber-500/40 text-amber-700 dark:text-amber-400'
+                  : 'text-muted-foreground'
+              )}
+            >
+              <InboxIcon className="size-3.5" />
+              {waitingCount > 0 ? `${waitingCount} waiting on you` : 'Inbox clear'}
+            </button>
+            {st?.state === 'connected' ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="no-drag flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] text-muted-foreground">
+                    <span className="size-1.5 rounded-full bg-emerald-500" />
+                    opencode v{st.version}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>{st.url}</TooltipContent>
+              </Tooltip>
+            ) : (
+              <Badge variant="outline" className={cn('no-drag font-normal', stateInfo.cls)}>
+                {stateInfo.label}
+              </Badge>
+            )}
+          </div>
         </div>
         {view.kind === 'setup' ? (
           <SetupView />
@@ -210,6 +287,8 @@ export default function App(): React.JSX.Element {
           <InboxView />
         ) : view.kind === 'scripts' ? (
           <ScriptsView />
+        ) : view.kind === 'github' ? (
+          <GitHubView onOpenChat={(sessionId) => setView({ kind: 'chat', sessionId })} />
         ) : view.kind === 'board' ? (
           <BoardView works={works.data ?? []} onStart={(workId) => setView({ kind: 'work', workId })} />
         ) : view.kind === 'work' ? (
@@ -238,7 +317,8 @@ function NavButton({
   sublabel,
   badge,
   active,
-  onClick
+  onClick,
+  actions
 }: {
   icon: React.ReactNode
   label: string
@@ -246,23 +326,47 @@ function NavButton({
   badge?: number
   active: boolean
   onClick: () => void
+  /** Hover-revealed buttons (e.g. delete). */
+  actions?: React.ReactNode
 }): React.JSX.Element {
   return (
-    <button
-      onClick={onClick}
+    <div
       className={cn(
-        'flex w-full items-center gap-2 truncate rounded-md px-2 py-1.5 text-left text-[13px] hover:bg-sidebar-accent',
+        'group/nav relative flex w-full items-center rounded-md text-left text-[13px] hover:bg-sidebar-accent',
         active && 'bg-sidebar-accent font-medium'
       )}
     >
-      {icon}
-      <span className="truncate">{label}</span>
-      {badge !== undefined && (
-        <span className="ml-auto flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold text-white">
-          {badge}
+      <button onClick={onClick} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5">
+        {icon}
+        <span className="truncate">{label}</span>
+        {badge !== undefined && (
+          <span className="flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold text-white">
+            {badge}
+          </span>
+        )}
+        {sublabel && <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">{sublabel}</span>}
+      </button>
+      {actions && (
+        <span className="absolute right-1 hidden items-center gap-0.5 rounded-md bg-sidebar-accent group-hover/nav:flex">
+          {actions}
         </span>
       )}
-      {sublabel && <span className="ml-auto text-[10px] text-muted-foreground">{sublabel}</span>}
+    </div>
+  )
+}
+
+/** Tiny hover button for row actions (delete/abandon). */
+function NavAction({ title, onClick }: { title: string; onClick: () => void }): React.JSX.Element {
+  return (
+    <button
+      title={title}
+      onClick={(e) => {
+        e.stopPropagation()
+        onClick()
+      }}
+      className="rounded p-1 text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
+    >
+      <Trash2 className="size-3.5" />
     </button>
   )
 }

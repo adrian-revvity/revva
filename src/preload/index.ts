@@ -57,6 +57,17 @@ const api: RevvaApi = {
     pending: () => ipcRenderer.invoke(IPC.commentsPending),
     tackle: (workId) => ipcRenderer.invoke(IPC.commentsTackle, workId)
   },
+  github: {
+    list: (scope) => ipcRenderer.invoke(IPC.githubList, scope),
+    review: (prUrl) => ipcRenderer.invoke(IPC.githubReview, prUrl)
+  },
+  task: {
+    ticketSession: (input) => ipcRenderer.invoke(IPC.taskTicketSession, input)
+  },
+  models: {
+    favorites: () => ipcRenderer.invoke(IPC.modelsFavorites),
+    toggleFavorite: (key) => ipcRenderer.invoke(IPC.modelsFavoriteToggle, key)
+  },
   inbox: {
     list: () => ipcRenderer.invoke(IPC.inboxList),
     replyForm: (sessionId, formId, answer) => ipcRenderer.invoke(IPC.inboxReplyForm, sessionId, formId, answer),

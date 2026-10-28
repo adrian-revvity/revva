@@ -41,6 +41,8 @@ export function NewChatDialog({
   const [customDir, setCustomDir] = useState('')
   const [agentID, setAgentID] = useState('__default__')
   const [modelKey, setModelKey] = useState('__default__')
+  const [ticketKey, setTicketKey] = useState('')
+  const [prRef, setPrRef] = useState('')
 
   // Default the folder to the first configured workspace.
   useEffect(() => {
@@ -57,7 +59,9 @@ export function NewChatDialog({
         directory: dir,
         title: title.trim() || undefined,
         agentID: agentID === '__default__' ? undefined : agentID,
-        model: modelKey === '__default__' ? undefined : parseModelKey(modelKey)
+        model: modelKey === '__default__' ? undefined : parseModelKey(modelKey),
+        ticketKey: ticketKey.trim() || undefined,
+        prUrl: prRef.trim() || undefined
       })
       await qc.invalidateQueries({ queryKey: ['chats'] })
       return chat

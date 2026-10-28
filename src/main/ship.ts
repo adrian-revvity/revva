@@ -104,7 +104,8 @@ class ShipManager {
     return checks
   }
 
-  /** Push + PR + Jira. Throws with a readable message when a fatal check fails. */
+  /** Push + PR + Jira. With an already-linked PR this just pushes to it (update);
+   *  otherwise it creates one. Throws with a readable message when a fatal check fails. */
   async ship(workId: string): Promise<ShipResult> {
     ensureSchema()
     const checks = await this.checks(workId)
@@ -115,21 +116,28 @@ class ShipManager {
       if (work.state === 'BUILDING' || work.state === 'REVIEW' || work.state === 'FIXING') throw new Error('Reviews are still running.')
       throw new Error(`Cannot ship from state ${work.state}.`)
     }
-    if (work.pr_url) return { prUrl: work.pr_url, alreadyShipped: true }
 
-    audit(workId, 'ship-start', `branch ${work.branch}`)
+    audit(workId, 'ship-start', `branch ${work.branch}${work.pr_url ? ' (update existing PR)' : ''}`)
 
     // 1. Push (never force). -u so gh and gh-stack see the tracking branch.
     const push = await this.probe('git', ['-C', work.worktree_dir, 'push', '-u', 'origin', work.branch])
     if (!push.ok) throw new Error(`git push failed: ${push.err.slice(0, 400)}`)
     audit(workId, 'pushed', work.branch)
 
-    // 2. PR. Stacked work bases on the parent work's branch — this is the gh-stack
-    //    relationship (child base = parent branch); plain gh pr create keeps bases correct.
+    // 2. PR: linked already ⇒ the push above updated it — no second PR, ever.
+    if (work.pr_url) {
+      const reviews = this.reviewLedger(workId)
+      const jira = await this.syncJira(work, work.pr_url, reviews)
+      audit(workId, 'jira-sync', jira)
+      getDb().prepare('UPDATE work SET updated_at = ? WHERE id = ?').run(Date.now(), workId)
+      workManager.setReviewState(workId, 'SHIPPED')
+      return { prUrl: work.pr_url, alreadyShipped: true }
+    }
+
+    // No PR yet: create one. Stacked work bases on the parent work's branch — this is the
+    // gh-stack relationship (child base = parent branch); plain gh pr create keeps bases correct.
     const base = await this.baseFor(work)
-    const reviews = getDb()
-      .prepare("SELECT role, round, status FROM review WHERE work_id = ? AND role != 'fixer' ORDER BY round, role")
-      .all(workId) as Array<{ role: string; round: number; status: string }>
+    const reviews = this.reviewLedger(workId)
     const title = this.prTitle(work)
     const body = this.prBody(work, reviews)
     const prArgs = [
@@ -154,6 +162,12 @@ class ShipManager {
     getDb().prepare('UPDATE work SET pr_url = ?, updated_at = ? WHERE id = ?').run(prUrl, Date.now(), workId)
     workManager.setReviewState(workId, 'SHIPPED')
     return { prUrl, alreadyShipped: false }
+  }
+
+  private reviewLedger(workId: string): Array<{ role: string; round: number; status: string }> {
+    return getDb()
+      .prepare("SELECT role, round, status FROM review WHERE work_id = ? AND role != 'fixer' ORDER BY round, role")
+      .all(workId) as Array<{ role: string; round: number; status: string }>
   }
 
   /** Push existing commits to the branch (used by rework); never force. */

@@ -4,6 +4,7 @@
  */
 import { openCodeService } from './service'
 import { scriptManager } from '../scripts'
+import { favoriteModels } from '../db'
 import type { AgentInfo, ModelInfo, SkillInfo } from '@shared/types'
 
 export async function listAgents(): Promise<AgentInfo[]> {
@@ -15,17 +16,28 @@ export async function listAgents(): Promise<AgentInfo[]> {
 }
 
 export async function listModels(): Promise<ModelInfo[]> {
-  const [res, gating] = await Promise.all([openCodeService.api.model.list({}), morningGate()])
+  const [res, gating, favorites] = await Promise.all([
+    openCodeService.api.model.list({}),
+    morningGate(),
+    Promise.resolve(favoriteModels())
+  ])
+  const favSet = new Set(favorites)
   return res.data
     .filter((m) => m.enabled)
-    .map((m) => ({
-      providerID: m.providerID,
-      id: m.modelID ?? m.id,
-      name: m.name,
-      context: m.limit?.context,
-      gated: gating.get(m.providerID)
-    }))
-    .sort((x, y) => `${x.providerID}/${x.id}`.localeCompare(`${y.providerID}/${y.id}`))
+    .map((m) => {
+      const model = {
+        providerID: m.providerID,
+        id: m.modelID ?? m.id,
+        name: m.name,
+        context: m.limit?.context,
+        gated: gating.get(m.providerID)
+      }
+      return { ...model, favorite: favSet.has(`${model.providerID}::${model.id}`) || undefined }
+    })
+    .sort((x, y) => {
+      if (!!y.favorite !== !!x.favorite) return x.favorite ? -1 : 1
+      return `${x.providerID}/${x.id}`.localeCompare(`${y.providerID}/${y.id}`)
+    })
 }
 
 /** Providers whose local endpoint (proxy) is down — models gray out until it's up. */

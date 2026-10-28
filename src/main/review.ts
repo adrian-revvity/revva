@@ -333,10 +333,10 @@ class ReviewManager {
       return
     }
     if (changes.length === 0) {
-      const work = getDb().prepare('SELECT mode FROM work WHERE id = ?').get(workId) as { mode: string } | undefined
+      const work = getDb().prepare('SELECT ship_on_approve FROM work WHERE id = ?').get(workId) as { ship_on_approve: number | null } | undefined
       this.audit(workId, round, 'approved', rows.map((r) => `${r.role}: approved`).join(', '))
-      if (work?.mode === 'auto') {
-        // AUTO: ship immediately after all gates pass — no routine pinging.
+      if (work?.ship_on_approve) {
+        // Opt-in only: push + PR the moment all gates pass (existing PR is updated).
         void shipManager.autoShip(workId)
       } else {
         workManager.setReviewState(workId, 'APPROVED')

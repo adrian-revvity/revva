@@ -114,3 +114,17 @@ export function roleConfigSet(cfg: RoleConfigRow): void {
     )
     .run(cfg.role, cfg.agentID ?? null, cfg.model?.providerID ?? null, cfg.model?.id ?? null)
 }
+
+/* ---------- model favorites (order-preserving list of `providerID::modelID`) ---------- */
+
+export function favoriteModels(): string[] {
+  const v = settingGet<string[]>('model.favorites')
+  return Array.isArray(v) ? v : []
+}
+
+export function toggleFavoriteModel(key: string): string[] {
+  const cur = favoriteModels()
+  const next = cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key]
+  settingSet('model.favorites', next)
+  return next
+}

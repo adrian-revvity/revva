@@ -6,9 +6,9 @@ import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { TranscriptView, type TranscriptDrive } from './Chat'
-import type { PushEvent, ReviewRole, ReviewRow } from '@shared/types'
+import type { PipelineRole, PushEvent, ReviewRow } from '@shared/types'
 
-const roleMeta: Record<ReviewRole | 'fixer', { label: string; icon: React.JSX.Element }> = {
+const roleMeta: Partial<Record<PipelineRole, { label: string; icon: React.JSX.Element }>> = {
   sol: { label: 'Sol-loop', icon: <ScanEye className="size-3.5" /> },
   testAudit: { label: 'Test audit', icon: <ShieldQuestion className="size-3.5" /> },
   impeccable: { label: 'UI review', icon: <Sparkles className="size-3.5" /> },

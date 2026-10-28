@@ -77,4 +77,5 @@ run the app manually and click through the flow once. `pnpm typecheck` +
 
 ## Owner notes (backlog)
 
-- **Board polish:** give Jira status codes a color palette so they're easy to tell apart at a glance; add a status dropdown filter and a search bar to the Board page.
+- **Board polish:** DONE 2026-10-28 — status color palette (name/category-keyed, hash-stable fallback), status dropdown filter, search bar. Also: per-ticket two buttons (Start flow / Session), GitHub tab with Review flow, tunable prompt templates + role defaults + model favorites in Setup, chat↔ticket/PR linking in New Chat, delete/abandon buttons in the sidebar, richer top bar, push/PR is opt-in ("push when changes are done"; pushes to the linked PR if one exists).
+- **GitHub multi-repo:** users work across many GitHub projects, so a bare "PR #123" is ambiguous. Everywhere a PR is referenced (New Chat link field, review launches), accept a full PR URL or `owner/repo#123`; only fall back to repo inference from context when unambiguous.

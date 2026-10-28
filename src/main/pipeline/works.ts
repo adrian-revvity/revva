@@ -17,6 +17,7 @@ import { eventBus, type RawEvent } from '../opencode/bus'
 import { getTicket } from '../jira/board'
 import { getDb, settingGet } from '../db'
 import { reviewManager } from '../review'
+import { renderPrompt, DEFAULT_START_PROMPT } from '@shared/prompts'
 import { IPC, type StartWorkInput, type WorkState, type WorkSummary } from '@shared/types'
 
 const exec = promisify(execFile)
@@ -33,6 +34,7 @@ interface WorkRow {
   state: string
   session_id: string | null
   review_sel: string | null
+  ship_on_approve: number | null
   pr_url: string | null
   created_at: number
   updated_at: number
@@ -49,6 +51,12 @@ function ensureSchema(): void {
   const cols = getDb().prepare('PRAGMA table_info(work)').all() as Array<{ name: string }>
   if (!cols.some((c) => c.name === 'review_sel')) {
     getDb().exec('ALTER TABLE work ADD COLUMN review_sel TEXT')
+  }
+  if (!cols.some((c) => c.name === 'ship_on_approve')) {
+    getDb().exec('ALTER TABLE work ADD COLUMN ship_on_approve INTEGER')
+  }
+  if (!cols.some((c) => c.name === 'pr_url')) {
+    getDb().exec('ALTER TABLE work ADD COLUMN pr_url TEXT')
   }
 }
 
@@ -116,8 +124,8 @@ class WorkManager {
     const now = Date.now()
     getDb()
       .prepare(
-        `INSERT INTO work(id, ticket_key, workspace_id, repo_dir, branch, worktree_dir, parent_work_id, mode, state, session_id, review_sel, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        `INSERT INTO work(id, ticket_key, workspace_id, repo_dir, branch, worktree_dir, parent_work_id, mode, state, session_id, review_sel, ship_on_approve, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
         id,
@@ -131,6 +139,7 @@ class WorkManager {
         state,
         null,
         input.reviewSel ? JSON.stringify(input.reviewSel) : null,
+        input.shipOnApprove ? 1 : 0,
         now,
         now
       )
@@ -158,6 +167,12 @@ class WorkManager {
   private async buildPrompt(ticketKey: string, input: StartWorkInput): Promise<string> {
     const ticket = await getTicket(ticketKey)
     const description = extractDescription(ticket?.raw)
+    const template = settingGet<string>('prompt.start') || DEFAULT_START_PROMPT
+    const core = renderPrompt(template, {
+      ticketKey,
+      summary: ticket?.summary ?? '',
+      description: description || '(No ticket description.)'
+    })
     const modeLines =
       input.mode === 'auto'
         ? [
@@ -173,9 +188,7 @@ class WorkManager {
             'Interactive mode: ask when the goal or trade-offs are genuinely unclear.'
           ]
     return [
-      `Work ticket ${ticketKey}: ${ticket?.summary ?? ''}`,
-      '',
-      description ? `--- Ticket description ---\n${description}\n--- End description ---` : '(No ticket description.)',
+      core,
       '',
       ...(input.grill
         ? [
@@ -184,12 +197,10 @@ class WorkManager {
             ''
           ]
         : []),
-      'Rules (Revva pipeline):',
+      // Structural pipeline facts — not stylistic, always appended.
+      `Pipeline context (Revva):`,
       '- You are in a dedicated git worktree on branch ' + slugBranch(ticketKey) + '.',
-      '- Implement the ticket fully, add/adjust tests where the repo has them, keep the tree committable.',
-      '- Commit your work with clear messages referencing ' + ticketKey + '.',
-      '- Do not push, do not open PRs — Revva ships after review.',
-      '- If UI changes are part of the ticket, note them in your final summary.',
+      '- Commit your work with clear messages referencing ' + ticketKey + '. Do not push, do not open PRs — Revva ships after review.',
       ...modeLines
     ].join('\n')
   }

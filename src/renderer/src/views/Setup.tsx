@@ -1,16 +1,23 @@
 import { useEffect, useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { FolderPlus, Trash2, CircleCheck, CircleX, CircleDashed } from 'lucide-react'
+import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
+import { FolderPlus, Trash2, CircleCheck, CircleX, CircleDashed, Star } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { RoleSelectors, DEFAULT, selOrUndefined } from './RoleSelectors'
 import { FeaturesDialogButton } from './FeaturesDialog'
-import type { PipelineRole } from '@shared/types'
+import {
+  DEFAULT_START_PROMPT,
+  DEFAULT_TACKLE_PROMPT,
+  DEFAULT_PR_REVIEW_PROMPT,
+  PROMPT_PLACEHOLDER_HELP
+} from '@shared/prompts'
+import type { PipelineRole, SettingsKey } from '@shared/types'
 
 /**
  * First-run setup + settings (REQ-SETUP-1/2): OpenCode connection status, workspace folders,
@@ -130,11 +137,27 @@ export function SetupView(): React.JSX.Element {
         </section>
 
         <section className="space-y-2">
-          <h2 className="text-sm font-medium">Review team defaults</h2>
+          <h2 className="text-sm font-medium">Agent / model defaults by role</h2>
           <p className="text-xs text-muted-foreground">
-            Agent/model per pipeline role; any run can override these. Empty = whatever your OpenCode service defaults to.
+            Any run can override these. Empty = whatever your OpenCode service defaults to.
           </p>
           <RoleDefaults />
+        </section>
+
+        <section className="space-y-2">
+          <h2 className="text-sm font-medium">Prompt templates</h2>
+          <p className="text-xs text-muted-foreground">
+            What the one-click buttons tell the agent. Edit freely; placeholders are filled in per run.
+          </p>
+          <PromptTuning />
+        </section>
+
+        <section className={cn('space-y-2', !connected && 'opacity-50')}>
+          <h2 className="text-sm font-medium">Favorite models</h2>
+          <p className="text-xs text-muted-foreground">
+            Star the models you use most — they pin to the top of every picker.
+          </p>
+          {connected && <ModelFavorites />}
         </section>
 
         <section className={cn('space-y-2', !connected && 'opacity-50')}>
@@ -171,10 +194,12 @@ export function SetupView(): React.JSX.Element {
 }
 
 const REVIEW_ROLES: Array<{ role: PipelineRole; label: string; hint: string }> = [
+  { role: 'build', label: 'Build', hint: 'default agent/model for Start flow & ticket sessions' },
   { role: 'sol', label: 'Sol-loop', hint: 'adversarial code review, every round' },
   { role: 'testAudit', label: 'Test audit', hint: 'tests around changed code' },
   { role: 'impeccable', label: 'UI review', hint: 'only when UI files change' },
-  { role: 'fixer', label: 'Fixer', hint: 'applies consolidated findings' }
+  { role: 'fixer', label: 'Fixer', hint: 'applies consolidated findings' },
+  { role: 'prReview', label: 'PR review', hint: 'GitHub tab review sessions' }
 ]
 
 function RoleDefaults(): React.JSX.Element {
@@ -212,6 +237,101 @@ function RoleDefaults(): React.JSX.Element {
           </div>
         )
       })}
+    </div>
+  )
+}
+
+const PROMPT_FIELDS: Array<{ key: 'prompt.start' | 'prompt.tackle' | 'prompt.review'; label: string; hint: string; fallback: string }> = [
+  { key: 'prompt.start', label: 'Start flow (pipeline build)', hint: 'the full worktree→review→ship run', fallback: DEFAULT_START_PROMPT },
+  { key: 'prompt.tackle', label: 'Session button (ticket)', hint: 'plain session linked to a Jira ticket', fallback: DEFAULT_TACKLE_PROMPT },
+  { key: 'prompt.review', label: 'Review button (PR)', hint: 'GitHub tab review sessions', fallback: DEFAULT_PR_REVIEW_PROMPT }
+]
+
+function PromptTuning(): React.JSX.Element {
+  const qc = useQueryClient()
+  return (
+    <div className="space-y-3">
+      <p className="text-[11px] text-muted-foreground">{PROMPT_PLACEHOLDER_HELP}</p>
+      {PROMPT_FIELDS.map(({ key, label, hint, fallback }) => (
+        <PromptField key={key} settingKey={key} label={label} hint={hint} fallback={fallback} qc={qc} />
+      ))}
+    </div>
+  )
+}
+
+function PromptField({
+  settingKey,
+  label,
+  hint,
+  fallback,
+  qc
+}: {
+  settingKey: SettingsKey
+  label: string
+  hint: string
+  fallback: string
+  qc: QueryClient
+}): React.JSX.Element {
+  const saved = useQuery({ queryKey: ['settings', settingKey], queryFn: () => window.revva.settings.get(settingKey) })
+  const [draft, setDraft] = useState<string | null>(null)
+  const value = draft ?? (typeof saved.data === 'string' && saved.data ? saved.data : fallback)
+  const dirty = draft !== null && draft !== (saved.data ?? '')
+
+  const persist = (next: string): void => {
+    void window.revva.settings.set(settingKey, next === fallback ? null : next).then(() => {
+      setDraft(null)
+      void qc.invalidateQueries({ queryKey: ['settings', settingKey] })
+    })
+  }
+
+  return (
+    <div className="space-y-1.5 rounded-md border p-2.5">
+      <div className="flex items-center justify-between">
+        <Label className="text-xs">
+          {label} <span className="font-normal text-muted-foreground">— {hint}</span>
+        </Label>
+        <div className="flex items-center gap-1.5">
+          {dirty && (
+            <Button size="sm" variant="outline" className="h-6 px-2 text-[11px]" onClick={() => persist(draft!)}>
+              Save
+            </Button>
+          )}
+          {typeof saved.data === 'string' && saved.data && (
+            <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={() => persist('')}>
+              Reset
+            </Button>
+          )}
+        </div>
+      </div>
+      <Textarea value={value} onChange={(e) => setDraft(e.target.value)} rows={5} className="text-[11px] leading-relaxed" />
+    </div>
+  )
+}
+
+function ModelFavorites(): React.JSX.Element {
+  const qc = useQueryClient()
+  const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models() })
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {(models.data ?? []).map((m) => (
+        <button
+          key={`${m.providerID}::${m.id}`}
+          onClick={() =>
+            void window.revva.models.toggleFavorite(`${m.providerID}::${m.id}`).then(() => {
+              void qc.invalidateQueries({ queryKey: ['models'] })
+              void qc.invalidateQueries({ queryKey: ['role-config'] })
+            })
+          }
+          className={cn(
+            'flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] transition-colors hover:bg-accent',
+            m.favorite && 'border-amber-500/50 bg-amber-500/10'
+          )}
+        >
+          <Star className={cn('size-3', m.favorite ? 'fill-amber-500 text-amber-500' : 'text-muted-foreground')} />
+          {m.name || m.id}
+          <span className="text-muted-foreground">{m.providerID}</span>
+        </button>
+      ))}
     </div>
   )
 }

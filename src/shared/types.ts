@@ -36,7 +36,9 @@ export const modelInfoSchema = z.object({
   name: z.string().optional(),
   context: z.number().optional(),
   /** Set when the provider's local endpoint (e.g. proxy script) is down — pickers gray out + explain. */
-  gated: z.string().optional()
+  gated: z.string().optional(),
+  /** User favorited it in Setup; pickers pin favorites to the top. */
+  favorite: z.boolean().optional()
 })
 export type ModelInfo = z.infer<typeof modelInfoSchema>
 
@@ -63,7 +65,11 @@ export const settingsKeySchema = z.enum([
   'autoDefault',
   'reviewMaxRounds',
   'jira.connected',
-  'jira.siteUrl'
+  'jira.siteUrl',
+  'model.favorites',
+  'prompt.start',
+  'prompt.tackle',
+  'prompt.review'
 ])
 export type SettingsKey = z.infer<typeof settingsKeySchema>
 
@@ -82,6 +88,8 @@ export const chatSummarySchema = z.object({
   agentID: z.string().optional(),
   providerID: z.string().optional(),
   modelID: z.string().optional(),
+  ticketKey: z.string().optional(),
+  prUrl: z.string().optional(),
   updatedAt: z.number()
 })
 export type ChatSummary = z.infer<typeof chatSummarySchema>
@@ -90,7 +98,10 @@ export const chatCreateInputSchema = z.object({
   directory: z.string().min(1),
   title: z.string().optional(),
   agentID: z.string().optional(),
-  model: modelRefSchema.optional()
+  model: modelRefSchema.optional(),
+  /** Optional context links — stored on the session and mentioned in a kickoff note. */
+  ticketKey: z.string().optional(),
+  prUrl: z.string().optional()
 })
 export type ChatCreateInput = z.infer<typeof chatCreateInputSchema>
 
@@ -152,14 +163,16 @@ export type ReviewRole = z.infer<typeof reviewRoleSchema>
 
 /** Human labels for roles (renderer). */
 export const roleLabels: Record<PipelineRole, string> = {
+  build: 'Build',
   sol: 'Sol-loop',
   testAudit: 'Test audit',
   impeccable: 'UI review',
-  fixer: 'Fixer'
+  fixer: 'Fixer',
+  prReview: 'PR review'
 }
 
-/** Pipeline roles that take an agent/model selection (reviewers + the fixer). */
-export const pipelineRoleSchema = z.enum(['sol', 'testAudit', 'impeccable', 'fixer'])
+/** Pipeline/task roles that take an agent/model selection. */
+export const pipelineRoleSchema = z.enum(['build', 'sol', 'testAudit', 'impeccable', 'fixer', 'prReview'])
 export type PipelineRole = z.infer<typeof pipelineRoleSchema>
 
 export const roleSelSchema = z.object({
@@ -220,6 +233,8 @@ export const startWorkInputSchema = z.object({
   model: modelRefSchema.optional(),
   parentWorkId: z.string().optional(),
   grill: z.boolean().default(false),
+  /** Push + PR automatically once all review gates approve (opt-in per run). */
+  shipOnApprove: z.boolean().default(false),
   /** Per-run reviewer/fixer selections; fall back to role defaults when omitted. */
   reviewSel: z
     .object({
@@ -261,6 +276,41 @@ export const shipResultSchema = z.object({
   alreadyShipped: z.boolean()
 })
 export type ShipResult = z.infer<typeof shipResultSchema>
+
+/* ---------- GitHub (M7) ---------- */
+
+export const pullRequestSchema = z.object({
+  repo: z.string(),
+  number: z.number(),
+  title: z.string(),
+  url: z.string(),
+  state: z.string(),
+  isDraft: z.boolean(),
+  updatedAt: z.number()
+})
+export type PullRequest = z.infer<typeof pullRequestSchema>
+
+export const prDetailSchema = pullRequestSchema.extend({
+  headRefName: z.string(),
+  baseRefName: z.string(),
+  reviewDecision: z.string().optional(),
+  body: z.string().optional()
+})
+export type PrDetail = z.infer<typeof prDetailSchema>
+
+/** One-click task sessions (board "session" button, GitHub "Review"). */
+export const taskSessionInputSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('ticket'), ticketKey: z.string(), repoDir: z.string().optional() }),
+  z.object({ kind: z.literal('prReview'), prUrl: z.string() })
+])
+export type TaskSessionInput = z.infer<typeof taskSessionInputSchema>
+
+export const taskSessionResultSchema = z.object({
+  sessionId: z.string(),
+  title: z.string(),
+  directory: z.string()
+})
+export type TaskSessionResult = z.infer<typeof taskSessionResultSchema>
 
 /* ---------- Inbox (M2) ---------- */
 
@@ -420,6 +470,21 @@ export interface RevvaApi {
     pending(): Promise<JiraComment[]>
     /** Rework session that addresses the alerts, updates the PR, replies on Jira. */
     tackle(workId: string): Promise<void>
+  }
+  github: {
+    /** Open PRs authored by / reviewing for the gh user. */
+    list(scope?: 'mine' | 'review'): Promise<PullRequest[]>
+    /** Spin up a PR-review agent session (worktree checked out in the background). */
+    review(prUrl: string): Promise<TaskSessionResult>
+  }
+  task: {
+    /** Ad-hoc session linked to a ticket (no pipeline), in that ticket's repo or a chosen folder. */
+    ticketSession(input: { ticketKey: string; repoDir?: string }): Promise<TaskSessionResult>
+  }
+  models: {
+    favorites(): Promise<string[]>
+    /** key = `providerID::modelID`; returns the new favorite list. */
+    toggleFavorite(key: string): Promise<string[]>
   }
   inbox: {
     list(): Promise<PendingItem[]>

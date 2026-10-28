@@ -17,8 +17,18 @@ import { workManager } from './pipeline/works'
 import { reviewManager } from './review'
 import { shipManager } from './ship'
 import { scriptManager } from './scripts'
-import { getDb, settingGet, settingSet, roleConfigList, roleConfigSet } from './db'
-import { startWorkInputSchema, inboxAnswerSchema, permissionDecisionSchema, scriptInputSchema, roleConfigSchema } from '@shared/types'
+import { githubManager } from './github'
+import { startTicketSession } from './tasks'
+import { parsePrRef } from '@shared/pr-ref'
+import { getDb, settingGet, settingSet, roleConfigList, roleConfigSet, favoriteModels, toggleFavoriteModel } from './db'
+import {
+  startWorkInputSchema,
+  inboxAnswerSchema,
+  permissionDecisionSchema,
+  scriptInputSchema,
+  roleConfigSchema,
+  taskSessionInputSchema
+} from '@shared/types'
 
 export function registerIpc(): void {
   /* ---------- service ---------- */
@@ -141,6 +151,23 @@ export function registerIpc(): void {
   /* ---------- comment watcher (M6) ---------- */
   ipcMain.handle(IPC.commentsPending, () => commentWatcher.pending())
   ipcMain.handle(IPC.commentsTackle, (_e, workId: string) => commentWatcher.tackleComments(String(workId)))
+
+  /* ---------- github + task sessions + favorites ---------- */
+  ipcMain.handle(IPC.githubList, (_e, scope?: unknown) =>
+    githubManager.list(scope === 'review' ? 'review' : 'mine')
+  )
+  ipcMain.handle(IPC.githubReview, (_e, ref: string) => {
+    const parsed = parsePrRef(String(ref))
+    if (!parsed?.url) throw new Error('Pass a full PR URL or owner/repo#123 (bare numbers are ambiguous across projects).')
+    return githubManager.startReview(parsed.url)
+  })
+  ipcMain.handle(IPC.taskTicketSession, (_e, input: unknown) => {
+    const parsed = taskSessionInputSchema.parse({ ...((input ?? {}) as object), kind: 'ticket' })
+    if (parsed.kind !== 'ticket') throw new Error('invalid input')
+    return startTicketSession(parsed.ticketKey, parsed.repoDir)
+  })
+  ipcMain.handle(IPC.modelsFavorites, () => favoriteModels())
+  ipcMain.handle(IPC.modelsFavoriteToggle, (_e, key: string) => toggleFavoriteModel(String(key)))
 
   /* ---------- scripts (one-click shell, incl. Morning) ---------- */
   ipcMain.handle(IPC.scriptList, () => scriptManager.list())

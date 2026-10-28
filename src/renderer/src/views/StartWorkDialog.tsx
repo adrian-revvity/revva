@@ -47,10 +47,11 @@ export function StartWorkDialog({
   const [repoDir, setRepoDir] = useState<string>('')
   const [auto, setAuto] = useState(false)
   const [grill, setGrill] = useState(false)
+  const [shipOnApprove, setShipOnApprove] = useState(false)
   const [agentID, setAgentID] = useState('__default__')
   const [modelKey, setModelKey] = useState('__default__')
   const [showReviewOverrides, setShowReviewOverrides] = useState(false)
-  const [reviewSel, setReviewSel] = useState<Record<PipelineRole, { agentID: string; modelKey: string }>>({
+  const [reviewSel, setReviewSel] = useState<Record<'sol' | 'testAudit' | 'impeccable' | 'fixer', { agentID: string; modelKey: string }>>({
     sol: { agentID: DEFAULT, modelKey: DEFAULT },
     testAudit: { agentID: DEFAULT, modelKey: DEFAULT },
     impeccable: { agentID: DEFAULT, modelKey: DEFAULT },
@@ -75,6 +76,7 @@ export function StartWorkDialog({
         model: modelKey === '__default__' ? undefined : parseModelKey(modelKey),
         parentWorkId: parentWorkId === '__none__' ? undefined : parentWorkId,
         grill,
+        shipOnApprove,
         reviewSel: {
           sol: selOrUndefined(reviewSel.sol.agentID, reviewSel.sol.modelKey),
           testAudit: selOrUndefined(reviewSel.testAudit.agentID, reviewSel.testAudit.modelKey),
@@ -210,6 +212,17 @@ export function StartWorkDialog({
                 </p>
               </div>
               <Checkbox checked={grill} onCheckedChange={(c) => setGrill(c === true)} />
+            </label>
+            <label className="flex cursor-pointer items-center justify-between">
+              <div>
+                <Label className="flex items-center gap-1.5">
+                  <Rocket className="size-3.5" /> Push when changes are done
+                </Label>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  After all review gates approve, push and update the linked PR — or open one if there isn't. Off = you ship manually from the cockpit.
+                </p>
+              </div>
+              <Checkbox checked={shipOnApprove} onCheckedChange={(c) => setShipOnApprove(c === true)} />
             </label>
           </div>
 
