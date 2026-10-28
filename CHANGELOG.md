@@ -7,6 +7,10 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 ## [Unreleased]
 
+- (nothing yet)
+
+## [0.2.0] - 2026-10-28
+
 - **Windows builds** — every release now also ships a Windows x64 NSIS installer + ZIP, built on a `windows-latest` CI runner alongside the macOS DMG/ZIP. Jira OAuth (Windows Credential store), chats, pipelines and GitHub work there; the Scripts tab runs PowerShell instead of zsh, and `opencode`/`git`/`gh` must be on `PATH`. Builds are unsigned (SmartScreen: More info → Run anyway).
 
 ## [0.1.0] - 2026-10-28
