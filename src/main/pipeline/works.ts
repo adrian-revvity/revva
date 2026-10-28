@@ -283,12 +283,18 @@ class WorkManager {
 }
 
 async function defaultBranch(repoDir: string): Promise<string> {
-  try {
-    const { stdout } = await exec('git', ['-C', repoDir, 'rev-parse', '--abbrev-ref', 'origin/HEAD'])
-    return stdout.trim().replace('origin/', '') || 'main'
-  } catch {
-    return 'main'
+  const candidates = ['origin/HEAD', 'origin/main', 'origin/master', 'main', 'master']
+  for (const ref of candidates) {
+    try {
+      await exec('git', ['-C', repoDir, 'rev-parse', '--verify', '--quiet', ref])
+      return ref.replace('origin/', '')
+    } catch {
+      /* try next */
+    }
   }
+  throw new Error(
+    `No usable base branch in ${repoDir} (no main/master, no commits?). Commit something or pick another repository.`
+  )
 }
 
 function extractDescription(raw: unknown): string {
