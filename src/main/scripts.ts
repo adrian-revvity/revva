@@ -1,8 +1,9 @@
 /**
  * User scripts: one-click shell commands (aliases included) from the sidebar.
  * Definitions and run history live in Revva's sqlite DB. Commands run through
- * zsh so anything the user has configured (aliases, functions via sourced rc)
- * works — Revva ships no knowledge of what the scripts do.
+ * the platform's shell — zsh on unix (so aliases/functions from rc files work),
+ * PowerShell on Windows (profile aliases unavailable; plain commands are) —
+ * Revva ships no knowledge of what the scripts do.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { connect as netConnect } from 'node:net'
@@ -88,13 +89,17 @@ class ScriptManager {
     const def = this.list().find((s) => s.id === id)
     if (!def) throw new Error('Script not found.')
 
-    const args = def.interactive ? ['-ic', def.command] : ['-c', def.command]
-    const proc = spawn('/bin/zsh', args, {
+    const isWin = process.platform === 'win32'
+    const [shell, args] = isWin
+      ? ['powershell.exe', def.interactive ? ['-Command', def.command] : ['-NoProfile', '-Command', def.command]]
+      : ['/bin/zsh', def.interactive ? ['-ic', def.command] : ['-c', def.command]]
+    const proc = spawn(shell, args, {
       cwd: def.cwd || undefined,
       env: { ...process.env },
       stdio: ['ignore', 'pipe', 'pipe'],
       // Own process group so kill() takes down children (e.g. a proxy).
-      detached: true
+      // On Windows the tree is killed via taskkill /T instead.
+      detached: !isWin
     })
 
     const runId = getDb()
@@ -123,9 +128,16 @@ class ScriptManager {
   kill(id: string): void {
     const st = this.running.get(id)
     if (!st) return
+    const pid = st.proc.pid
+    if (pid === undefined) return
+    if (process.platform === 'win32') {
+      // No process groups; kill the whole child tree the shell spawned.
+      spawn('taskkill', ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore' })
+      return
+    }
     // zsh -ic spawns children; kill the group.
     try {
-      process.kill(-st.proc.pid!, 'SIGTERM')
+      process.kill(-pid, 'SIGTERM')
     } catch {
       st.proc.kill('SIGTERM')
     }

@@ -482,7 +482,7 @@ function JiraSection(): React.JSX.Element {
       )}
       {error && <p className="text-xs text-destructive">{error}</p>}
       <p className="text-xs text-muted-foreground">
-        Revva registers its own OAuth client and stores tokens in the macOS Keychain (encrypted), never reading other apps' credential caches.
+        Revva registers its own OAuth client and stores tokens in the OS keychain (macOS Keychain / Windows Credential API, encrypted), never reading other apps' credential caches.
       </p>
     </div>
   )

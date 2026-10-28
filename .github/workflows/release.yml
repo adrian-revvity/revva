@@ -9,8 +9,16 @@ permissions:
   contents: write
 
 jobs:
-  build-mac:
-    runs-on: macos-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            dist: dist:mac
+          - os: windows-latest
+            dist: dist:win
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,13 +33,37 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      # typecheck gate, then package dmg + zip into release/
-      - run: pnpm typecheck && pnpm dist
+      # typecheck gate, then package installer + zip into release/
+      - run: pnpm typecheck && pnpm ${{ matrix.dist }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: release/*
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: release
+          merge-multiple: true
 
       - name: Release notes from CHANGELOG
         id: notes
         run: |
-          VER="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VER=$(node -p "require('./package.json').version")
+            TAG="v$VER"
+          else
+            TAG="$GITHUB_REF_NAME"
+            VER="${TAG#v}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           # Print the section between "## [<version>]" and the next "## [" heading.
           NOTES=$(awk -v tag="$VER" '
             $0 ~ "^## \\[" tag "\\]" { in_sec=1; next }
@@ -43,9 +75,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.notes.outputs.tag }}
           generate_release_notes: true
           body: ${{ steps.notes.outputs.notes }}
-          files: |
-            release/*.dmg
-            release/*.zip
-            release/*.yml
+          files: release/*

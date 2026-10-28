@@ -75,11 +75,19 @@ pnpm release:patch   # or release:minor / release:major
 
 This bumps the version, seals the `[Unreleased]` changelog section under the new
 version, commits, tags `vX.Y.Z`, and pushes. The tag triggers
-`.github/workflows/release.yml`, which builds the macOS DMG + ZIP on GitHub
-and publishes them on the [Releases page](https://github.com/adrian-revvity/revva/releases)
+`.github/workflows/release.yml`, which builds the macOS DMG + ZIP (arm64) and
+the Windows NSIS installer + ZIP (x64) on GitHub runners and publishes them on
+the [Releases page](https://github.com/adrian-revvity/revva/releases)
 with the matching changelog section as release notes. Builds are unsigned for
 now (Developer ID signing can be added later with `CSC_LINK` secrets) — the
-first launch may need right-click → Open.
+first launch may need right-click → Open on macOS, and Windows SmartScreen
+offers "More info → Run anyway".
+
+Windows caveats: Jira OAuth, chats, pipelines and the GitHub tab all work
+(tokens land in the Windows Credential store via `safeStorage`). The **Scripts
+tab runs PowerShell instead of zsh** — shell aliases from your zsh config are
+unix-side only, so define the command as a plain PowerShell command on Windows.
+`opencode`, `git` and `gh` must be on `PATH`.
 
 In-app: **Setup → v0.x.x → Changelog** shows the bundled changelog and links to
 downloads.

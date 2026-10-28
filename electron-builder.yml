@@ -17,4 +17,14 @@ mac:
       arch: [arm64]
     - target: zip
       arch: [arm64]
+win:
+  # icon.ico is generated from build/icon.png (1024px) by electron-builder.
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: zip
+      arch: [x64]
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
 artifactName: ${name}-${version}-${arch}.${ext}
