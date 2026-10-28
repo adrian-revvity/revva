@@ -58,6 +58,14 @@ const FEATURES: Array<{ title: string; body: string }> = [
   {
     title: 'Comment watcher',
     body: 'Polls Jira for new comments on shipped tickets; \u201cTackle comments\u201d runs a rework agent, pushes fixes to the PR, and replies on Jira.'
+  },
+  {
+    title: 'GitHub tab',
+    body: 'Your open PRs across all projects (via gh CLI), Mine / Needs review; \u201cReview\u201d checks out the PR head and starts a review agent session.'
+  },
+  {
+    title: 'Prompt tuning + favorites',
+    body: 'Setup holds per-role agent/model defaults, editable prompts for every one-click button, and favorite models pinned to the top of pickers.'
   }
 ]
 

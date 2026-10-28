@@ -33,6 +33,8 @@ Jira sprint board ──▶ pick tickets ──▶ worktree + branch per ticket
 10. **Ship** — pre-flight checks (gh present/auth, GitHub remote, clean tree, commits ahead), `git push` (never force), `gh pr create` with a review-gate summary, opens the PR in your browser, then transitions Jira to a review-ish status and post a summary comment. revva never merges. Pushing/shipping is **opt-in per run** ("Push when changes are done"): when approved with a PR already linked, revva pushes to that PR; otherwise it opens one. In an ad-hoc session you can also just tell the agent "push when the changes are done".
 11. **AUTO mode** — opt-in per run: the agent picks recommended/safe options, minimizes routine questions, and after all review gates pass revva pushes + opens the PR by itself. Genuine blockers park the work in WAITING_HUMAN with the reason; gates are never skipped and decisions are logged to an audit ledger.
 12. **Comment watcher** — polls Jira for new comments on shipped tickets (excluding revva's own); a **"Tackle comments"** button runs a rework agent on the branch, pushes the fixes onto the open PR, and posts the agent's reply back to Jira.
+13. **GitHub tab** — your open PRs (authored / review-requested) across all your projects via the `gh` CLI; a **Review** button checks out the PR head into a worktree and starts a review agent session with a tunable prompt.
+14. **Prompt tuning + favorites** — Setup holds per-role agent/model defaults (build, reviewers, fixer, PR review), editable prompt templates for every one-click button, and starred favorite models that pin to the top of every picker.
 
 The same list is available in-app: **Setup → Features**.
 
