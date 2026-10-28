@@ -31,15 +31,15 @@ export type JiraCapability =
   | 'getTransitions'
   | 'user'
 
-type ToolDef = { name: string; description?: string }
+type ToolDef = { name: string; description?: string; inputSchema?: Record<string, unknown> }
 
 /** Preferred tool-name patterns per capability, matched against the live inventory. */
 const CAPABILITY_PATTERNS: Record<JiraCapability, RegExp[]> = {
-  search: [/^search$/, /\bsearch\b.*\b(jira|issue)/i, /jql/i],
-  getIssue: [/^getIssue$/, /get.*\bissue\b(?!s)/i],
-  addComment: [/^addComment$/, /add.*comment/i],
-  transition: [/^transitionIssue$/, /do.*transition|set.*transition/i],
-  getTransitions: [/^getTransitions$/, /get.*transitions/i],
+  search: [/searchJiraIssuesUsingJql/i, /search.*\bjql\b/i],
+  getIssue: [/^getJiraIssue$/, /get.*issue(?!s)/i],
+  addComment: [/addCommentToJiraIssue/, /add.*comment/i],
+  transition: [/transitionJiraIssue/, /^transitionIssue$/],
+  getTransitions: [/getTransitionsForJiraIssue/, /get.*transitions/i],
   user: [/^getAccessibleAtlassianResources$/, /^atlassianUserInfo$/, /user.*info/i]
 }
 
@@ -47,6 +47,7 @@ export class JiraMcp {
   private client: Client | undefined
   private tools: ToolDef[] = []
   private capMap = new Map<JiraCapability, string>()
+  private cloudId: string | undefined
 
   get connected(): boolean {
     return !!this.client
@@ -61,14 +62,28 @@ export class JiraMcp {
     await client.connect(transport)
     const listed = await client.listTools()
     this.client = client
-    this.tools = listed.tools.map((t) => ({ name: t.name, description: t.description }))
+    this.tools = listed.tools.map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema as Record<string, unknown> | undefined
+    }))
     this.capMap = buildCapabilityMap(this.tools)
+    // Dev aid: dump the live contract so argument names can be verified, not guessed.
+    try {
+      const { app } = await import('electron')
+      const { writeFileSync } = await import('node:fs')
+      const { join } = await import('node:path')
+      writeFileSync(join(app.getPath('userData'), 'jira-tools.json'), JSON.stringify(this.tools, null, 2))
+    } catch {
+      /* ignore */
+    }
   }
 
   async disconnect(): Promise<void> {
     await this.client?.close().catch(() => undefined)
     this.client = undefined
     this.capMap.clear()
+    this.cloudId = undefined
   }
 
   /** Re-auth + reconnect (token rotated or stream died). */
@@ -77,13 +92,27 @@ export class JiraMcp {
     await this.connect()
   }
 
-  private tool(cap: JiraCapability | 'getTransitions'): string {
-    const name = this.capMap.get(cap as JiraCapability)
+  private tool(cap: JiraCapability): string {
+    const name = this.capMap.get(cap)
     if (!name) throw new Error(`Your Atlassian site does not expose the "${cap}" capability via MCP.`)
     return name
   }
 
-  private async call<T>(cap: JiraCapability | 'getTransitions', args: Record<string, unknown>): Promise<T> {
+  /** Every Jira MCP tool requires cloudId; resolve once from accessible resources. */
+  private async resolveCloudId(): Promise<string> {
+    if (this.cloudId) return this.cloudId
+    const res = await this.call<unknown>('user', {})
+    const list = Array.isArray(res)
+      ? res
+      : ((res as { data?: unknown[] })?.data ?? (Array.isArray((res as { resources?: unknown[] })?.resources) ? (res as { resources: unknown[] }).resources : []))
+    const first = list[0] as { id?: string; url?: string } | undefined
+    const id = first?.id ?? (first?.url ? new URL(first.url).host : undefined)
+    if (!id) throw new Error('No accessible Atlassian site for this account.')
+    this.cloudId = id
+    return id
+  }
+
+  private async call<T>(cap: JiraCapability, args: Record<string, unknown>): Promise<T> {
     if (!this.client) throw new Error('Jira not connected.')
     try {
       const res = await this.client.callTool({ name: this.tool(cap), arguments: args })
@@ -102,24 +131,34 @@ export class JiraMcp {
 
   /** JQL search returning raw-ish issue records (mapped later by board.ts). */
   async search(jql: string, fields?: string[]): Promise<unknown> {
-    return this.call('search', { jql, maxResults: 50, fields })
+    const cloudId = await this.resolveCloudId()
+    return this.call('search', {
+      cloudId,
+      jql,
+      maxResults: 50,
+      ...(fields ? { fields } : {}),
+      responseContentFormat: 'markdown'
+    })
   }
 
   async getIssue(key: string): Promise<unknown> {
-    return this.call('getIssue', { issueIdOrKey: key })
+    const cloudId = await this.resolveCloudId()
+    return this.call('getIssue', { cloudId, issueIdOrKey: key, responseContentFormat: 'markdown' })
   }
 
   async addComment(key: string, body: string): Promise<unknown> {
-    // text: a minimal ADF doc (paragraph with one text run) — accepted as markdown-ish too.
-    return this.call('addComment', { issueIdOrKey: key, text: body })
+    const cloudId = await this.resolveCloudId()
+    return this.call('addComment', { cloudId, issueIdOrKey: key, commentBody: body, contentFormat: 'markdown' })
   }
 
   async listTransitions(key: string): Promise<unknown> {
-    return this.call('getTransitions', { issueIdOrKey: key })
+    const cloudId = await this.resolveCloudId()
+    return this.call('getTransitions', { cloudId, issueIdOrKey: key })
   }
 
   async transitionIssue(key: string, transitionId: string): Promise<unknown> {
-    return this.call('transition', { issueIdOrKey: key, transitionId })
+    const cloudId = await this.resolveCloudId()
+    return this.call('transition', { cloudId, issueIdOrKey: key, transition: { id: transitionId } })
   }
 
   inventory(): ToolDef[] {
@@ -128,7 +167,7 @@ export class JiraMcp {
 
   capabilities(): Record<string, string | undefined> {
     const out: Record<string, string | undefined> = {}
-    for (const cap of [...Object.keys(CAPABILITY_PATTERNS), 'getTransitions'] as JiraCapability[]) {
+    for (const cap of Object.keys(CAPABILITY_PATTERNS) as JiraCapability[]) {
       out[cap] = this.capMap.get(cap)
     }
     return out
