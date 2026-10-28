@@ -66,6 +66,7 @@ export const settingsKeySchema = z.enum([
   'reviewMaxRounds',
   'jira.connected',
   'jira.siteUrl',
+  'jira.commentPollSecs',
   'model.favorites',
   'prompt.start',
   'prompt.tackle',
