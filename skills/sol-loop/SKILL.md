@@ -5,32 +5,36 @@ description: Use when the user says "sol loop" — multi-round Sol code review b
 
 # sol-loop (revva / OpenCode adaptation)
 
-This is a workflow for making your code changes more correct before filing a
-pull request. tl;dr — use a strong reviewer model (Sol on Bedrock, or the
-fallback the user acknowledged) to review your code in a loop.
+This is a workflow for making code changes more correct before filing a pull
+request. In Revva, the user chooses which configured OpenCode agent/model runs
+the reviewer role. The skill describes the review protocol; it does not mandate
+a provider or model ID.
 
 Make the most minimal possible changes to appease the reviewer. Be careful of
 scope creep and don't be scared to push back.
 
 ## revva integration notes (read first)
 
-- In revva, the **reviewer is a separate OpenCode session** (model:
-  `amazon-bedrock/openai.gpt-6.1-sol` unless the user named another; Bedrock
-  readiness required, else an explicitly user-acknowledged fallback — never a
-  silent substitution). The reviewer session is read-only: its permission
+- In revva, the **reviewer is a separate OpenCode subagent session** using the
+  Sol-loop review role's configured default or per-run-selected agent/model.
+  Any agent/model available in the user's OpenCode setup is eligible, including
+  GPU Qwen or GPT-6 Sol. The reviewer session is read-only: its permission
   ruleset denies edit/write/bash-write.
 - The **fixer is the build session** (or a dedicated fixer session on the
   build model). revva passes findings between them; each round is a fresh
   reviewer prompt carrying the ledger — reviewer sessions get no history.
+- Each review round has exactly one Sol-loop reviewer. Other applicable gates
+  (test audit and UI audit) are separate subagents launched concurrently; none
+  may edit or start further reviewers.
 - Where the upstream skill says `orchestrator_capabilities` /
   `delegate_task` / T3 tools, substitute: revva creates the reviewer session
   via the OpenCode API and reports the verdict as the strict reply block
   below. Where it says "native Sol subagent", revva uses the reviewer session
   and keeps its session id as the round's saved id for follow-ups.
-- "Outside T3, use a native Sol subagent… If no route runs Sol, report the
-  blocker. Do not substitute a model." — in revva this is the pipeline rule:
-  no Bedrock readiness ⇒ WAITING_HUMAN with a Morning-not-ready blocker,
-  unless the user has ticked the acknowledged-fallback checkbox for this work.
+- The upstream requirement to use Sol applies only when the user selected a
+  Sol-specific model. If that selected model is unavailable, report the
+  blocker and ask the user to choose another configured model; never silently
+  substitute.
 
 ## Budget
 

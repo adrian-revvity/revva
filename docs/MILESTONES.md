@@ -2,49 +2,65 @@
 
 Each milestone ships something you can use daily. Order assumes evenings/weekends; estimates are rough focused-work hours.
 
-## M0 — Scaffold + service attach (≈0.5d)
+## M0 — Scaffold, first-run setup + service attach (≈1d)
 - electron-vite + React + TS + Tailwind scaffold in `revva/`; strict TS, pnpm.
-- `src/main/opencode`: `Service.ensure()`, typed IPC `revva:service:status`, reconnect logic.
+- Initialize shadcn/ui for Vite, commit `components.json` and theme tokens; use the project-local shadcn skill/MCP and reuse-first policy from `docs/FRONTEND.md`.
+- First-run setup: discover OpenCode, choose workspace/worktree folders, detect optional tools; no user-specific path/provider/token assumptions.
+- `src/main/opencode`: `Service.ensure()`, typed IPC `revva:service:status`, reconnect logic, dynamic models/agents/skills.
 - Status bar shows opencode version/url (today: `v2.0.30 @ 127.0.0.1:49374`).
-- **Exit test:** `pnpm dev` opens a window that shows the live service and lists sessions/models/agents/skills.
+- **Exit test:** clean user profile can connect without importing developer config and sees that profile's live service/models/agents/skills.
+
+## M0.5 — General chat (≈0.5d)
+- Global New Chat action; choose authorized workspace directory plus configured agent/model; create an ordinary OpenCode session.
+- Chat list/history, streaming transcript, follow-up, interrupt, forms, and permission handling; no Jira connection required.
+- **Exit test:** start, close, and reopen a non-ticket chat; resume the same OpenCode session after restarting Revva.
 
 ## M1 — Board + start work + watch (≈1.5d)
-- Settings: workspaces (`~/workspace` subfolders), worktrees root (`~/workspace-worktrees` per your global permission allowlist), Jira user/site check.
-- Atlassian MCP client (token load/refresh, session init, tools map) + JQL board fetch with 5-min/focus refresh.
-- Start work: pick repo, model preset, optional grill toggle, dep parent branch → opencode `POST /api/worktree` + `session.create` + build prompt.
+- Settings: user-selected workspace/worktree roots, Atlassian OAuth onboarding (and documented REST-token fallback), and per-role agent/model defaults.
+- Atlassian MCP client (Revva-owned auth, session init, tools map) + JQL board fetch with 5-min/focus refresh.
+- Start work: pick repo, implementation agent/model (default or per-run), reviewer role overrides, optional grill toggle, dep parent branch → opencode `POST /api/worktree` + `session.create` + build prompt.
+- Start Work exposes Interactive/AUTO selection; persist mode visibly on the ticket run (AUTO execution policy and delivery completed in M5).
 - Cockpit v1: SSE transcript (text + tool calls + costs), interrupt, chat box, stop.
 - sqlite schema v1 (settings/workspace/ticket/work/phase).
-- **Exit test:** pick a real CLN ticket → agent codes in a fresh worktree → you watch it live.
+- **Exit test:** pick a ticket from the connected user's Jira → agent codes in a fresh worktree → watch it live.
 
 ## M2 — Question inbox (≈0.5d)
 - `GET /api/form` + `/api/permission/request` per active location, SSE-pushed; global Inbox; inline in Cockpit; answered-audit table.
 - **Exit test:** agent asks a question → red badge → answer from Inbox → agent continues.
 
-## M3 — Morning button (≈0.5d)
-- Terminal.app spawn, readiness prober, titlebar chip, Bedrock preset gating (model dropdown filters on readiness).
-- **Exit test:** click Morning → SSO in Terminal → chip goes green → "gpt-6.1-sol" preset selectable for a session.
+## M3 — Built-in Morning / AWS readiness (≈1d)
+- AWS profile/SSO start URL/region/Bedrock region settings; feature-detect AWS CLI v2; invoke `aws sso login` as a managed process with in-app progress/browser handoff, no shell function or custom Python script.
+- Bundle/manage a loopback-only SigV4 proxy if the selected provider requires it; configurable port; lifecycle/readiness/expiry/error handling.
+- Dynamic model readiness gating; no hardcoded Sol/Qwen IDs or developer account defaults.
+- **Exit test:** configure a test user's SSO profile and complete Morning from Revva; no `morning` function, `useaws.py`, or Terminal.app flow is required; a non-AWS model works with AWS unconfigured.
 
 ## M4 — Review pipeline (≈2d) ⭐ the meat
 - Phase runner framework (idle detection via `session.idle` + `/wait`, verdict parsing, ledger persistence, resume).
-- sol-loop: vendor skill from tstack with opencode adaptation (§6 ARCHITECTURE); reviewer (Sol, deny-edit) + fixer pair; ≤3 rounds; stop conditions; WAITING_HUMAN escalation card in Cockpit.
-- test-audit reviewer via skill API; findings → fixer; ≤2 rounds.
-- impeccable conditional run (UI-file diff heuristic + label `ui`); warn/block policy.
-- Sequential Bedrock-reviewer queue.
-- **Exit test:** finish a build → watch rounds appear as cards with verdicts/ledger → APPROVE unlocks Ship.
+- Parallel review fan-out of read-only subagent sessions: one Sol-loop reviewer, test-audit, and impeccable when UI is detected; no reviewer edits or starts other reviewers.
+- Per-role agent/model defaults plus per-run overrides for every reviewer and fixer; any agent/model exposed by the user's OpenCode service is eligible.
+- AUTO decision policy: explicit recommendation/safe-choice handling, assumptions log, concise blocker escalation, and a separately configured least-privilege permission profile. No routine progress pings.
+- Fan-in ledger, consolidated findings, one fixer session, then bounded parallel re-review; incomplete/error reviewers block approval and are visible.
+- Sol-loop ≤3 rounds by default, up to 5 only under its stated conditions; each round has one Sol-loop reviewer.
+- Provider-aware concurrency limits may queue a whole reviewer batch when necessary, but may not silently serialize gates or mark queued gates approved.
+- **Exit test:** finish a build → observe applicable reviewer subagents start concurrently, findings consolidate, fixer runs, and parallel re-review gates Ship. Verify one run uses GPU Qwen for review and another uses GPT-6 Sol (when configured), with no code change; also verify an arbitrary configured model can be selected.
 
 ## M5 — Ship + Jira sync (≈0.5d)
 - Commit-tree check, push, `gh pr create` (open browser), `gh stack submit` path for dep chains, Jira transition + summary comment, stack base wiring.
+- In AUTO mode, push/create/open PR automatically after all review gates and repository checks pass; Interactive mode retains an explicit Ship action. Neither mode merges; never force-push.
+- AUTO activity log records choices, assumptions, permission decisions, outcomes, and blockers; notify only for blocker or completion.
 - **Exit test:** two dependent tickets → stacked PRs (child base = parent branch) → both tickets transition with links.
+- **AUTO exit test:** a clear ticket completes from Start Work to PR without routine user prompts; a high-impact ambiguous question, missing auth, or unsafe permission pauses for the user; no PR is merged.
 
 ## M6 — Comment watcher + rework (≈1d)
 - Poller (watermarks), unresolved-comment detection (exclude agent's own), alert badge + Inbox section, "Tackle comments" rework session, revva-side Jira reply/resolve from agent's structured response block, auto-return to REVIEW.
 - **Exit test:** add a Jira comment on a shipped ticket → badge → tackle → PR updated + thread resolved.
 
-## M7 — Polish (ongoing)
+## M7 — Portability and polish (ongoing)
 - Multi-work concurrency dashboard, cost totals, per-repo check commands, plan-edit before BUILD, reduced-motion/a11y pass, launch-at-login, auto-update (electron-builder + notarization skipped while personal).
+- Validate clean-profile installation, OS-specific paths/credential storage adapters, optional integrations, and setup docs; macOS is v1 target, avoid architectural AppleScript/zsh dependencies.
 
 ## Open decisions (resolve when each milestone starts)
-1. **Atlassian MCP reliability** (M1): if the Node MCP client trips Cloudflare 1010, flip to REST v3 + Keychain PAT behind the same interface (plan B is a config flag, not a rewrite).
+1. **Atlassian MCP reliability** (M1): if the Node MCP client trips Cloudflare 1010, use REST v3 + OS-secured API token behind the same interface (plan B is a config flag, not a rewrite).
 2. **grill-me session lifecycle** (M4 if grill feels clunky): keep grill as its own session (current plan) vs. same session as build with the command — same-session loses the clean "locked plan" artifact; current plan preferred.
-3. **sol-loop model substitution wording** (M4): skill says "do not substitute a model" — revva surfaces an explicit, user-acknowledged fallback chip rather than silently using Qwen as reviewer.
+3. **Review role defaults** (M4): ship sensible empty/default role settings based on the user's available inventory; never hardcode Sol/Qwen. Any role can be overridden per run.
 4. **Rework Jira writes by agent vs. revva** (M6): current plan = revva writes (agents get no Jira credentials); revisit if comment replies lose the agent's nuance.
