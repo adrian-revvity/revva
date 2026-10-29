@@ -54,7 +54,7 @@ class ThroughputMeter {
   }
 
   /** Called before prompt submission so preparation and request latency count too. */
-  async measurePrompt(sessionId: string, sentAt: unknown, submit: () => Promise<void>): Promise<void> {
+  async measurePrompt<T>(sessionId: string, sentAt: unknown, submit: () => Promise<T>): Promise<T> {
     // A queued/steered follow-up must not reset an interaction still in flight.
     const current = this.sessions.get(sessionId)
     const now = Date.now()
@@ -63,7 +63,13 @@ class ThroughputMeter {
       : now
     const state = current ?? this.begin(sessionId, startedAt, true)
     try {
-      await submit()
+      const result = await submit()
+      if (result === 'queued' && !current && this.sessions.get(sessionId) === state && state.awaitingExecution) {
+        state.running = false
+        this.push(sessionId, state, Date.now())
+        this.sessions.delete(sessionId)
+      }
+      return result
     } catch (error) {
       if (!current && this.sessions.get(sessionId) === state && state.awaitingExecution) {
         this.settleGap(state, Date.now())

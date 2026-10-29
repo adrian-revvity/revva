@@ -90,11 +90,11 @@ export default function App(): React.JSX.Element {
     queryFn: () => window.revva.session.active(),
     enabled: status.data?.state === 'connected',
   })
-  // Warm the New chat dialog's inventory while it is still closed: opening the
-  // dialog then reads cache instead of blocking on a cold service round-trip.
+  // Local workspace metadata is cheap; network picker inventory belongs to an
+  // open dialog, not every background/read-only conversation surface.
   useQuery({ queryKey: ['workspaces'], queryFn: () => window.revva.workspace.list(), staleTime: 5 * 60_000 })
-  useQuery({ queryKey: ['agents'], queryFn: () => window.revva.inventory.agents(), staleTime: 60_000, enabled: status.data?.state === 'connected' })
-  useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models(), staleTime: 60_000, enabled: status.data?.state === 'connected' })
+  useQuery({ queryKey: ['agents'], queryFn: () => window.revva.inventory.agents(), staleTime: 60_000, enabled: newChatOpen && status.data?.state === 'connected' })
+  useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models(), staleTime: 60_000, enabled: newChatOpen && status.data?.state === 'connected' })
   const pending = useInbox()
   const ghAlerts = useGithubAlerts()
   const worktreeCount = worktrees.data?.length
@@ -560,7 +560,11 @@ export default function App(): React.JSX.Element {
         ) : view.kind === 'github' ? (
           <GitHubView onOpenChat={(sessionId) => setView({ kind: 'chat', sessionId })} />
         ) : view.kind === 'jira' ? (
-          <BoardView works={works.data ?? []} onStart={(workId) => setView({ kind: 'work', workId })} />
+          <BoardView
+            works={works.data ?? []}
+            onStart={(workId) => setView({ kind: 'work', workId })}
+            onOpenChat={(sessionId) => setView({ kind: 'chat', sessionId })}
+          />
         ) : view.kind === 'work' ? (
           activeWork ? (
             <WorkCockpit key={activeWork.sessionId ?? activeWork.id} work={activeWork} onOpenChat={(sessionId) => setView({ kind: 'chat', sessionId })} />

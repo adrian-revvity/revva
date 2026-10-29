@@ -65,12 +65,15 @@ type PrSeen = {
   threads?: number
 }
 const SEEN_KEY = 'githubPrSeen'
-const POLL_INTERVAL_MS = 5 * 60_000
+const POLL_INTERVAL_MS = 60_000
+const DESKTOP_NOTIFICATION_INTERVAL_MS = 5 * 60_000
 
 class GitHubManager {
   private login: string | undefined
   /** url → latest enrichment info, so markSeen does not refetch. */
   private lastInfo = new Map<string, PrSeen>()
+  private lastMine: PullRequest[] | undefined
+  private refreshes = new Map<'mine' | 'review', Promise<PullRequest[]>>()
 
   /** Feature-detect for the UI (tab shows a hint instead of errors when gh is missing). */
   async available(): Promise<boolean> {
@@ -85,20 +88,26 @@ class GitHubManager {
   }
 
   /**
-   * Background freshness: refresh both scopes every few minutes, push the alert
-   * set to the renderer, and raise an OS notification only for newly raised
-   * alerts (never repeats while a bell is still unacknowledged).
+   * Background freshness for authored PRs, independent of the selected screen.
+   * Every successful Mine refresh publishes alerts, including UI refreshes.
    */
   private pollTimer: NodeJS.Timeout | undefined
   private notifiedKeys = new Set<string>()
+  private polling = false
+  private lastDesktopPoll = 0
 
   startPolling(): void {
     if (this.pollTimer) return
     const tick = async (): Promise<void> => {
+      if (this.polling) return
+      this.polling = true
       try {
         if (!(await this.available())) return
         const alerts = await this.alerts()
-        this.pushAlerts(alerts)
+        // Sidebar freshness is independent of the existing desktop cadence.
+        const now = Date.now()
+        if (now - this.lastDesktopPoll < DESKTOP_NOTIFICATION_INTERVAL_MS) return
+        this.lastDesktopPoll = now
         const fresh = alerts.filter((a) => a.kinds.some((k) => !this.notifiedKeys.has(`${a.url}#${k}`)))
         for (const a of fresh) a.kinds.forEach((k) => this.notifiedKeys.add(`${a.url}#${k}`))
         const keys = new Set(alerts.flatMap((a) => a.kinds.map((k) => `${a.url}#${k}`)))
@@ -106,10 +115,7 @@ class GitHubManager {
         if (fresh.length > 0 && Notification.isSupported()) {
           const n = new Notification({
             title: fresh.length === 1 ? 'PR update' : `${fresh.length} PR updates`,
-            body: fresh
-              .slice(0, 3)
-              .map((a) => `${a.repo}#${a.number}: ${a.kinds.join(', ')}`)
-              .join('\n'),
+            body: fresh.slice(0, 3).map((a) => `${a.repo}#${a.number}: ${a.kinds.join(', ')}`).join('\n'),
             silent: false
           })
           n.on('click', () => {
@@ -123,6 +129,8 @@ class GitHubManager {
         }
       } catch (err) {
         console.log('[github] poll failed:', describeError(err))
+      } finally {
+        this.polling = false
       }
     }
     this.pollTimer = setInterval(() => void tick(), POLL_INTERVAL_MS)
@@ -132,8 +140,15 @@ class GitHubManager {
   /** New comments / conflicts / approvals on MY PRs only. The review-requested
    *  scope never alerts — its PRs are not even fetched until the tab is opened. */
   async alerts(): Promise<PrAlert[]> {
+    await this.list('mine')
+    if (!this.lastMine) throw new Error('GitHub alert status could not be refreshed. Check gh authentication and connectivity; existing alerts are kept.')
+    return this.alertsFrom(this.lastMine)
+  }
+
+  private alertsFrom(prs: PullRequest[]): PrAlert[] {
     const byUrl = new Map<string, PrAlert>()
-    for (const pr of await this.list('mine')) {
+    for (const pr of prs) {
+      if (pr.merged || pr.state.toLowerCase() !== 'open') continue
       const kinds: PrAlert['kinds'] = []
       if (pr.hasNewComments) kinds.push('comment')
       if (pr.hasNewConflicts) kinds.push('conflict')
@@ -145,11 +160,18 @@ class GitHubManager {
     return [...byUrl.values()]
   }
 
+  /** UI reads and background polls both update the sidebar's alert indicator. */
+  private publishAlerts(): void {
+    if (!this.lastMine) return
+    this.pushAlerts(this.alertsFrom(this.lastMine))
+  }
+
   /** Clear alert flags for the given PRs (all current alerts when omitted). */
   async markAlertsSeen(urls?: string[]): Promise<void> {
-    const targets = urls && urls.length > 0 ? urls : (await this.alerts()).map((a) => a.url)
+    const targets = urls && urls.length > 0 ? urls : (this.lastMine ? this.alertsFrom(this.lastMine) : await this.alerts()).map((a) => a.url)
     for (const url of targets) this.markSeen(url)
-    this.pushAlerts(await this.alerts())
+    // Acknowledge the displayed snapshot, not newer events fetched during dismissal.
+    this.publishAlerts()
   }
 
   private pushAlerts(items: PrAlert[]): void {
@@ -161,6 +183,18 @@ class GitHubManager {
   /** Open PRs I authored, or PRs where my review is requested. Merged PRs are
    *  deliberately absent — they are done, not waiting on anyone. */
   async list(scope: 'mine' | 'review' = 'mine'): Promise<PullRequest[]> {
+    const pending = this.refreshes.get(scope)
+    if (pending) return pending
+    const refresh = this.fetchList(scope)
+    this.refreshes.set(scope, refresh)
+    try {
+      return await refresh
+    } finally {
+      if (this.refreshes.get(scope) === refresh) this.refreshes.delete(scope)
+    }
+  }
+
+  private async fetchList(scope: 'mine' | 'review'): Promise<PullRequest[]> {
     const fields = 'repository,title,url,number,isDraft,updatedAt,state,commentsCount'
     const searches: string[][] = [
       scope === 'mine'
@@ -191,7 +225,20 @@ class GitHubManager {
         updatedAt: Date.parse(r.updatedAt ?? '') || Date.now(),
         commentsCount: r.commentsCount
       }))
-    await this.enrich(prs)
+    const enriched = await this.enrich(prs)
+    if (scope === 'mine') {
+      if (enriched) {
+        this.lastMine = prs
+        this.publishAlerts()
+      } else {
+        // A failed status lookup is not proof that comments/conflicts disappeared.
+        const previous = new Map((this.lastMine ?? []).map((pr) => [pr.url, pr]))
+        for (const pr of prs) {
+          const saved = previous.get(pr.url)
+          if (saved) Object.assign(pr, { ...saved, ...pr })
+        }
+      }
+    }
     return prs
   }
 
@@ -200,8 +247,8 @@ class GitHubManager {
    * then flags PRs with a not-yet-seen comment from someone else (first sighting of
    * a PR only sets the baseline — no false "new" for pre-existing comments).
    */
-  private async enrich(prs: PullRequest[]): Promise<void> {
-    if (prs.length === 0) return
+  private async enrich(prs: PullRequest[]): Promise<boolean> {
+    if (prs.length === 0) return true
     const byRepo = new Map<string, PullRequest[]>()
     for (const pr of prs) {
       const list = byRepo.get(pr.repo) ?? []
@@ -225,10 +272,13 @@ class GitHubManager {
     }
     q += '}'
     const res = await gh(['api', 'graphql', '--field', `query=${q}`])
-    if (!res.ok) return // enrichment is best-effort; the list still renders without badges
+    if (!res.ok) {
+      console.warn('[github] PR status refresh failed; existing alerts kept:', res.err.trim().slice(0, 300))
+      return false // the list still renders; alert state stays intact
+    }
     type Node = { author?: { login?: string } | null; createdAt?: string }
     type PrNode = {
-      reviewDecision?: string
+      reviewDecision?: string | null
       state?: string
       mergedAt?: string | null
       mergeable?: string
@@ -239,8 +289,17 @@ class GitHubManager {
       comments?: { totalCount?: number; nodes?: Node[] }
     }
     type RepoNode = { defaultBranchRef?: { name?: string } | null; [alias: string]: unknown }
-    const data = (JSON.parse(res.out) as { data?: Record<string, RepoNode> }).data ?? {}
+    const payload = JSON.parse(res.out) as { data?: Record<string, RepoNode>; errors?: Array<{ message?: string }> }
+    const data = payload.data ?? {}
+    if (payload.errors?.length || refs.length !== prs.length || refs.some(({ path }) => !data[path[0]]?.[path[1]])) {
+      console.warn('[github] Incomplete PR status refresh; existing alerts kept.')
+      return false
+    }
     const me = await this.myLogin()
+    if (!me) {
+      console.warn('[github] Could not determine the GitHub account; existing alerts kept.')
+      return false
+    }
     const seenMap = settingGet<Record<string, PrSeen>>(SEEN_KEY) ?? {}
     let seenDirty = false
 
@@ -252,12 +311,17 @@ class GitHubManager {
       pr.headRefName = node.headRefName || undefined
       pr.baseRefName = node.baseRefName || undefined
       pr.defaultBranch = repo?.defaultBranchRef?.name || undefined
+      if (node.state) pr.state = node.state.toLowerCase()
       if (node.mergedAt || node.state === 'MERGED') {
         pr.merged = true
         pr.state = 'merged'
       }
-      const conflicting = node.mergeable === 'CONFLICTING'
-      pr.mergeable = node.mergeable === 'MERGEABLE' || node.mergeable === 'CONFLICTING' || node.mergeable === 'UNKNOWN' ? node.mergeable : undefined
+      const seen = seenMap[pr.url]
+      const conflicting = node.mergeable === 'CONFLICTING' || node.mergeStateStatus === 'DIRTY'
+      const knownMergeability = conflicting || node.mergeable === 'MERGEABLE'
+      // UNKNOWN while GitHub recomputes is not a conflict-resolution event.
+      const observedConflict = knownMergeability ? conflicting : this.lastInfo.get(pr.url)?.conflicting ?? seen?.conflicting
+      pr.mergeable = conflicting ? 'CONFLICTING' : node.mergeable === 'MERGEABLE' || node.mergeable === 'UNKNOWN' ? node.mergeable : undefined
       pr.mergeStateStatus = node.mergeStateStatus || undefined
       const others = (node.comments?.nodes ?? [])
         .filter((n) => n.author?.login && n.author.login !== me)
@@ -269,21 +333,34 @@ class GitHubManager {
       const latest = others[0]
       const unresolved = (node.reviewThreads?.nodes ?? []).filter((t) => !t.isResolved).length
       pr.unresolvedThreads = unresolved
-      this.lastInfo.set(pr.url, { latestOtherAt: latest?.at ?? 0, total, conflicting, decision: pr.reviewDecision, threads: unresolved })
+      this.lastInfo.set(pr.url, { latestOtherAt: latest?.at ?? 0, total, conflicting: observedConflict, decision: pr.reviewDecision, threads: unresolved })
       pr.latestOtherCommentAuthor = latest?.author
       pr.latestOtherCommentAt = latest?.at
-      const seen = seenMap[pr.url]
       if (!seen) {
         // First sighting: set the baseline — no false "new" for pre-existing state.
-        seenMap[pr.url] = { latestOtherAt: latest?.at ?? 0, total, conflicting, decision: pr.reviewDecision, threads: unresolved }
+        seenMap[pr.url] = { latestOtherAt: latest?.at ?? 0, total, conflicting: observedConflict, decision: pr.reviewDecision, threads: unresolved }
         seenDirty = true
         pr.hasNewComments = false
         pr.hasNewConflicts = false
         pr.hasNewApproval = false
       } else {
+        // Rearm recurring events when their prior episode definitively clears.
+        // Do not acknowledge unrelated unread comments or other current alerts.
+        if (knownMergeability && !conflicting && seen.conflicting !== false) {
+          seen.conflicting = false
+          seenDirty = true
+        }
+        if (node.reviewDecision !== undefined && node.reviewDecision !== 'APPROVED' && seen.decision === 'APPROVED') {
+          seen.decision = pr.reviewDecision
+          seenDirty = true
+        }
+        if (node.reviewThreads && unresolved < (seen.threads ?? 0)) {
+          seen.threads = unresolved
+          seenDirty = true
+        }
         pr.hasNewComments = !!latest && latest.at > seen.latestOtherAt
         // Conflict and approval flags fire on the *transition* into the state.
-        pr.hasNewConflicts = conflicting && !seen.conflicting
+        pr.hasNewConflicts = observedConflict === true && !seen.conflicting
         pr.hasNewApproval = pr.reviewDecision === 'APPROVED' && seen.decision !== 'APPROVED'
         // New review feedback: thread count rose since the user last looked
         // (old threads staying unresolved must not nag).
@@ -296,15 +373,24 @@ class GitHubManager {
       }
     }
     if (seenDirty) settingSet(SEEN_KEY, seenMap)
+    return true
   }
 
-  /** Dismiss the "new comment" flag (called on Review click and by the ✓ button). */
+  /** Acknowledge this PR's current comments, conflicts, approvals and review feedback. */
   markSeen(prUrl: string): void {
     const info = this.lastInfo.get(prUrl)
     if (!info) return
     const seenMap = settingGet<Record<string, PrSeen>>(SEEN_KEY) ?? {}
     seenMap[prUrl] = info
     settingSet(SEEN_KEY, seenMap)
+    const pr = this.lastMine?.find((item) => item.url === prUrl)
+    if (pr) {
+      pr.hasNewComments = false
+      pr.hasNewConflicts = false
+      pr.hasNewApproval = false
+      pr.hasNewReviewThreads = false
+      this.publishAlerts()
+    }
   }
 
   async detail(prUrl: string): Promise<PrDetail> {
@@ -658,23 +744,20 @@ class GitHubManager {
     const ticketKey = this.ticketForPr(pr)
     const { directory, onPrBranch } = await this.chatDirectoryForPr(pr, ticketKey)
     const generalSelection = settingGet<{ agentID?: string; model?: { providerID: string; id: string } } | undefined>('chat.lastSelection')
+    const where = onPrBranch
+      ? 'The PR branch is checked out in this directory.'
+      : `This chat opens in ${directory}, which is not this PR's checkout — read the code with \`gh\` and the PR URL, not local files, unless the repo happens to be here.`
+    const primer = `This chat is attached to GitHub PR ${pr.url} (${pr.repo}#${pr.number}: ${pr.title}, ${pr.headRefName} → ${pr.baseRefName})${ticketKey ? `, ticket ${ticketKey}` : ''}. ${where} Inspect it with \`gh pr view ${pr.url} --json body,files\` and \`gh pr diff ${pr.url}\` as needed.`
+    // The chat opens empty; the primer rides the user's first message.
     const chat = await chatManager.create({
       directory,
       title: `${ticketKey ?? `${pr.repo}#${pr.number}`} · PR #${pr.number} chat`.slice(0, 80),
       agentID: generalSelection?.agentID,
       model: generalSelection?.model,
       ticketKey,
-      prUrl: pr.url
+      prUrl: pr.url,
+      context: primer
     })
-    const where = onPrBranch
-      ? 'The PR branch is checked out in this directory.'
-      : `This chat opens in ${directory}, which is not this PR's checkout — read the code with \`gh\` and the PR URL, not local files, unless the repo happens to be here.`
-    const primer = `This chat is attached to GitHub PR ${pr.url} (${pr.repo}#${pr.number}: ${pr.title}, ${pr.headRefName} → ${pr.baseRefName})${ticketKey ? `, ticket ${ticketKey}` : ''}. ${where} Inspect it with \`gh pr view ${pr.url} --json body,files\` and \`gh pr diff ${pr.url}\` as needed.`
-    await openCodeService.api.session
-      .prompt({ sessionID: chat.sessionId, text: `${primer}\n\nAcknowledge with one short line that you have read this — the user's request follows.` })
-      .catch((err) => {
-        throw new Error(`Session created but the PR primer failed: ${describeError(err)}`)
-      })
     this.markSeen(prUrl)
     return { sessionId: chat.sessionId, title: chat.title, directory }
   }

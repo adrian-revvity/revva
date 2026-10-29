@@ -140,6 +140,23 @@ function migrate(db: Database.Database): void {
     addColumnIfMissing(db, 'work', 'owns_worktree', 'INTEGER NOT NULL DEFAULT 1')
     db.exec('PRAGMA user_version = 7;')
   }
+  if (version < 8) {
+    db.exec(`
+      CREATE TABLE work_followup (
+        id TEXT PRIMARY KEY, work_id TEXT NOT NULL, text TEXT NOT NULL,
+        images TEXT NOT NULL, refs TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
+        error TEXT, created_at INTEGER NOT NULL
+      );
+      CREATE INDEX idx_work_followup ON work_followup(work_id, created_at);
+    `)
+    addColumnIfMissing(db, 'work', 'review_after_followup', 'INTEGER NOT NULL DEFAULT 0')
+    db.exec('PRAGMA user_version = 8;')
+  }
+  if (version < 9) {
+    // Ticket/PR chats open empty; this context rides along on the user's first message.
+    addColumnIfMissing(db, 'chat', 'context', 'TEXT')
+    db.exec('PRAGMA user_version = 9;')
+  }
 }
 
 function addColumnIfMissing(db: Database.Database, table: string, column: string, decl: string): boolean {

@@ -27,6 +27,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Separator } from '@/components/ui/separator'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
+import { transcriptRequest } from '@/lib/transcript-requests'
 import { activeWorkLabel, isActiveWorkState, workStateLabels } from '@/lib/work-state'
 import { MD_COMPONENTS } from '@/components/message-markdown'
 import type { FinishedRun, InboxField, PendingItem, TriageEntry, WorkState } from '@shared/types'
@@ -447,18 +448,9 @@ function FinishedRunCard({
   const [draft, setDraft] = useState('')
   const message = useQuery({
     queryKey: ['triage-message', item.source, item.sessionID, item.updatedAt],
-    queryFn: () => item.source === 'chat'
-      ? window.revva.chat.messages(item.sessionID)
-      : window.revva.work.messages(item.sessionID),
+    queryFn: ({ signal }) => transcriptRequest(signal, (requestId) => window.revva.session.latestAnswer(item.sessionID, item.updatedAt, requestId)),
     enabled: visible,
     staleTime: Infinity,
-    select: ({ messages }) => {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const message = messages[i]
-        if (message?.role === 'assistant' && message.text.trim()) return message.text
-      }
-      return null
-    }
   })
   const reply = useMutation({
     mutationFn: (text: string) => window.revva.chat.prompt(item.sessionID, text),

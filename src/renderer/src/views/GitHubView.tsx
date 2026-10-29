@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import {
   AlertTriangle,
   Bell,
@@ -84,7 +85,8 @@ export function GitHubView({
       void qc.invalidateQueries({ queryKey: ['chats'] })
       void qc.invalidateQueries({ queryKey: ['gh-prs'] })
       onOpenChat(res.sessionId)
-    }
+    },
+    onError: (e: Error) => toast.error('Could not start the review session', { description: e.message })
   })
   const chatSession = useMutation({
     mutationFn: (prUrl: string) => window.revva.github.chat(prUrl),
@@ -94,7 +96,10 @@ export function GitHubView({
       void qc.invalidateQueries({ queryKey: ['gh-prs'] })
       onOpenChat(res.sessionId)
     },
-    onError: (e: Error) => setActionError(e.message)
+    onError: (e: Error) => {
+      setActionError(e.message)
+      toast.error('Could not start the PR chat', { description: e.message })
+    }
   })
   /** Big card button: new chat linked to the PR (+ ticket), checked out at its branch. */
   const startChat = (url: string): void => {
@@ -111,6 +116,7 @@ export function GitHubView({
     onError: (e: Error) => {
       void qc.invalidateQueries({ queryKey: ['chats'] })
       setActionError(e.message)
+      toast.error('Could not start conflict solving', { description: e.message })
     }
   })
   const solveComments = useMutation({
@@ -125,27 +131,38 @@ export function GitHubView({
     onError: (e: Error) => {
       void qc.invalidateQueries({ queryKey: ['chats'] })
       setActionError(e.message)
+      toast.error('Could not start review-comment answers', { description: e.message })
     }
   })
   const merge = useMutation({
     mutationFn: ({ prUrl, method }: { prUrl: string; method: PrMergeMethod }) =>
       window.revva.github.merge(prUrl, method),
-    onSuccess: () => {
+    onSuccess: (_res, { prUrl, method }) => {
       setActionError(null)
+      const pr = (prs.data ?? []).find((p) => p.url === prUrl)
+      toast.success(`${pr ? `${pr.repo}#${pr.number}` : 'PR'} merged (${method}) — branch deleted`)
       void qc.invalidateQueries({ queryKey: ['gh-prs'] })
       void qc.invalidateQueries({ queryKey: ['gh-alerts'] })
       void qc.invalidateQueries({ queryKey: ['works'] })
     },
-    onError: (e: Error) => setActionError(e.message)
+    onError: (e: Error) => {
+      setActionError(e.message)
+      toast.error('Merge failed', { description: e.message })
+    }
   })
   const rebase = useMutation({
     mutationFn: (prUrl: string) => window.revva.github.rebase(prUrl),
-    onSuccess: () => {
+    onSuccess: (_res, prUrl) => {
       setActionError(null)
+      const pr = (prs.data ?? []).find((p) => p.url === prUrl)
+      toast.success(`${pr ? `${pr.repo}#${pr.number}` : 'PR'} rebased onto ${pr?.baseRefName ?? 'its base'}`)
       void qc.invalidateQueries({ queryKey: ['gh-prs'] })
       void qc.invalidateQueries({ queryKey: ['gh-alerts'] })
     },
-    onError: (e: Error) => setActionError(e.message)
+    onError: (e: Error) => {
+      setActionError(e.message)
+      toast.error('Rebase failed', { description: e.message })
+    }
   })
 
   // Merged PRs are done — never listed, never alerted (main stopped fetching

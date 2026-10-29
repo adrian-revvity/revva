@@ -120,7 +120,9 @@ export const chatCreateInputSchema = z.object({
   model: modelRefSchema.optional(),
   /** Optional context links — stored on the session and mentioned in a kickoff note. */
   ticketKey: z.string().optional(),
-  prUrl: z.string().optional()
+  prUrl: z.string().optional(),
+  /** Context delivered with the user's first message instead of a kickoff prompt. */
+  context: z.string().optional()
 })
 export type ChatCreateInput = z.infer<typeof chatCreateInputSchema>
 
@@ -142,7 +144,9 @@ export const chatToolCallSchema = z.object({
   /** One-line summary of the input (command, path, pattern…). */
   detail: z.string().optional(),
   /** Truncated text output or error message. */
-  output: z.string().optional()
+  output: z.string().optional(),
+  /** Raw streamed input prefix length, independent of the truncated summary. */
+  inputLength: z.number().optional()
 })
 export type ChatToolCall = z.infer<typeof chatToolCallSchema>
 
@@ -157,6 +161,8 @@ export const chatMessageSchema = z.object({
   tools: z.array(chatToolCallSchema).optional(),
   /** Model reasoning/thinking text, when the provider surfaced it. */
   thinking: z.string().optional(),
+  /** Untrimmed prefix lengths for overlap-safe incremental delivery. */
+  streamLengths: z.object({ text: z.number(), thinking: z.number() }).optional(),
   createdAt: z.number()
 })
 export type ChatMessage = z.infer<typeof chatMessageSchema>
@@ -184,6 +190,16 @@ export const queuedMessageSchema = z.object({
 })
 export type QueuedMessage = z.infer<typeof queuedMessageSchema>
 
+/** Persisted in Revva, not OpenCode's idle build-session inbox. */
+export interface WorkFollowUp {
+  id: string
+  text: string
+  imageCount: number
+  createdAt: number
+  status: 'queued' | 'sending' | 'error'
+  error?: string
+}
+
 /* ---------- Worktree cleanup ---------- */
 
 export const worktreeInfoSchema = z.object({
@@ -201,9 +217,54 @@ export const worktreeInfoSchema = z.object({
   revva: z.boolean(),
   ticketKey: z.string().optional(),
   /** Revva work still live — removal must go through abandon. */
-  busy: z.boolean().optional()
+  busy: z.boolean().optional(),
+  /** The repository's main checkout. Only listed when the caller asks for them; never a removal target. */
+  mainCheckout: z.boolean().optional()
 })
 export type WorktreeInfo = z.infer<typeof worktreeInfoSchema>
+
+/** Branches of one repository, for the conversation's branch picker (`worktrees.branches`). */
+export const repoBranchSchema = z.object({
+  name: z.string(),
+  /** Checked out in the directory the listing was asked for. */
+  current: z.boolean(),
+  /** Another worktree of the same repo holds it out; git refuses a second checkout. */
+  checkedOutIn: z.string().optional(),
+  /** Only exists on a remote — selecting it creates the local tracking branch. */
+  remoteOnly: z.boolean(),
+  /** Whose remote branch this is (undefined for local-only branches). */
+  remote: z.string().optional(),
+  /** Every remote carrying it when more than one does; git would guess, so Revva refuses. */
+  remotes: z.array(z.string()).optional(),
+  lastCommitAt: z.number().optional()
+})
+export type RepoBranch = z.infer<typeof repoBranchSchema>
+
+export const repoBranchListSchema = z.object({
+  /** Repository root the listing came from. */
+  repoDir: z.string(),
+  /** Branch the given directory is on; absent when it is detached or not a checkout. */
+  current: z.string().optional(),
+  /** True when the directory is the repository's main checkout. */
+  mainCheckout: z.boolean(),
+  branches: z.array(repoBranchSchema)
+})
+export type RepoBranchList = z.infer<typeof repoBranchListSchema>
+
+/** The branch listing for one checkout (`worktrees.branches`). */
+export const worktreeBranchesInputSchema = z.object({ directory: z.string().min(1).max(2048) })
+
+/** `worktrees.list` options. Main checkouts are off unless asked for: cleanup must never offer them. */
+export const worktreeListInputSchema = z.object({ includeMainCheckouts: z.boolean().optional() })
+
+/** Where a conversation works: one of Revva's known worktrees, and the branch to check out there. */
+export const conversationCheckoutInputSchema = z.object({
+  /** Linked worktree or main checkout to work in; omit to stay where the conversation is. */
+  directory: z.string().min(1).optional(),
+  /** Branch to check out in that folder (local, or a remote branch to start tracking). */
+  branch: z.string().min(1).optional()
+})
+export type ConversationCheckoutInput = z.infer<typeof conversationCheckoutInputSchema>
 
 /**
  * Read-only proof gathered before any removal (main process, `worktrees.preflight`).
@@ -257,12 +318,6 @@ export const worktreeRemoveInputSchema = z.object({
   confirmed: z.boolean().default(false)
 })
 export type WorktreeRemoveInput = z.infer<typeof worktreeRemoveInputSchema>
-
-export const worktreeInspectInputSchema = z.object({
-  repoDir: z.string().min(1),
-  directory: z.string().min(1)
-})
-export type WorktreeInspectInput = z.infer<typeof worktreeInspectInputSchema>
 
 export const workAbandonInputSchema = z.object({
   id: z.string().min(1),
@@ -396,6 +451,9 @@ export const reviewRowSchema = z.object({
   status: reviewStatusSchema,
   /** Reviewer's final report (findings or approval notes). */
   findings: z.string(),
+  /** Latest real execution event; kept in memory while this app is running. */
+  activity: z.string().optional(),
+  lastActivityAt: z.number().optional(),
   error: z.string().optional(),
   agentID: z.string().optional(),
   model: modelRefSchema.optional(),
@@ -403,6 +461,13 @@ export const reviewRowSchema = z.object({
   updatedAt: z.number()
 })
 export type ReviewRow = z.infer<typeof reviewRowSchema>
+
+/** Outcome of a conversation checkout switch: the refreshed work row plus what git actually did. */
+export interface ConversationCheckoutResult {
+  /** The conversation's utilities, re-anchored to the new folder/branch. Absent for an unlinked chat. */
+  work: WorkSummary | null
+  note: string
+}
 
 export const workSummarySchema = z.object({
   id: z.string(),
@@ -711,11 +776,29 @@ export type ThroughputSnapshot = z.infer<typeof throughputSnapshotSchema>
 export interface TranscriptPage {
   messages: ChatMessage[]
   reset: boolean
+  /** Active drafts whose prefix was missed/evicted; wait for authoritative data. */
+  missingPrefixes?: string[]
 }
+
+export interface TranscriptAttachment { epoch: string; sequence: number }
+const transcriptUpdateSchema = z.object({
+  messageId: z.string(),
+  partId: z.string(),
+  field: z.enum(['text', 'thinking', 'tool']),
+  offset: z.number().optional(),
+  text: z.string().optional(),
+  tool: chatToolCallSchema.optional(),
+  createdAt: z.number()
+})
+export type TranscriptUpdate = z.infer<typeof transcriptUpdateSchema>
 
 export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('service'), status: serviceStatusSchema }),
   z.object({ kind: z.literal('mcp.changed') }),
+  z.object({ kind: z.literal('inventory.models') }),
+  z.object({ kind: z.literal('transcript.batch'), sessionId: z.string(), epoch: z.string(), sequence: z.number(), updates: z.array(transcriptUpdateSchema), diagnostic: z.boolean() }),
+  z.object({ kind: z.literal('transcript.reset'), sessionId: z.string(), epoch: z.string() }),
+  z.object({ kind: z.literal('session.metrics'), sessionId: z.string() }),
   z.object({ kind: z.literal('chat.delta'), sessionId: z.string(), messageId: z.string(), text: z.string() }),
   z.object({ kind: z.literal('chat.message'), sessionId: z.string(), message: chatMessageSchema }),
   z.object({ kind: z.literal('chat.idle'), sessionId: z.string() }),
@@ -727,10 +810,11 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('session.model'), sessionId: z.string() }),
   z.object({ kind: z.literal('session.agent'), sessionId: z.string() }),
   z.object({ kind: z.literal('session.activity'), sessionId: z.string(), running: z.boolean() }),
-  z.object({ kind: z.literal('session.transcript'), sessionId: z.string() }),
+  z.object({ kind: z.literal('session.transcript'), sessionId: z.string(), reset: z.boolean().optional() }),
   /** Output tokens / elapsed time since Send; frozen when the interaction ends. */
   z.object({ kind: z.literal('session.throughput'), items: z.array(throughputSnapshotSchema) }),
   z.object({ kind: z.literal('work.updated'), workId: z.string(), state: workStateSchema }),
+  z.object({ kind: z.literal('work.queue'), workId: z.string() }),
   z.object({ kind: z.literal('work.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
   z.object({ kind: z.literal('inbox'), items: z.array(pendingItemSchema) }),
   /** Ranked triage feed: pending items + finished-unseen runs (pushed on dismissal). */
@@ -790,9 +874,9 @@ export interface RevvaApi {
   chat: {
     list(): Promise<ChatSummary[]>
     create(input: ChatCreateInput): Promise<ChatSummary>
-    messages(sessionId: string, since?: string): Promise<TranscriptPage>
+    messages(sessionId: string, since?: string, requestId?: string): Promise<TranscriptPage>
     /** `queued` = park in the inbox behind the running turn instead of steering into it. */
-    prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs, sentAt?: number): Promise<void>
+    prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs, sentAt?: number): Promise<void | 'queued'>
     interrupt(sessionId: string): Promise<void>
     rename(sessionId: string, title: string): Promise<void>
     setTicket(sessionId: string, ticketKey: string | null): Promise<void>
@@ -801,6 +885,11 @@ export interface RevvaApi {
     remove(sessionId: string): Promise<void>
   }
   session: {
+    subscribe(sessionId: string, token: string): Promise<TranscriptAttachment>
+    unsubscribe(token: string): Promise<void>
+    cancelRequest(requestId: string): Promise<void>
+    latestAnswer(sessionId: string, generation: number, requestId: string): Promise<string | null>
+    performanceFrame(delayMs: number): Promise<void>
     model(sessionId: string): Promise<(ModelRef & { variants?: string[] }) | null>
     /** Switch the model for subsequent provider turns (live, mid-conversation). */
     setModel(sessionId: string, model: ModelRef): Promise<void>
@@ -818,14 +907,16 @@ export interface RevvaApi {
     promoteQueued(sessionId: string, inboxId: string): Promise<void>
   }
   worktrees: {
-    /** Linked worktrees across known repos (revva-created or not). */
-    list(): Promise<WorktreeInfo[]>
+    /** Linked worktrees across known repos (revva-created or not). Main checkouts are included on request. */
+    list(input?: { includeMainCheckouts?: boolean }): Promise<WorktreeInfo[]>
+    /** Branches of the repository owning a directory, with each branch's worktree occupancy. */
+    branches(input: { directory: string }): Promise<RepoBranchList>
     /** Read-only safety proof for one removal path; throws a refusal when the path is not safe. */
     preflight(input: { repoDir: string; directory: string }): Promise<WorktreeRemovalPreflight>
     /** Removes the worktree; deletes its branch only when git allows (`-d`). Returns a note. */
     remove(input: WorktreeRemoveInput): Promise<string | undefined>
-    /** Opens an audit chat answering "can this worktree be removed, or is uncommitted/unpushed work in it?". */
-    inspect(input: WorktreeInspectInput): Promise<TaskSessionResult>
+    /** Opens an agent chat that checks every worktree for work that would be lost, cleans up the safe ones, and reports the rest. */
+    cleanupChat(): Promise<TaskSessionResult>
   }
   jira: {
     status(): Promise<JiraStatus>
@@ -841,11 +932,18 @@ export interface RevvaApi {
     list(): Promise<WorkSummary[]>
     /** Shared utilities for an existing conversation, regardless of its Jira/PR properties. */
     conversationContext(sessionId: string, directory?: string): Promise<WorkSummary>
+    /** Move a conversation to a known worktree and/or switch its branch; git refuses unsafe switches. */
+    setCheckout(sessionId: string, input: ConversationCheckoutInput): Promise<ConversationCheckoutResult>
     /** Read-only proof of what abandoning would destroy (worktree safety + notes). */
     abandonPreflight(id: string): Promise<WorkAbandonPreflight>
     abandon(input: WorkAbandonInput): Promise<string | undefined>
-    messages(sessionId: string, since?: string): Promise<TranscriptPage>
-    prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs, sentAt?: number): Promise<void>
+    messages(sessionId: string, since?: string, requestId?: string): Promise<TranscriptPage>
+    prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs, sentAt?: number): Promise<void | 'queued'>
+    promptNow(sessionId: string, text: string, images?: PromptImage[], refs?: PromptRefs): Promise<void>
+    queue(workId: string): Promise<WorkFollowUp[]>
+    editQueued(workId: string, id: string, text: string, refs?: PromptRefs): Promise<void>
+    cancelQueued(workId: string, id: string): Promise<void>
+    sendQueuedNow(workId: string, id: string): Promise<void>
     interrupt(sessionId: string): Promise<void>
     /** Review ledger for one work (all rounds). */
     reviews(workId: string): Promise<ReviewRow[]>

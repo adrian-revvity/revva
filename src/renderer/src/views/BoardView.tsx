@@ -7,7 +7,8 @@ import {
   CornerUpLeft,
   ExternalLink,
   ListChecks,
-  MessageSquare,
+  Loader2,
+  MessageSquareText,
   Pin,
   PinOff,
   Play,
@@ -46,14 +47,16 @@ const ALL_STATUSES = '__all__'
 /**
  * Board: current-sprint assigned tickets with dependency hints, status filter,
  * and search. Two entry points per ticket: the full pipeline (Start flow) or a
- * plain agent session linked to the ticket.
+ * chat opened with the ticket in context.
  */
 export function BoardView({
   works,
-  onStart
+  onStart,
+  onOpenChat
 }: {
   works: WorkSummary[]
   onStart: (workId: string) => void
+  onOpenChat: (sessionId: string) => void
 }): React.JSX.Element {
   const qc = useQueryClient()
   const jira = useQuery({ queryKey: ['jira-status'], queryFn: () => window.revva.jira.status() })
@@ -85,7 +88,10 @@ export function BoardView({
 
   const openSession = useMutation({
     mutationFn: (key: string) => window.revva.task.ticketSession({ ticketKey: key }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['chats'] })
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ['chats'] })
+      onOpenChat(res.sessionId)
+    }
   })
 
   const activeByTicket = new Map(
@@ -549,6 +555,20 @@ function TicketCard({
           <Play className="size-3.5" />
           {active ? (active.state === 'BUILDING' ? 'Watching…' : active.state) : 'Start'}
         </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 w-full gap-1.5 text-xs text-muted-foreground hover:text-foreground"
+          disabled={sessionBusy}
+          onClick={onSession}
+        >
+          {sessionBusy ? (
+            <Loader2 className="size-3.5 animate-spin" />
+          ) : (
+            <MessageSquareText className="size-3.5" />
+          )}
+          {sessionBusy ? 'Opening chat…' : 'Chat with this ticket'}
+        </Button>
         <div className="flex flex-wrap items-center gap-1">
           <Tooltip>
             <TooltipTrigger asChild>
@@ -577,21 +597,6 @@ function TicketCard({
               </Button>
             </TooltipTrigger>
             <TooltipContent>{zone === 'later' ? 'Back to the list' : 'Not right now'}</TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                size="xs"
-                variant="ghost"
-                className="h-6 px-1.5 text-muted-foreground"
-                title="Open a plain agent session linked to this ticket (no pipeline)"
-                disabled={sessionBusy}
-                onClick={onSession}
-              >
-                <MessageSquare className="size-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Open a plain agent session linked to this ticket (no pipeline)</TooltipContent>
           </Tooltip>
           {t.url && (
             <Tooltip>

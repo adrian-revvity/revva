@@ -7,6 +7,7 @@
  */
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import { Loader2, RefreshCw, Sparkles } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -46,10 +47,12 @@ export function PrDescribeDialog({ prUrl, onClose }: { prUrl: string; onClose: (
       return window.revva.github.describeSave(prUrl, draft.data.original, draft.data.head, body)
     },
     onSuccess: () => {
+      toast.success('PR description saved')
       void qc.invalidateQueries({ queryKey: ['gh-pr-detail', prUrl] })
       void qc.invalidateQueries({ queryKey: ['gh-prs'] })
       onClose()
-    }
+    },
+    onError: (e: Error) => toast.error('Could not save the description', { description: e.message })
   })
   return (
     <Dialog open onOpenChange={(open) => !open && !save.isPending && onClose()}>

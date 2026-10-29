@@ -40,7 +40,7 @@ const api: RevvaApi = {
   chat: {
     list: () => ipcRenderer.invoke(IPC.chatList),
     create: (input) => ipcRenderer.invoke(IPC.chatCreate, input),
-    messages: (sessionId, since) => ipcRenderer.invoke(IPC.chatMessages, sessionId, since),
+    messages: (sessionId, since, requestId) => ipcRenderer.invoke(IPC.chatMessages, sessionId, since, requestId),
     prompt: (sessionId, text, images, queued, refs, sentAt) => ipcRenderer.invoke(IPC.chatPrompt, sessionId, text, images, queued, refs, sentAt),
     interrupt: (sessionId) => ipcRenderer.invoke(IPC.chatInterrupt, sessionId),
     rename: (sessionId, title) => ipcRenderer.invoke(IPC.chatRename, sessionId, title),
@@ -49,6 +49,11 @@ const api: RevvaApi = {
     remove: (sessionId) => ipcRenderer.invoke(IPC.chatDelete, sessionId)
   },
   session: {
+    subscribe: (sessionId, token) => ipcRenderer.invoke(IPC.transcriptSubscribe, sessionId, token),
+    unsubscribe: (token) => ipcRenderer.invoke(IPC.transcriptUnsubscribe, token),
+    cancelRequest: (requestId) => ipcRenderer.invoke(IPC.transcriptCancel, requestId),
+    latestAnswer: (sessionId, generation, requestId) => ipcRenderer.invoke(IPC.transcriptLatest, sessionId, generation, requestId),
+    performanceFrame: (delayMs) => ipcRenderer.invoke(IPC.performanceFrame, delayMs),
     model: (sessionId) => ipcRenderer.invoke(IPC.sessionModel, sessionId),
     setModel: (sessionId, model) => ipcRenderer.invoke(IPC.sessionSetModel, sessionId, model),
     agent: (sessionId) => ipcRenderer.invoke(IPC.sessionAgent, sessionId),
@@ -61,10 +66,11 @@ const api: RevvaApi = {
     promoteQueued: (sessionId, inboxId) => ipcRenderer.invoke(IPC.sessionQueuePromote, sessionId, inboxId)
   },
   worktrees: {
-    list: () => ipcRenderer.invoke(IPC.worktreeList),
+    list: (input) => ipcRenderer.invoke(IPC.worktreeList, input),
+    branches: (input) => ipcRenderer.invoke(IPC.worktreeBranches, input),
     preflight: (input) => ipcRenderer.invoke(IPC.worktreePreflight, input),
     remove: (input) => ipcRenderer.invoke(IPC.worktreeRemove, input),
-    inspect: (input) => ipcRenderer.invoke(IPC.worktreeInspect, input)
+    cleanupChat: () => ipcRenderer.invoke(IPC.worktreeCleanupChat)
   },
   jira: {
     status: () => ipcRenderer.invoke(IPC.jiraStatus),
@@ -78,10 +84,16 @@ const api: RevvaApi = {
     start: (input) => ipcRenderer.invoke(IPC.workStart, input),
     list: () => ipcRenderer.invoke(IPC.workList),
     conversationContext: (sessionId, directory) => ipcRenderer.invoke(IPC.conversationContext, sessionId, directory),
+    setCheckout: (sessionId, input) => ipcRenderer.invoke(IPC.workSetCheckout, sessionId, input),
     abandonPreflight: (id) => ipcRenderer.invoke(IPC.workAbandonPreflight, id),
     abandon: (input) => ipcRenderer.invoke(IPC.workAbandon, input),
-    messages: (sessionId, since) => ipcRenderer.invoke(IPC.workMessages, sessionId, since),
+    messages: (sessionId, since, requestId) => ipcRenderer.invoke(IPC.workMessages, sessionId, since, requestId),
     prompt: (sessionId, text, images, queued, refs, sentAt) => ipcRenderer.invoke(IPC.workPrompt, sessionId, text, images, queued, refs, sentAt),
+    promptNow: (sessionId, text, images, refs) => ipcRenderer.invoke(IPC.workPromptNow, sessionId, text, images, refs),
+    queue: (workId) => ipcRenderer.invoke(IPC.workQueue, workId),
+    editQueued: (workId, id, text, refs) => ipcRenderer.invoke(IPC.workQueueEdit, workId, id, text, refs),
+    cancelQueued: (workId, id) => ipcRenderer.invoke(IPC.workQueueCancel, workId, id),
+    sendQueuedNow: (workId, id) => ipcRenderer.invoke(IPC.workQueueSend, workId, id),
     interrupt: (sessionId) => ipcRenderer.invoke(IPC.workInterrupt, sessionId),
     reviews: (workId) => ipcRenderer.invoke(IPC.workReviews, workId),
     reviewStart: (workId) => ipcRenderer.invoke(IPC.workReviewStart, workId),

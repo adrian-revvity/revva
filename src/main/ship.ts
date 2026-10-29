@@ -50,6 +50,11 @@ class ShipManager {
   async checks(workId: string): Promise<ShipCheck[]> {
     const work = this.requireWork(workId)
     const checks: ShipCheck[] = []
+    checks.push({
+      name: 'Follow-ups',
+      ok: !workManager.hasFollowUps(workId) && !workManager.isPrompting(workId),
+      detail: 'Send or remove saved follow-ups before shipping; pending instructions must be implemented and reviewed first.'
+    })
 
     const attached = await this.probe('git', ['-C', work.worktree_dir, 'branch', '--show-current'])
     checks.push({
@@ -141,6 +146,7 @@ class ShipManager {
    *  the reviewed-commit check fatal because nobody is watching. */
   async ship(workId: string, opts: { strict?: boolean } = {}): Promise<ShipResult> {
     if (this.shipping.has(workId)) throw new Error('Shipping is already in progress.')
+    if (workManager.hasFollowUps(workId) || workManager.isPrompting(workId)) throw new Error('A follow-up is pending. Implement and review it before shipping.')
     this.shipping.add(workId)
     try {
       const checks = await this.checks(workId)
@@ -149,6 +155,7 @@ class ShipManager {
       )
       if (fatal) throw new Error(`Cannot ship: ${fatal.name} — ${fatal.detail}`)
       const work = this.requireWork(workId)
+      if (workManager.hasFollowUps(workId) || workManager.isPrompting(workId)) throw new Error('A follow-up is pending. Implement and review it before shipping.')
       if (work.state === 'BUILDING' || work.state === 'REVIEW' || work.state === 'FIXING') {
         throw new Error('Reviews are still running.')
       }
@@ -231,7 +238,8 @@ class ShipManager {
       // Keep the approved gate and let the user retry shipping after resolving the blocker.
       const reason = err instanceof Error ? err.message : String(err)
       audit(workId, 'auto-ship-blocked', reason)
-      workManager.setReviewState(workId, 'APPROVED', `Automatic shipping failed: ${reason}`)
+      const current = getDb().prepare('SELECT state FROM work WHERE id = ?').get(workId) as { state: string } | undefined
+      if (current?.state === 'APPROVED') workManager.setReviewState(workId, 'APPROVED', `Automatic shipping failed: ${reason}`)
     }
   }
 

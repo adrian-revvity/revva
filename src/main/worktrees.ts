@@ -12,15 +12,21 @@
  * modifications, and the UI says so. `--force` reaches git only for content
  * the user explicitly confirmed destroying. Branches are only ever deleted
  * with `branch -d`, never `-D`: unmerged work is kept and the user is told.
+ * The dialog's cleanup button instead hands the whole set to one agent chat
+ * (cleanupChat): it checks each worktree for work that would be lost and
+ * removes only the provably-empty ones itself, with plain `git worktree
+ * remove` — never `--force`, so git's own guard still protects anything the
+ * agent misjudges.
  */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { existsSync } from 'node:fs'
 import { lstat } from 'node:fs/promises'
-import { basename, isAbsolute, join } from 'node:path'
+import { basename, join } from 'node:path'
 import { openCodeService } from './opencode/service'
 import { chatManager } from './opencode/chats'
 import { getDb, settingGet } from './db'
+import { listRepoBranches, mainRepoOf } from './branches'
 import {
   listRegisteredWorktrees,
   performRemoval,
@@ -28,7 +34,7 @@ import {
   requireAbsenceOfAgents,
   staleConfirmationError
 } from './worktree-safety'
-import type { TaskSessionResult, WorktreeInfo, WorktreeRemovalPreflight } from '@shared/types'
+import type { RepoBranchList, TaskSessionResult, WorktreeInfo, WorktreeRemovalPreflight } from '@shared/types'
 
 const exec = promisify(execFile)
 
@@ -59,8 +65,13 @@ class WorktreeManager {
     return [...dirs].filter((dir) => existsSync(join(dir, '.git')))
   }
 
-  /** All linked worktrees across known repos, marked with revva ownership/busy state. */
-  async list(): Promise<WorktreeInfo[]> {
+  /**
+   * All linked worktrees across known repos, marked with revva ownership/busy state.
+   * The main checkouts are left out by default: cleanup must never offer them. The
+   * conversation's worktree picker asks for them, because a conversation can live there.
+   */
+  async list(options?: { includeMainCheckouts?: boolean }): Promise<WorktreeInfo[]> {
+    const includeMain = options?.includeMainCheckouts ?? false
     const works = getDb().prepare('SELECT worktree_dir, repo_dir, branch, state, ticket_key FROM work').all() as WorkRow[]
     const byDir = new Map(works.map((w) => [w.worktree_dir, w]))
     const rootSetting = settingGet<string>('worktreeRoot') || undefined
@@ -84,10 +95,16 @@ class WorktreeManager {
 
     for (const repoDir of this.repoDirs()) {
       const revvaRoot = rootSetting || join(repoDir, '..', `${basename(repoDir)}-worktrees`)
+      // The main checkout is the shared git dir's owner, not necessarily the queried
+      // path: a workspace can itself be a linked worktree, and then git lists the real
+      // main checkout among its entries. Cleanup must never offer that one.
+      const mainCheckout = await mainRepoOf(repoDir).catch(() => repoDir)
       // Git first: its porcelain data is richer than the service listing.
       try {
         for (const wt of await listRegisteredWorktrees(repoDir)) {
-          if (wt.path === repoDir) continue // the main checkout is never a cleanup target
+          const isMain = wt.path === mainCheckout
+          // The main checkout is never a cleanup target; the conversation picker asks for it.
+          if (isMain && !includeMain) continue
           const work = byDir.get(wt.path)
           add({
             repoDir,
@@ -99,7 +116,8 @@ class WorktreeManager {
             inWorktreeRoot: wt.path.startsWith(revvaRoot),
             revva: Boolean(work),
             ticketKey: work?.ticket_key,
-            busy: work ? LIVE_STATES.has(work.state) : undefined
+            busy: work ? LIVE_STATES.has(work.state) : undefined,
+            mainCheckout: isMain || undefined
           })
         }
       } catch (err) {
@@ -112,7 +130,7 @@ class WorktreeManager {
         try {
           const list = await openCodeService.api.worktree.list({ projectID: projectId })
           for (const wt of list) {
-            if (!wt.directory || wt.directory === repoDir) continue
+            if (!wt.directory || wt.directory === mainCheckout) continue
             // OpenCode's registry is append-only: rows for worktrees removed outside
             // OpenCode (git worktree remove, rm -rf) linger forever and would show as
             // ghosts here. Git's listing already covers every real registration, prunable
@@ -168,6 +186,11 @@ class WorktreeManager {
     return out.sort((a, b) => a.directory.localeCompare(b.directory))
   }
 
+  /** Branches of the repository owning `directory`, for the conversation’s branch picker. */
+  branches(directory: string): Promise<RepoBranchList> {
+    return listRepoBranches(directory)
+  }
+
   /**
    * Read-only removal preview for one path (the dialog's first step). Exact
    * registration against `git worktree list` is required — an unregistered
@@ -179,47 +202,63 @@ class WorktreeManager {
   }
 
   /**
-   * "Can I remove this?": a chat primed to audit the worktree's removability
-   * before anything is deleted — uncommitted/untracked/ignored work, whether
-   * its commits and branches live safely elsewhere (merged, pushed), and what
-   * must be committed, pushed or is simply safe to lose. Read-only by
-   * instruction: the chat advises, revva's confirmation gate still does the
-   * deleting. The chat sits in the main checkout (which always exists — the
-   * worktree folder may already be gone) and inspects the worktree via
-   * `git -C <worktree>` so a stale registration is auditable too.
+   * "Clean up worktrees": one chat primed to audit *and clean* every linked
+   * worktree revva can see. The agent checks each candidate for work that
+   * would be lost — uncommitted, untracked, unpushed or unmerged — and removes
+   * only what provably holds nothing, then reports what it kept and why. It
+   * works with plain `git worktree remove` (never `--force`, never `branch -D`),
+   * so git's own guard is the backstop if the check misses something; locked
+   * worktrees and revva work in a live state are off-limits and listed as such.
+   * The chat runs in a main checkout (which always exists) and reaches each
+   * worktree through `git -C`, so stale registrations are cleanable too.
    */
-  async inspect(repoDir: string, directory: string): Promise<TaskSessionResult> {
-    const repoInput = repoDir.trim()
-    const dirInput = directory.trim()
-    if (!repoInput || !dirInput) throw new Error('The check needs both a repository and a worktree path.')
-    if (!isAbsolute(repoInput) || !isAbsolute(dirInput)) throw new Error('Both paths must be absolute.')
-    let registered = false
-    try {
-      registered = (await listRegisteredWorktrees(repoInput)).some((w) => w.path === dirInput)
-    } catch (err) {
-      throw new Error(`Cannot check ${dirInput}: ${(err as Error).message}`)
-    }
-    if (!registered) {
-      throw new Error(
-        `${dirInput} is not a registered linked worktree of ${repoInput} — revva cannot check a path git has no registration for.`
-      )
-    }
-    const work = getDb().prepare('SELECT ticket_key, state FROM work WHERE worktree_dir = ?').get(dirInput) as WorkRow | undefined
-    const label = dirInput.split('/').slice(-1)[0] ?? dirInput
+  async cleanupChat(): Promise<TaskSessionResult> {
+    const worktrees = await this.list()
+    if (worktrees.length === 0) throw new Error('Nothing to clean: no linked worktrees in your known repositories.')
+
+    // The richest repo's main checkout hosts the chat: repo instructions apply
+    // there and it exists on disk, while worktree folders may already be gone.
+    const counts = new Map<string, number>()
+    for (const w of worktrees) counts.set(w.repoDir, (counts.get(w.repoDir) ?? 0) + 1)
+    const directory = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]![0]
+
+    const offLimits = worktrees.filter((w) => w.busy || w.locked)
+    const candidates = worktrees.filter((w) => !w.busy && !w.locked)
+    const listing = (list: WorktreeInfo[]): string =>
+      list
+        .map((w) => {
+          const flags = [
+            w.branch ? `branch ${w.branch}` : w.detached ? 'detached HEAD' : 'branch unknown',
+            w.prunable ? 'folder already gone (stale registration)' : null,
+            w.locked ? `locked (${w.locked})` : null,
+            w.ticketKey ? `revva work ${w.ticketKey}${w.busy ? ' — live, in progress' : ''}` : null
+          ]
+            .filter(Boolean)
+            .join(', ')
+          return `- ${w.directory} — in ${w.repoDir}${flags ? ` (${flags})` : ''}`
+        })
+        .join('\n')
+
+    const generalSelection = settingGet<{ agentID?: string; model?: { providerID: string; id: string } } | undefined>('chat.lastSelection')
     const chat = await chatManager.create({
-      directory: repoInput,
-      title: `Can I remove ${label}?`.slice(0, 80),
-      ticketKey: work?.ticket_key
+      directory,
+      title: `Clean up worktrees (${worktrees.length})`.slice(0, 80),
+      agentID: generalSelection?.agentID,
+      model: generalSelection?.model
     })
     const text = [
-      `Check whether the git worktree at ${dirInput} can be removed easily, or whether work would be lost — the user wants to delete it and asks: can I remove this worktree safely, or are we missing commits that should be committed first?`,
-      `The worktree belongs to the repository whose main checkout is ${repoInput} (run ordinary git commands there; reach the worktree itself with \`git -C ${dirInput} …\`).${work ? ` Revva tracks it as ${work.ticket_key} (state ${work.state}).` : ''} If \`git -C\` fails because the folder is already gone, say so plainly — then only the stale registration remains and nothing on disk can be lost.`,
-      'Inspect, read-only, exactly this worktree: `git -C <worktree> status --porcelain -uall --ignored`, `git -C <worktree> diff --stat` and `--cached --stat`, the branch it carries (`git -C <worktree> branch --show-current`), whether that branch is pushed and equal to its remote, and whether its commits are merged into the repository\'s main/master (or otherwise contained in another branch or an open PR — `git branch --contains`, `git log <base>..<branch> --oneline`, `gh pr list --head <branch>`). Never inspect other worktrees\' contents.',
-      'Do NOT change anything: no commits, stashes, pushes, merges, branch or worktree deletions. The user deletes through Revva\'s confirmation dialog, which re-proves the state anyway.',
-      'Finish with a short verdict, one of: (1) "Safe to remove — nothing would be lost"; (2) "Remove after saving X" — list precisely what is uncommitted, untracked (excluding pure build output/dependencies like node_modules), unpushed or unmerged, with a suggested action for each (commit+push on <branch>, merge, or discard); or (3) "Do not remove yet" with the reasons. Quantify each category (file counts, commit counts) rather than pasting diffs.'
+      `Clean up the git worktrees Revva found across your repositories. Remove the ones that hold nothing and report the rest — the user asked for a full cleanup, so do the removals yourself rather than only planning them.`,
+      `Candidates (check each before deleting):\n${listing(candidates)}`,
+      offLimits.length
+        ? `Off-limits — never touch these, they belong to work in progress or are locked:\n${listing(offLimits)}`
+        : 'No worktree is locked or tied to live revva work.',
+      'For every candidate, first prove nothing would be lost: `git -C <worktree> status --porcelain -uall --ignored`, `git -C <worktree> diff --stat` and `git -C <worktree> diff --cached --stat`; the branch it carries (`git -C <worktree> branch --show-current`), whether that branch is pushed and equal to its remote, and whether its commits are already contained elsewhere (`git -C <repo> branch --contains <sha>`, `git -C <repo> log origin/<base>..<branch> --oneline`, `gh pr list --head <branch> --state all`). A folder whose `.git` file is gone is a stale registration: `git -C <repo> worktree prune` clears it and destroys nothing.',
+      'Remove only what the check proves safe, with plain `git worktree remove <path>` — never `--force`, so git itself refuses while modified or untracked files exist. Afterwards delete its branch only with `git branch -d` (never `-D`): if git refuses because the branch is not fully merged, leave the branch and say so. Anything with uncommitted, untracked (beyond pure build output or dependencies like node_modules), unpushed or unmerged work stays exactly as it is — report what it holds and what would save it (commit and push on <branch>, merge, or an explicit discard by the user), and ask before removing such a worktree.',
+      'Never push, force-push, merge, rebase, stash, commit, rewrite history, change files, or touch a main checkout, another repository, or a worktree that is not in the list above. Work in one worktree at a time and re-run its status check immediately before deleting it.',
+      'Finish with a short report: removed (path, branch, branch kept or deleted), kept and why (file counts and commit counts, not diffs), and anything needing the user\'s decision.'
     ].join('\n\n')
     await openCodeService.api.session.prompt({ sessionID: chat.sessionId, text }).catch((err) => {
-      throw new Error(`Chat created, but the check prompt failed: ${(err as Error).message}`)
+      throw new Error(`Chat created, but the cleanup prompt failed: ${(err as Error).message}`)
     })
     return { sessionId: chat.sessionId, title: chat.title, directory: chat.directory }
   }

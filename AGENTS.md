@@ -1,5 +1,24 @@
 # revva — agent working agreement
 
+## Proportional investigation
+
+- For small, localized changes, read the relevant implementation and immediate dependencies, then make the smallest correct patch. Expand scope only to resolve a specific uncertainty or follow evidence.
+- Batch independent searches/reads when possible. Reuse results; re-read only for a specific missing detail or after a file changes.
+- Stop broad discovery once you can explain the relevant behavior and identify the change. Use directly relevant/required skills; delegate research or planning only when complexity warrants the overhead.
+- Keep all required verification and safety checks. Do not turn a small fix into unrelated cleanup.
+
+## File map (start here, not a whole-repo search)
+
+- `src/renderer/src/views/`: product screens and workflows; `Chat.tsx` renders conversations, `GitHubView.tsx` the GitHub board, `ReviewPanel.tsx` review controls, and `Setup.tsx` settings/prompt editing.
+- `src/renderer/src/components/`: shared UI; `components/ui/` contains installed shadcn primitives. `src/renderer/src/assets/index.css` holds global styles/theme tokens; see `docs/FRONTEND.md` for UI policy.
+- `src/renderer/src/lib/`: renderer utilities, including transcript streaming/cache updates in `transcript-stream.ts`.
+- `src/main/ipc.ts` → `src/preload/index.ts` → `src/shared/ipc-channels.ts` / `src/shared/types.ts`: main/renderer IPC wiring and contracts.
+- `src/main/opencode/`: service connection, ordinary sessions/prompts/transcripts (`chats.ts`), events, and throughput metrics (`throughput.ts`).
+- `src/main/pipeline/works.ts`: ticket worktrees, build prompts, follow-ups, and work-state transitions. `src/main/review.ts` owns reviewer/fixer orchestration; `src/main/ship.ts` owns shipping.
+- `src/main/github.ts`: GitHub/PR operations and PR conversations. `src/main/jira/`: Jira integration. `src/main/tasks.ts`: one-click ticket conversations.
+- `src/shared/prompts.ts`: default task prompt templates. `src/main/db/index.ts`: SQLite schema, persistence, and settings.
+- `src/main/worktrees.ts` / `src/main/worktree-safety.ts`: worktree listing, cleanup, and deletion safeguards.
+
 ## Testing policy: YOLO
 
 - **Do not write E2E tests. Write nearly no unit tests.** This project is deliberately untested by choice of the owner.

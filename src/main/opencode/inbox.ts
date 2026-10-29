@@ -14,6 +14,8 @@ import { eventBus, type RawEvent } from './bus'
 import type { PendingItem } from '@shared/types'
 import { pushToWindows } from '../push'
 import { notifyInbound } from '../notify'
+import { compactLatestAnswer } from './transcript-requests'
+import { performanceMeter } from './performance'
 
 interface InboxRow {
   session_id: string
@@ -35,8 +37,12 @@ class InboxManager extends EventEmitter {
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
     eventBus.on('stream:reconnect', () => void this.resync())
     openCodeService.onStatus((s) => {
-      if (s.state === 'connected') void this.resync()
+      if (s.state !== 'connected') {
+        this.recovery?.abort()
+        this.clearPreviews()
+      }
     })
+    if (eventBus.established && openCodeService.connected) void this.resync()
   }
 
   list(): PendingItem[] {
@@ -74,25 +80,44 @@ class InboxManager extends EventEmitter {
   private resyncing = false
   private resyncAgain = false
   private revision = 0
-  async resync(): Promise<void> {
+  private recovery: AbortController | undefined
+  private recoveredGeneration = -1
+  private scanningGeneration = -1
+  async resync(force = false): Promise<void> {
     if (!openCodeService.connected) return
+    const generation = eventBus.generation
     if (this.resyncing) {
-      this.resyncAgain = true
+      if (generation !== this.scanningGeneration || force) {
+        this.resyncAgain = true
+        if (generation !== this.scanningGeneration) this.recovery?.abort()
+      }
       return
     }
+    if (!force && generation === this.recoveredGeneration) return
     this.resyncing = true
+    this.scanningGeneration = generation
+    const controller = new AbortController()
+    this.recovery = controller
+    if (generation !== this.recoveredGeneration) this.clearPreviews()
+    performanceMeter.add('inbox.scans')
     try {
       const revision = this.revision
       const sessionIds = this.knownSessions()
+      const active = await performanceMeter.request('inbox.active', () => openCodeService.api.session.active({ signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]) })).catch(() => ({}))
+      const blocked = new Set([...this.pending.values()].map((item) => item.sessionID))
+      sessionIds.sort((a, b) => Number(b in active || blocked.has(b)) - Number(a in active || blocked.has(a)))
       const fresh = new Map<string, PendingItem>()
-      // Sessions are independent; per-session the two list calls are too.
-      await Promise.allSettled(
-        sessionIds.map(async (sessionID) => {
+      // Four workers, two independent calls each: at most eight recovery calls.
+      let next = 0
+      await Promise.allSettled(Array.from({ length: Math.min(4, sessionIds.length) }, async () => {
+        while (next < sessionIds.length && !controller.signal.aborted) {
+          const sessionID = sessionIds[next++]!
           const dir = this.directoryOf(sessionID)
           const owner = this.ownerLabel(sessionID)
+          const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)])
           const [forms, perms] = await Promise.allSettled([
-            openCodeService.api.session.form.list({ sessionID }),
-            openCodeService.api.permission.list({ sessionID })
+            performanceMeter.request('inbox.forms', () => openCodeService.api.session.form.list({ sessionID }, { signal })),
+            performanceMeter.request('inbox.permissions', () => openCodeService.api.permission.list({ sessionID }, { signal }))
           ])
           // A rejected list means the session is gone/unreadable — skip it (as the old per-call catch did).
           if (forms.status === 'fulfilled') {
@@ -131,15 +156,17 @@ class InboxManager extends EventEmitter {
           } else {
             for (const [key, item] of this.pending) if (item.sessionID === sessionID && item.kind === 'permission') fresh.set(key, item)
           }
-        })
-      )
+        }
+      }))
+      if (controller.signal.aborted || generation !== eventBus.generation) return
       if (revision !== this.revision) {
         this.resyncAgain = true
         return
       }
       for (const [key, item] of fresh) if (!this.isKnown(item.sessionID)) fresh.delete(key)
       this.pending = fresh
-      this.push()
+      this.recoveredGeneration = generation
+      this.push(false)
       // Preview tails are fetched after the snapshot is up (resync runs on every
       // connect; message.list per session would slow the initial paint otherwise).
       for (const [key, item] of fresh) this.attachLastMessage(key, item.sessionID)
@@ -147,7 +174,7 @@ class InboxManager extends EventEmitter {
       this.resyncing = false
       if (this.resyncAgain) {
         this.resyncAgain = false
-        void this.resync()
+        void this.resync(true)
       }
     }
   }
@@ -191,20 +218,11 @@ class InboxManager extends EventEmitter {
    * Tail of the agent's last assistant message, so an inbox card says what the
    * agent was doing when it blocked — without opening the chat. Best-effort.
    */
-  private async lastMessage(sessionID: string): Promise<string | undefined> {
+  private async lastMessage(sessionID: string, signal: AbortSignal): Promise<string | undefined> {
     try {
-      const res = await openCodeService.api.message.list({ sessionID, order: 'desc', limit: 20 })
-      for (const m of res.data) {
-        if (m.type !== 'assistant') continue
-        let text = ''
-        for (const part of m.content ?? []) {
-          const p = part as Record<string, unknown>
-          if (p.type === 'text' && typeof p.text === 'string') text += p.text
-        }
-        const clean = text.trim().replace(/\s+/g, ' ')
-        if (!clean) continue
-        return clean.length > 280 ? `…${clean.slice(-280)}` : clean
-      }
+      const text = await compactLatestAnswer(sessionID, this.previewGeneration, signal)
+      const clean = text?.trim().replace(/\s+/g, ' ')
+      return clean ? clean.length > 280 ? `…${clean.slice(-280)}` : clean : undefined
     } catch {
       /* transcript unavailable — card renders without the preview */
     }
@@ -213,6 +231,10 @@ class InboxManager extends EventEmitter {
 
   private onEvent(e: RawEvent): void {
     const data = (e.data ?? {}) as Record<string, unknown>
+    if (['session.execution.started', 'session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted', 'session.revert.committed', 'session.revert.cleared', 'session.compaction.ended', 'session.message.content.updated'].includes(e.type) && typeof data.sessionID === 'string') {
+      this.previews.get(data.sessionID)?.controller.abort()
+      this.previews.delete(data.sessionID)
+    }
     switch (e.type) {
       case 'form.created': {
         const form = data.form as { id: string; sessionID: string; title: string; fields?: unknown[] } | undefined
@@ -268,12 +290,32 @@ class InboxManager extends EventEmitter {
   }
 
   /** Async tail-fetch after the item is already shown; pushes an updated snapshot. */
+  private previews = new Map<string, { controller: AbortController; promise: Promise<string | undefined> }>()
+  private previewGeneration = 0
+  private clearPreviews(): void {
+    this.previewGeneration++
+    for (const entry of this.previews.values()) entry.controller.abort()
+    this.previews.clear()
+  }
   private attachLastMessage(key: string, sessionID: string): void {
-    void this.lastMessage(sessionID).then((text) => {
+    let entry = this.previews.get(sessionID)
+    if (!entry) {
+      const controller = new AbortController()
+      entry = { controller, promise: this.lastMessage(sessionID, controller.signal) }
+      this.previews.set(sessionID, entry)
+      while (this.previews.size > 128) {
+        const oldest = this.previews.keys().next().value!
+        this.previews.get(oldest)?.controller.abort()
+        this.previews.delete(oldest)
+      }
+    }
+    const current = entry
+    void current.promise.then((text) => {
+      if (this.previews.get(sessionID) !== current || current.controller.signal.aborted) return
       const item = this.pending.get(key)
-      if (!item || !text) return
+      if (!item || item.sessionID !== sessionID || !text || item.lastMessage === text) return
       item.lastMessage = text
-      this.push()
+      this.push(false)
     })
   }
 
@@ -305,8 +347,8 @@ class InboxManager extends EventEmitter {
     )
   }
 
-  private push(): void {
-    this.revision++
+  private push(stateChanged = true): void {
+    if (stateChanged) this.revision++
     this.emit('changed')
     pushToWindows({ kind: 'inbox', items: this.list() })
   }

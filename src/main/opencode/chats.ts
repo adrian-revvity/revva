@@ -18,10 +18,33 @@ import { parsePrRef, repoFromGitRemote, resolvePrRef } from '@shared/pr-ref'
 import { ticketKeyFromText } from '@shared/ticket-key'
 import { IPC, type ChatCreateInput, type ChatMessage, type ChatSummary, type PromptImage, type PromptRefs, type PushEvent, type QueuedMessage, type TranscriptPage } from '@shared/types'
 import { fileAttachments, skillAttachments } from './prompt-refs'
+import { skillGuardRules } from './skill-guard'
 import { pushToWindows } from '../push'
 import { notifyInbound } from '../notify'
 import { isConflict, promptImageFiles } from '../util'
 import { workManager } from '../pipeline/works'
+import { performanceMeter } from './performance'
+
+/** Cache prefixes supplement incomplete native drafts, never completed history. */
+function mergePrefixes(history: ChatMessage[], prefixes: ChatMessage[]): ChatMessage[] {
+  const rows = new Map(history.map((message) => [message.id, message]))
+  const grow = (saved: string, prefix: string): string => prefix.startsWith(saved) ? prefix : saved
+  for (const prefix of prefixes) {
+    const saved = rows.get(prefix.id)
+    if (!saved) { rows.set(prefix.id, prefix); continue }
+    const text = grow(saved.text, prefix.text)
+    const thinking = grow(saved.thinking ?? '', prefix.thinking ?? '')
+    const tools = new Map(saved.tools?.map((tool) => [tool.id, tool]))
+    for (const tool of prefix.tools ?? []) {
+      const previous = tools.get(tool.id)
+      if (previous?.state === 'completed' || previous?.state === 'error') continue
+      if (previous?.state === 'running' && tool.state === 'streaming') continue
+      tools.set(tool.id, { ...previous, ...tool, name: tool.name === 'tool' ? previous?.name ?? tool.name : tool.name, detail: tool.detail ?? previous?.detail, output: tool.output ?? previous?.output })
+    }
+    rows.set(saved.id, { ...saved, text, thinking: thinking || undefined, tools: tools.size ? [...tools.values()] : undefined, streamLengths: { text: text.length, thinking: thinking.length } })
+  }
+  return [...rows.values()].sort((a, b) => a.createdAt - b.createdAt).slice(-200)
+}
 
 const exec = promisify(execFile)
 
@@ -83,7 +106,8 @@ function summarizeToolPart(p: Record<string, unknown>): NonNullable<ChatMessage[
     state: (['streaming', 'running', 'completed', 'error'] as const).includes(status as never)
       ? (status as 'streaming' | 'running' | 'completed' | 'error')
       : 'running',
-    detail: truncate(detail),
+    detail: status === 'streaming' && typeof input === 'string' ? input.slice(0, 2000) : truncate(detail),
+    inputLength: status === 'streaming' && typeof input === 'string' ? input.length : undefined,
     output: truncate(output)
   }
 }
@@ -165,20 +189,35 @@ class ChatManager {
     // OpenCode auto-titles from the first message and we adopt it via session.renamed.
     const custom = input.title?.trim()
     const title = custom || AUTO_TITLE
+    const guard = await skillGuardRules(input.directory)
     const session = await api.session.create({
       ...(custom ? { title: custom } : {}),
       agent: input.agentID ?? null,
       model: input.model ? { providerID: input.model.providerID, id: input.model.id } : null,
       location: { directory: input.directory },
+      ...(guard.length ? { permissions: guard } : {}),
       metadata: { revva: { kind: 'chat', ticketKey: input.ticketKey ?? null, prUrl: prUrl ?? null } }
     })
     const now = Date.now()
+    // Context (ticket/PR brief) should never appear as chat noise. Preferred path:
+    // an instruction entry — the service injects it on every turn and the empty
+    // session's transcript stays clean (verified: no transcript message on first send).
+    // Older services without the endpoint fall back to prepending it to the first message.
+    let context = input.context?.trim() || null
+    if (context) {
+      try {
+        await api.session.instructions.entry.put({ sessionID: session.id, key: 'revva.context', value: context })
+        context = null
+      } catch {
+        /* pre-instructions service — keep the stored-context fold */
+      }
+    }
     getDb()
       .prepare(
-        `INSERT INTO chat(session_id, title, directory, agent_id, provider_id, model_id, ticket_key, pr_url, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?)`
+        `INSERT INTO chat(session_id, title, directory, agent_id, provider_id, model_id, ticket_key, pr_url, context, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?)`
       )
-      .run(session.id, title, input.directory, input.agentID ?? null, input.model?.providerID ?? null, input.model?.id ?? null, input.ticketKey ?? null, prUrl ?? null, now, now)
+      .run(session.id, title, input.directory, input.agentID ?? null, input.model?.providerID ?? null, input.model?.id ?? null, input.ticketKey ?? null, prUrl ?? null, context, now, now)
     sessionIndex.register(session.id, 'chat')
     return {
       sessionId: session.id,
@@ -256,22 +295,28 @@ class ChatManager {
     }
   }
 
-  async messages(sessionId: string, since?: string): Promise<TranscriptPage> {
+  async messages(sessionId: string, since?: string, signal?: AbortSignal): Promise<TranscriptPage> {
     const api = openCodeService.api
     // First load is the newest 200. Refreshes fetch pages of 20 until the
     // overlap row; never silently skip steps when a run advances between polls.
-    const res = await api.message.list({ sessionID: sessionId, order: 'desc', limit: since ? 20 : 200 })
+    const res = await performanceMeter.request('history', () => api.message.list({ sessionID: sessionId, order: 'desc', limit: since ? 20 : 200 }, { signal }))
     const rows = [...res.data]
     let cursor = res.cursor.next
     const seen = new Set<string>()
     while (since && !rows.some((m) => m.id === since) && cursor && rows.length < 200 && !seen.has(cursor)) {
       seen.add(cursor)
-      const page = await api.message.list({ sessionID: sessionId, cursor, limit: Math.min(20, 200 - rows.length) })
+      const nextCursor = cursor
+      const page = await performanceMeter.request('history', () => api.message.list({ sessionID: sessionId, cursor: nextCursor, limit: Math.min(20, 200 - rows.length) }, { signal }))
       rows.push(...page.data)
       cursor = page.cursor.next
     }
     const overlap = since ? rows.findIndex((m) => m.id === since) : -1
     const reset = !since || overlap < 0
+    const authoritative = new Set<string>()
+    for (const message of rows) if (message.type === 'assistant' && message.time.completed !== undefined) {
+      streamBuffer.persisted(sessionId, message.id)
+      authoritative.add(message.id)
+    }
     const selected = reset ? rows : rows.slice(0, overlap + 1)
     const out: ChatMessage[] = []
     for (const m of selected.reverse()) {
@@ -296,16 +341,20 @@ class ChatManager {
         const msg: ChatMessage = {
           id: m.id,
           role: 'assistant',
-          text: text.trim(),
+          text,
           tools: tools.length ? tools : undefined,
-          thinking: thinking.trim() || undefined,
+          thinking: thinking || undefined,
+          streamLengths: { text: text.length, thinking: thinking.length },
           createdAt: m.time?.created ?? 0
         }
-        if (!msg.text && !msg.tools && !msg.thinking) continue
+        if (!msg.text.trim() && !msg.tools && !msg.thinking?.trim()) continue
         out.push(msg)
       }
     }
-    return { messages: out, reset }
+    // Read the cache after HTTP finishes: buffered IPC overlaps this exact prefix
+    // by numeric offsets. Ordinary tail/heartbeat fetches do not resend it.
+    const messages = reset ? mergePrefixes(out, streamBuffer.snapshot(sessionId)) : out
+    return { messages, reset, missingPrefixes: streamBuffer.missingPrefixes(sessionId, messages, authoritative) }
   }
 
   /** Messages waiting in OpenCode's inbox (queued follow-ups). */
@@ -337,8 +386,14 @@ class ChatManager {
     await openCodeService.api.session.inbox.update({ sessionID: sessionId, inboxID: inboxId, delivery: 'steer' })
   }
 
-  async prompt(sessionId: string, text: string, images: PromptImage[] = [], queued = false, refs?: PromptRefs): Promise<void> {
-    const chat = getDb().prepare('SELECT ticket_key, pr_url FROM chat WHERE session_id = ?').get(sessionId) as { ticket_key: string | null; pr_url: string | null } | undefined
+  async prompt(sessionId: string, text: string, images: PromptImage[] = [], queued = false, refs?: PromptRefs): Promise<void | 'queued'> {
+    const chat = getDb().prepare('SELECT ticket_key, pr_url, context FROM chat WHERE session_id = ?').get(sessionId) as { ticket_key: string | null; pr_url: string | null; context: string | null } | undefined
+    // A ticket/PR chat opens empty; its context rides the first real message only.
+    // Cleared before delivery: a failed send keeps the folded text in the user's draft retry, never a double prefix.
+    if (chat?.context) {
+      text = `${chat.context}\n\n${text}`
+      getDb().prepare('UPDATE chat SET context = NULL WHERE session_id = ?').run(sessionId)
+    }
     // Jira and PR links enable the SAME utilities on the SAME conversation.
     if (chat?.ticket_key || chat?.pr_url || workManager.forSession(sessionId)) {
       await workManager.conversationContext(sessionId)
@@ -422,15 +477,6 @@ class ChatManager {
         if (!row || row.title !== AUTO_TITLE) break
         getDb().prepare('UPDATE chat SET title = ? WHERE session_id = ?').run(title.slice(0, 100), sessionId)
         pushToWindows({ kind: 'chat.renamed', sessionId, title: title.slice(0, 100) })
-        break
-      }
-      case 'session.text.delta': {
-        streamBuffer.push({
-          kind: 'chat.delta',
-          sessionId,
-          messageId: String(data.assistantMessageID ?? ''),
-          text: typeof data.delta === 'string' ? data.delta : ''
-        })
         break
       }
       case 'session.execution.succeeded':

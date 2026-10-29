@@ -8,6 +8,7 @@
  */
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import { AlertTriangle, ChevronDown, ExternalLink, FilePenLine, GitMerge, Github, Layers, Rocket, ScanEye, Undo2, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -120,10 +121,17 @@ export function PrMenu({
         refreshPr()
         onOpenChat?.(res.sessionId)
       })
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        setError(msg)
+        toast.error(kind === 'review' ? 'Could not start the review session' : 'Could not start conflict solving', {
+          description: msg
+        })
+      })
       .finally(() => setBusy(null))
   }
-  const run = (label: string, action: () => Promise<unknown>): void => {
+  const prLabel = (): string => (pr.data ? `${pr.data.repo}#${pr.data.number}` : 'PR')
+  const run = (label: string, action: () => Promise<unknown>, ok?: () => string): void => {
     setBusy(label)
     setError(null)
     setDone(null)
@@ -133,14 +141,22 @@ export function PrMenu({
         refreshPr()
         void qc.invalidateQueries({ queryKey: ['gh-pr-stack', prUrl] })
         if (work) void qc.invalidateQueries({ queryKey: ['reviews', work.id] })
+        // String results (e.g. the description request) carry their own message.
+        toast.success(typeof res === 'string' ? res : (ok?.() ?? 'Done'))
       })
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        setError(msg)
+        // The menu closes on selection — the toast is what the user actually sees.
+        toast.error(`${label[0]!.toUpperCase()}${label.slice(1)} failed`, { description: msg })
+      })
       .finally(() => setBusy(null))
   }
   const data = pr.data
   const gate = data ? prGate(data) : undefined
-  const merge = (method: PrMergeMethod): void => run('merge', () => window.revva.github.merge(prUrl, method))
-  const canRerunReview = !!work && (work.state === 'APPROVED' || work.state === 'WAITING_HUMAN')
+  const merge = (method: PrMergeMethod): void =>
+    run('merge', () => window.revva.github.merge(prUrl, method), () => `${prLabel()} merged (${method}) — branch deleted`)
+  const canRerunReview = !!work && ['READY', 'APPROVED', 'WAITING_HUMAN'].includes(work.state)
   const shipReason = work ? shipBlockReason(work) : undefined
   return (
     <>
@@ -183,7 +199,7 @@ export function PrMenu({
                 <DropdownMenuItem
                   disabled={!gate?.open || !gate.behind || busy !== null}
                   title={!gate?.behind ? 'Only needed when the branch is behind its base' : undefined}
-                  onSelect={() => run('rebase', () => window.revva.github.rebase(prUrl))}
+                  onSelect={() => run('rebase', () => window.revva.github.rebase(prUrl), () => `${prLabel()} rebased onto ${data.baseRefName}`)}
                 >
                   <Undo2 /> {busy === 'rebase' ? 'Rebasing…' : 'Rebase onto base'}
                 </DropdownMenuItem>
@@ -202,7 +218,7 @@ export function PrMenu({
                 <DropdownMenuItem
                   disabled={!directory || !gate?.open || busy !== null}
                   title={!directory ? 'Only for chats whose worktree holds the commits to push (conflict-resolution sessions)' : 'Push this conversation’s worktree commits to the PR head branch'}
-                  onSelect={() => run('push', () => window.revva.github.push(prUrl, directory!))}
+                  onSelect={() => run('push', () => window.revva.github.push(prUrl, directory!), () => `Commits pushed to ${prLabel()}`)}
                 >
                   <Upload /> {busy === 'push' ? 'Pushing…' : 'Push commits from this chat'}
                 </DropdownMenuItem>
@@ -219,9 +235,9 @@ export function PrMenu({
                   <DropdownMenuItem
                     disabled={busy !== null}
                     title="Start a fresh review round for this ticket"
-                    onSelect={() => run('reviewRound', () => window.revva.work.reviewStart(work.id))}
+                    onSelect={() => run('reviewRound', () => window.revva.work.reviewStart(work.id), () => 'Review round started')}
                   >
-                    <ScanEye /> {busy === 'reviewRound' ? 'Starting review…' : 'Re-run review'}
+                    <ScanEye /> {busy === 'reviewRound' ? 'Starting reviews…' : 'Re-run all reviews'}
                   </DropdownMenuItem>
                 )}
               </DropdownMenuGroup>
@@ -288,7 +304,7 @@ export function PrConversationActions({
   onOpenChat?: (sessionId: string) => void
   onAskAgent: (text: string) => Promise<void>
 }): React.JSX.Element | null {
-  const canReview = !!work && (work.state === 'APPROVED' || work.state === 'WAITING_HUMAN')
+  const canReview = !!work && ['READY', 'APPROVED', 'WAITING_HUMAN'].includes(work.state)
   if (!prUrl && !canReview) return null
   return (
     <>

@@ -15,6 +15,12 @@ const buttonVariants = cva(
           "border bg-background shadow-xs hover:bg-accent hover:text-accent-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50",
         secondary:
           "bg-secondary text-secondary-foreground hover:bg-secondary/80",
+        info:
+          "border border-status-info/25 bg-status-info/5 text-status-info hover:bg-status-info/10 focus-visible:border-status-info focus-visible:ring-status-info/25",
+        warning:
+          "border border-status-warning/25 bg-status-warning/5 text-status-warning hover:bg-status-warning/10 focus-visible:border-status-warning focus-visible:ring-status-warning/25",
+        success:
+          "border border-status-success/25 bg-status-success/5 text-status-success hover:bg-status-success/10 focus-visible:border-status-success focus-visible:ring-status-success/25",
         ghost:
           "hover:bg-accent hover:text-accent-foreground dark:hover:bg-accent/50",
         link: "text-primary underline-offset-4 hover:underline",

@@ -15,6 +15,7 @@ import { streamBuffer } from '../opencode/stream-buffer'
 import { pushToWindows } from '../push'
 import { collectAdfText, fetchLastAssistantText } from '../util'
 import { openCodeService, describeError } from '../opencode/service'
+import { skillGuardRules } from '../opencode/skill-guard'
 import { eventBus, type RawEvent } from '../opencode/bus'
 import { shipManager } from '../ship'
 import { workManager } from '../pipeline/works'
@@ -154,9 +155,11 @@ class CommentWatcher {
     if (this.reworking.size > 0 && [...this.reworking.values()].includes(workId)) throw new Error('Already reworking.')
 
     const api = openCodeService.api
+    const guard = await skillGuardRules(work.worktree_dir)
     const session = await api.session.create({
       title: `${work.ticket_key} · rework (${pending.length} comment(s))`,
       location: { directory: work.worktree_dir },
+      ...(guard.length ? { permissions: guard } : {}),
       metadata: { revva: { kind: 'rework', workId } }
     })
     this.reworking.set(session.id, workId)

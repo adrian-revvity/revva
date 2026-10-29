@@ -16,6 +16,7 @@ import { jiraMcp } from './jira/mcp'
 import { commentWatcher } from './jira/watch'
 import { sessionIndex } from './opencode/session-index'
 import { throughputMeter } from './opencode/throughput'
+import { wireSessionMetrics } from './opencode/session-metrics'
 import { handleTranscriptImages, registerImageScheme } from './opencode/transcript-images'
 
 registerImageScheme()
@@ -65,6 +66,7 @@ app.whenReady().then(() => {
   eventBus.start()
   chatManager.wire()
   throughputMeter.wire()
+  wireSessionMetrics()
   workManager.wire()
   inboxManager.wire()
   reviewManager.wire()

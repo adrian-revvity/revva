@@ -5,7 +5,13 @@
  */
 import { BrowserWindow } from 'electron'
 import { IPC, type PushEvent } from '@shared/types'
+import { transcriptSubscriptions } from './opencode/transcript-subscriptions'
 
 export function pushToWindows(event: PushEvent): void {
-  for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IPC.eventPush, event)
+  const detail = event.kind === 'chat.delta' || event.kind === 'work.delta' || event.kind === 'review.delta' || event.kind === 'chat.message' || event.kind === 'chat.tool'
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.webContents.isDestroyed()) continue
+    if (detail && (!win.isVisible() || win.isMinimized() || !transcriptSubscriptions.receives(win.webContents.id, event.sessionId))) continue
+    win.webContents.send(IPC.eventPush, event)
+  }
 }

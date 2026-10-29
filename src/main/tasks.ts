@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import { chatManager } from './opencode/chats'
 import { getDb, settingGet } from './db'
 import { getTicket } from './jira/board'
+import { collectAdfText } from './util'
 import { renderPrompt, DEFAULT_TACKLE_PROMPT } from '@shared/prompts'
 import type { TaskSessionResult } from '@shared/types'
 
@@ -31,17 +32,28 @@ export async function startTicketSession(ticketKey: string, repoDir?: string): P
   const dir = repoDir ? expandTilde(repoDir) : inferRepoDir(ticketKey)
   if (!dir) throw new Error('No repo known for this ticket — add a workspace folder in Setup or pick one.')
   const ticket = await getTicket(ticketKey)
+  // The chat opens empty. The tackle prompt (Setup-tunable) becomes the chat's
+  // stored context and rides along on the user's FIRST message.
+  const template = settingGet<string>('prompt.tackle') || DEFAULT_TACKLE_PROMPT
+  const context = renderPrompt(template, {
+    ticketKey,
+    summary: ticket?.summary ?? '',
+    description: extractDescription(ticket?.raw) || '(No ticket description.)'
+  })
   const chat = await chatManager.create({
     directory: dir,
     title: `${ticketKey} session`,
-    ticketKey
-  })
-  const template = settingGet<string>('prompt.tackle') || DEFAULT_TACKLE_PROMPT
-  const text = renderPrompt(template, {
     ticketKey,
-    summary: ticket?.summary ?? '',
-    description: ''
+    context
   })
-  await chatManager.prompt(chat.sessionId, text)
   return { sessionId: chat.sessionId, title: chat.title, directory: dir }
+}
+
+/** Ticket description as plain text (string or ADF), so the chat opens with the ticket in context. */
+function extractDescription(raw: unknown): string {
+  const fields = (raw as { fields?: Record<string, unknown> })?.fields
+  const d = fields?.description
+  if (typeof d === 'string') return d
+  if (d && typeof d === 'object') return collectAdfText(d).join('\n')
+  return ''
 }

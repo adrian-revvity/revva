@@ -11,6 +11,7 @@
  */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { realpath } from 'node:fs/promises'
 import { BrowserWindow } from 'electron'
 import { openCodeService, describeError } from './opencode/service'
 import { eventBus, type RawEvent } from './opencode/bus'
@@ -19,7 +20,9 @@ import { sessionIndex } from './opencode/session-index'
 import { streamBuffer } from './opencode/stream-buffer'
 import { pushToWindows } from './push'
 import { fetchLastAssistantText } from './util'
+import { latestAssistantText } from './opencode/transcript-requests'
 import { listSkills } from './opencode/inventory'
+import { skillGuardRules } from './opencode/skill-guard'
 import { getDb, roleConfigGet, settingGet } from './db'
 import { workManager } from './pipeline/works'
 import { shipManager } from './ship'
@@ -36,6 +39,7 @@ const exec = promisify(execFile)
 
 /** Watchdog: a reviewer/fixer session stuck this long is errored out. */
 const SESSION_TIMEOUT_MS = 20 * 60_000
+const LEGACY_RESTART_ERROR = 'revva restarted while this review was running'
 
 interface ReviewDbRow {
   id: number
@@ -99,6 +103,7 @@ interface TrackedSession {
   timer?: NodeJS.Timeout
   remainingMs: number
   deadline: number
+  tools?: Map<string, { name: string; detail?: string }>
 }
 
 interface ReviewScope {
@@ -113,6 +118,13 @@ function latestAttempts(rows: ReviewRow[]): ReviewRow[] {
   return [...latest.values()]
 }
 
+/** A reviewer retry reopens fan-in; an older fixer must not suppress that retry. */
+function currentFixer(rows: ReviewRow[]): ReviewRow | undefined {
+  const fixer = rows.find((row) => row.role === 'fixer')
+  const newestReviewer = Math.max(0, ...rows.filter((row) => row.role !== 'fixer').map((row) => row.id))
+  return fixer && fixer.id > newestReviewer ? fixer : undefined
+}
+
 class ReviewManager {
   private wired = false
   private sessions = new Map<string, TrackedSession>()
@@ -121,20 +133,129 @@ class ReviewManager {
   private stopping = new Set<string>()
   /** Fan-in guard: a round is decided exactly once. */
   private settledRounds = new Set<string>()
+  private activity = new Map<number, { activity: string; lastActivityAt: number }>()
+  private activityWork = new Map<string, number>()
+  private activityTimer?: NodeJS.Timeout
+  private recovering = new Set<string>()
+  private recovery?: Promise<void>
+  private recoverAgain = false
+  private recoverAfterStart = new Set<string>()
 
   wire(): void {
     if (this.wired) return
     this.wired = true
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
     inboxManager.on('changed', () => this.syncWatchdogs())
-    // Sessions cannot survive an app restart: mark anything still 'running' as errored.
-    const stale = getDb().prepare("SELECT * FROM review WHERE status IN ('pending','running')").all() as ReviewDbRow[]
-    for (const r of stale) {
-      this.update(r.id, 'error', undefined, 'revva restarted while this review was running')
-    }
+    // OpenCode owns executions: closing Revva does NOT stop them. Keep their
+    // persisted status until the service can tell us what actually happened.
     const interrupted = getDb().prepare("SELECT id FROM work WHERE state IN ('REVIEW', 'FIXING')").all() as Array<{ id: string }>
-    for (const work of interrupted) {
-      workManager.setReviewState(work.id, 'WAITING_HUMAN', 'Revva restarted during review. Re-run review to continue.')
+    for (const work of interrupted) this.recovering.add(work.id)
+    eventBus.on('stream:reconnect', () => void this.recover())
+    openCodeService.onStatus((status) => {
+      if (status.state === 'connected') void this.recover()
+    })
+    if (openCodeService.connected) void this.recover()
+  }
+
+  /** Reattach without repeating a session's prompt; finished runs use normal fan-in. */
+  private async recover(): Promise<void> {
+    if (this.recovery) {
+      this.recoverAgain = true
+      return this.recovery
+    }
+    if (!openCodeService.connected) return
+    this.recovery = this.recoverSessions().catch((err) => console.warn('[review] reconnect failed:', describeError(err)))
+    try { await this.recovery } finally {
+      this.recovery = undefined
+      if (this.recoverAgain) {
+        this.recoverAgain = false
+        void this.recover()
+      }
+    }
+  }
+
+  private async recoverSessions(): Promise<void> {
+    const db = getDb()
+    const works = db.prepare(`SELECT DISTINCT w.id, w.state FROM work w
+      LEFT JOIN review r ON r.work_id = w.id
+      WHERE w.state NOT IN ('ABANDONED','SHIPPED','BUILDING')
+        AND (w.state IN ('REVIEW','FIXING') OR r.status IN ('pending','running') OR r.error = ?)`)
+      .all(LEGACY_RESTART_ERROR) as Array<{ id: string; state: string }>
+    const eligible = works.filter((work) => !this.starting.has(work.id) && !this.stopping.has(work.id))
+    for (const work of works) {
+      if (this.starting.has(work.id) && this.reviewsFor(work.id).some((row) => row.status === 'pending' || row.status === 'running')) this.recoverAfterStart.add(work.id)
+    }
+    for (const work of eligible) this.recovering.add(work.id)
+    // Fail closed while offline, without inventing a failure for a live session.
+    await openCodeService.api.session.active()
+    const restored: ReviewRow[] = []
+    for (const work of eligible) {
+      const round = this.latestRound(work.id)
+      const rows = latestAttempts(this.reviewsFor(work.id).filter((row) => row.round === round))
+      // A fixer row proves fan-in already happened; do not dispatch a second one.
+      if (currentFixer(rows)) this.settledRounds.add(`${work.id}:${round}`)
+      for (const row of rows) {
+        if (!['pending', 'running'].includes(row.status) && row.error !== LEGACY_RESTART_ERROR) continue
+        if (!['sol', 'testAudit', 'impeccable', 'fixer'].includes(row.role)) continue
+        if (!row.sessionId) {
+          this.update(row.id, 'error', undefined, 'Review session was not created before disconnection. Retry this agent.')
+          continue
+        }
+        if (!this.sessions.has(row.sessionId)) {
+          db.prepare("UPDATE review SET status = 'running', error = NULL, updated_at = ? WHERE id = ?").run(Date.now(), row.id)
+          this.trackSession(row.sessionId, { workId: work.id, round, role: row.role as ReviewRole | 'fixer', reviewId: row.id, remainingMs: SESSION_TIMEOUT_MS, deadline: 0 })
+          this.activity.set(row.id, { activity: 'Reconnecting to OpenCode…', lastActivityAt: Date.now() })
+        }
+        restored.push(row)
+      }
+      const running = [...this.sessions.values()].filter((tracked) => tracked.workId === work.id)
+      if (running.length) workManager.setReviewState(work.id, running.some((tracked) => tracked.role === 'fixer') ? 'FIXING' : 'REVIEW', null)
+      this.recovering.delete(work.id)
+      this.push(work.id, round)
+    }
+    // Register first, then probe: events after this point are observed even if
+    // execution ends while we fetch this second authoritative snapshot.
+    const active = await openCodeService.api.session.active()
+    for (const row of restored) {
+      const sessionId = row.sessionId!
+      if (sessionId in active || !this.sessions.has(sessionId)) continue
+      const messages = await openCodeService.api.message.list({ sessionID: sessionId, order: 'desc', limit: 200 }).catch((err) => {
+        if ((err as { _tag?: string })._tag === 'SessionNotFoundError') return undefined
+        throw err // unreachable is unknown, not proof of failure
+      })
+      if (!messages) {
+        await this.settle(sessionId, 'error', undefined, 'The agent session no longer exists. Retry the reviewer or relaunch the fixer; files are kept.')
+        continue
+      }
+      const idle = messages.data.find((message) => message.type === 'idle')
+      if (idle?.type === 'idle' && idle.time.created >= row.createdAt) {
+        await this.settle(sessionId, idle.outcome === 'succeeded' ? undefined : 'error', undefined,
+          idle.outcome === 'succeeded' ? undefined : idle.outcome === 'failed'
+            ? describeError(idle.error ?? 'Agent failed while Revva was disconnected.')
+            : 'Agent was interrupted. Retry the reviewer or resume the fixer.')
+      } else {
+        const inbox = await openCodeService.api.session.inbox.list({ sessionID: sessionId })
+        if (inbox.length || Date.now() - row.updatedAt < 5000) continue
+        await this.settle(sessionId, 'error', undefined, 'Agent is idle without a completed execution. Retry the reviewer or resume the fixer; partial work is kept.')
+      }
+    }
+    for (const work of eligible) {
+      if (this.isBusyReviewing(work.id)) continue
+      const current = db.prepare('SELECT state FROM work WHERE id = ?').get(work.id) as { state: string } | undefined
+      if (!current || !['REVIEW', 'FIXING'].includes(current.state)) continue
+      const round = this.latestRound(work.id)
+      const rows = latestAttempts(this.reviewsFor(work.id).filter((row) => row.round === round))
+      const fixer = currentFixer(rows)
+      if (fixer?.status === 'approved') {
+        workManager.setReviewState(work.id, 'REVIEW')
+        await this.startRound(work.id, round + 1).catch((err) => workManager.setReviewState(work.id, 'WAITING_HUMAN', `Could not continue review: ${describeError(err)}`))
+      } else if (fixer) {
+        workManager.setReviewState(work.id, 'WAITING_HUMAN', fixer.error ?? 'Fixer stopped. Resume it to continue from the existing work.')
+      } else if (rows.length) {
+        await this.settleRoundIfDone(work.id, round)
+      } else {
+        workManager.setReviewState(work.id, 'WAITING_HUMAN', 'No review sessions were started. Re-run review when ready.')
+      }
     }
   }
 
@@ -142,7 +263,7 @@ class ReviewManager {
     const rows = getDb()
       .prepare('SELECT * FROM review WHERE work_id = ? ORDER BY round ASC, id ASC')
       .all(workId) as ReviewDbRow[]
-    return rows.map(toRow)
+    return rows.map((row) => ({ ...toRow(row), ...this.activity.get(row.id) }))
   }
 
   latestRound(workId: string): number {
@@ -158,6 +279,7 @@ class ReviewManager {
       | { id: string; ticket_key: string; branch: string; worktree_dir: string; parent_work_id: string | null; mode: string; review_sel: string | null }
       | undefined
     if (!work) throw new Error('Work not found.')
+    if (workManager.isPrompting(workId) || workManager.hasFollowUps(workId)) throw new Error('Send or remove saved follow-ups and wait for implementation to finish before reviewing.')
     if (this.isBusyReviewing(workId)) throw new Error('A review round is already in flight for this work.')
     if (shipManager.isShipping(workId)) throw new Error('Shipping is in progress.')
     const state = (getDb().prepare('SELECT state FROM work WHERE id = ?').get(workId) as { state: string }).state
@@ -234,17 +356,21 @@ class ReviewManager {
       throw err
     } finally {
       this.starting.delete(workId)
+      if (this.recoverAfterStart.delete(workId)) void this.recover()
     }
     void this.settleRoundIfDone(workId, round)
   }
 
   /** Retry one role without invalidating other reviewers' results for the same commit. */
   async retryReview(workId: string, reviewId: number): Promise<void> {
+    await this.recover()
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(workId) as
       | { id: string; ticket_key: string; branch: string; worktree_dir: string; state: string; review_head: string | null; review_base: string | null }
       | undefined
     if (!work) throw new Error('Work not found.')
-    if (work.state !== 'WAITING_HUMAN') throw new Error('Individual retries are available when the ticket needs attention.')
+    if (work.state === 'BUILDING' || workManager.isPrompting(workId)) throw new Error('Implementation is still running in the main conversation. Stop that run or wait for it to finish before resuming the fixer or relaunching a reviewer.')
+    if (workManager.hasFollowUps(workId)) throw new Error('Send or remove the saved follow-ups before retrying review.')
+    if (!['READY', 'WAITING_HUMAN', 'APPROVED'].includes(work.state)) throw new Error('Review is already in progress or this work has not settled. Stop review before relaunching an agent.')
     if (this.isBusyReviewing(workId) || shipManager.isShipping(workId)) throw new Error('Another review or shipping operation is in progress.')
     const round = this.latestRound(workId)
     const rows = latestAttempts(this.reviewsFor(workId).filter((r) => r.round === round))
@@ -258,6 +384,24 @@ class ReviewManager {
     this.starting.add(workId)
     try {
       await this.requireStoppedReviews(workId)
+      const active = await openCodeService.api.session.active()
+      const build = getDb().prepare('SELECT session_id FROM work WHERE id = ?').get(workId) as { session_id: string | null }
+      if (build.session_id && build.session_id in active) throw new Error('Implementation is still running in the main conversation. Stop that run or wait for it to finish before relaunching an agent.')
+      const changes = rows.filter((r) => r.role !== 'fixer' && r.status === 'changes')
+      if (row.role === 'fixer') {
+        if (!changes.length || rows.some((r) => r.role !== 'fixer' && r.status === 'error')) throw new Error('Resolve reviewer errors before resuming the fixer.')
+        if (!work.review_head || !work.review_base) throw new Error('The review scope was not recorded. Re-run review before launching the fixer.')
+        const branch = (await exec('git', ['-C', work.worktree_dir, 'branch', '--show-current'])).stdout.trim()
+        if (!work.branch || branch !== work.branch) throw new Error('The checkout branch changed. Select the correct working folder before resuming the fixer.')
+        await exec('git', ['-C', work.worktree_dir, 'merge-base', '--is-ancestor', work.review_head, 'HEAD']).catch((err) => {
+          if ((err as { code?: number }).code === 1) throw new Error('Branch history changed since review. Re-run review against the current branch instead of resuming old findings. Partial work is untouched.')
+          throw err
+        })
+        this.settledRounds.add(`${workId}:${round}`)
+        this.starting.delete(workId)
+        await this.dispatchFixer(workId, round, changes, row)
+        return
+      }
       const [head, status] = await Promise.all([
         exec('git', ['-C', work.worktree_dir, 'rev-parse', 'HEAD']),
         exec('git', ['-C', work.worktree_dir, 'status', '--porcelain'])
@@ -267,15 +411,6 @@ class ReviewManager {
       }
       if (!work.review_base) throw new Error('The base for this review was not recorded. Use Re-run review to review the whole team against the same base.')
       const scope = await this.scopeFromBase(work.worktree_dir, work.review_base)
-      const changes = rows.filter((r) => r.role !== 'fixer' && r.status === 'changes')
-      if (row.role === 'fixer') {
-        if (!changes.length || rows.some((r) => r.role !== 'fixer' && r.status === 'error')) {
-          throw new Error('Resolve reviewer errors before retrying the fixer.')
-        }
-        this.starting.delete(workId)
-        await this.dispatchFixer(workId, round, changes)
-        return
-      }
       const skills = new Set((await listSkills()).map((s) => s.id))
       if (row.role === 'impeccable' && !skills.has('impeccable')) {
         throw new Error('The impeccable skill is unavailable. Install or enable it in OpenCode, then retry UI review.')
@@ -293,6 +428,7 @@ class ReviewManager {
       this.push(workId, round)
     } finally {
       this.starting.delete(workId)
+      if (this.recoverAfterStart.delete(workId)) void this.recover()
     }
     void this.settleRoundIfDone(workId, round)
   }
@@ -308,11 +444,13 @@ class ReviewManager {
   ): Promise<void> {
     try {
       const api = openCodeService.api
+      const guard = await skillGuardRules(work.worktree_dir)
       const session = await api.session.create({
         title: `${work.ticket_key || work.branch} · ${role} (round ${round})`,
         agent: sel.agentID ?? null,
         model: sel.model ? { providerID: sel.model.providerID, id: sel.model.id } : null,
         location: { directory: work.worktree_dir },
+        ...(guard.length ? { permissions: guard } : {}),
         metadata: { revva: { kind: 'review', workId: work.id, round, role } }
       })
       this.update(reviewId, 'running', undefined, undefined, session.id)
@@ -334,7 +472,7 @@ class ReviewManager {
 
   /** workManager calls this when a tracked reviewer/fixer session finished. */
   isBusyReviewing(workId: string): boolean {
-    if (this.starting.has(workId) || this.stopping.has(workId)) return true
+    if (this.starting.has(workId) || this.stopping.has(workId) || this.recovering.has(workId)) return true
     for (const t of this.sessions.values()) if (t.workId === workId) return true
     return false
   }
@@ -354,7 +492,7 @@ class ReviewManager {
 
   /** Explicit, non-destructive recovery, including review sessions orphaned by restart. */
   async stopWork(workId: string): Promise<void> {
-    if (this.starting.has(workId) || this.stopping.has(workId)) throw new Error('Review is starting or stopping; try again once it settles.')
+    if (this.starting.has(workId) || this.stopping.has(workId) || this.recovering.has(workId)) throw new Error('Review is reconnecting, starting or stopping; try again once it settles.')
     if (shipManager.isShipping(workId)) throw new Error('Shipping is in progress; wait before stopping review.')
     const work = getDb().prepare('SELECT state FROM work WHERE id = ?').get(workId) as { state: string } | undefined
     if (!work || !['REVIEW', 'FIXING', 'WAITING_HUMAN'].includes(work.state)) throw new Error('Stop review is available during review or when this ticket needs attention.')
@@ -377,7 +515,7 @@ class ReviewManager {
         inboxManager.forgetSession(id)
       }
       for (const row of rows) {
-        if (row.status === 'pending' || row.status === 'running' || (row.sessionId && ids.has(row.sessionId))) {
+        if (row.status === 'pending' || row.status === 'running' || row.error === LEGACY_RESTART_ERROR || (row.sessionId && ids.has(row.sessionId))) {
           this.update(row.id, 'error', undefined, 'Review stopped by you; files and transcript kept.')
         }
       }
@@ -407,6 +545,7 @@ class ReviewManager {
   private trackSession(sessionId: string, tracked: TrackedSession): void {
     this.sessions.set(sessionId, tracked)
     sessionIndex.register(sessionId, 'review')
+    this.activity.set(tracked.reviewId, { activity: 'Preparing session…', lastActivityAt: Date.now() })
     this.syncWatchdogs()
   }
 
@@ -443,18 +582,49 @@ class ReviewManager {
     const tracked = this.sessions.get(sessionId)
     if (!tracked) return
 
+    let activity: string | undefined
+    if (e.type === 'session.execution.started') activity = 'Waiting for model…'
+    else if (e.type.startsWith('session.reasoning.')) activity = 'Reasoning'
+    else if (e.type.startsWith('session.text.')) activity = 'Generating response'
+    else if (e.type === 'session.tool.input.started' && typeof data.id === 'string') {
+      const name = String(data.name ?? 'tool')
+      tracked.tools ??= new Map()
+      tracked.tools.set(data.id, { name })
+      activity = `Preparing: ${name}`
+    }
+    else if (e.type === 'session.tool.called' || e.type === 'session.tool.success' || e.type === 'session.tool.failed') {
+      const id = String(data.id ?? '')
+      const tool = tracked.tools?.get(id)
+      const input = data.input as Record<string, unknown> | undefined
+      const detail = input && ['command', 'path', 'filePath', 'pattern', 'query', 'url', 'description'].map((key) => input[key]).find((value) => typeof value === 'string') || tool?.detail
+      const name = String(data.name ?? tool?.name ?? 'tool')
+      const verb = e.type === 'session.tool.called' ? 'Running' : e.type === 'session.tool.failed' ? 'Failed' : 'Finished'
+      activity = `${verb}: ${name}${detail ? ` · ${String(detail).split('\n')[0]?.slice(0, 180)}` : ''}`
+      if (e.type === 'session.tool.called') {
+        tracked.tools ??= new Map()
+        tracked.tools.set(id, { name, detail: detail ? String(detail) : undefined })
+      } else tracked.tools?.delete(id)
+    } else if (e.type === 'session.tool.progress') {
+      const tool = tracked.tools?.get(String(data.id ?? ''))
+      activity = `Running: ${tool?.name ?? 'tool'}${tool?.detail ? ` · ${tool.detail.split('\n')[0]?.slice(0, 180)}` : ''}`
+    } else if (e.type === 'session.retry.scheduled') {
+      activity = `Retrying model · attempt ${String(data.attempt ?? '')}`
+    } else if (e.type === 'session.status') {
+      const status = data.status as { type?: string; message?: string } | undefined
+      if (status?.type === 'retry') activity = `Retrying${status.message ? ` · ${status.message.slice(0, 180)}` : ''}`
+    }
+    if (activity) {
+      this.activity.set(tracked.reviewId, { activity, lastActivityAt: Date.now() })
+      this.activityWork.set(tracked.workId, tracked.round)
+      // Coalesce streaming/reasoning deltas; activity need not redraw per token.
+      this.activityTimer ??= setTimeout(() => {
+        this.activityTimer = undefined
+        for (const [workId, round] of this.activityWork) this.push(workId, round)
+        this.activityWork.clear()
+      }, 1000)
+    }
+
     switch (e.type) {
-      case 'session.text.delta': {
-        // Forward live text so the cockpit can show reviewers thinking in real time.
-        streamBuffer.push({
-          kind: 'review.delta',
-          workId: tracked.workId,
-          sessionId,
-          messageId: String(data.assistantMessageID ?? ''),
-          text: String(data.delta ?? '')
-        })
-        break
-      }
       case 'session.execution.succeeded':
         void this.settle(sessionId, undefined)
         break
@@ -480,13 +650,8 @@ class ReviewManager {
     let text = findings ?? ''
     if (!forcedStatus) {
       try {
-        // desc so the limit keeps the newest messages; first assistant = final reply.
-        const res = await openCodeService.api.message.list({ sessionID: sessionId, order: 'desc', limit: 200 })
-        const lastAssistant = res.data.find((m) => m.type === 'assistant')
-        for (const part of (lastAssistant as { content?: unknown[] })?.content ?? []) {
-          const p = part as Record<string, unknown>
-          if (p.type === 'text' && typeof p.text === 'string') text += p.text
-        }
+        const row = getDb().prepare('SELECT created_at FROM review WHERE id = ?').get(t.reviewId) as { created_at: number } | undefined
+        text += await latestAssistantText(sessionId, AbortSignal.timeout(30_000), row?.created_at ?? Infinity)
         status = t.role === 'fixer' ? 'approved' : parseVerdict(text)
       } catch (err) {
         status = 'error'
@@ -506,6 +671,11 @@ class ReviewManager {
 
     if (t.role === 'fixer') {
       if (status === 'approved') {
+        if (workManager.hasFollowUps(t.workId)) {
+          workManager.setReviewState(t.workId, 'READY')
+          await workManager.drainFollowUps(t.workId)
+          return
+        }
         // Fixes committed → next round of reviewers.
         workManager.setReviewState(t.workId, 'REVIEW')
         await this.startRound(t.workId, t.round + 1).catch((err) => {
@@ -570,6 +740,8 @@ class ReviewManager {
       const work = getDb().prepare('SELECT mode, ship_on_approve FROM work WHERE id = ?').get(workId) as { mode: string; ship_on_approve: number | null } | undefined
       this.audit(workId, round, 'approved', rows.map((r) => `${r.role}: ${r.status}`).join(', '))
       workManager.setReviewState(workId, 'APPROVED')
+      // Saved human instructions win over automatic delivery of the old commit.
+      if (await workManager.drainFollowUps(workId)) return
       if (work?.mode === 'auto' || work?.ship_on_approve) {
         // Opt-in only: push + PR the moment all gates pass (existing PR is updated).
         void shipManager.autoShip(workId)
@@ -587,13 +759,14 @@ class ReviewManager {
   }
 
   /** Fan-in: one fixer session gets all findings from the round. */
-  private async dispatchFixer(workId: string, round: number, changes: ReviewRow[]): Promise<void> {
+  private async dispatchFixer(workId: string, round: number, changes: ReviewRow[], resume?: ReviewRow): Promise<void> {
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(workId) as
       | { id: string; ticket_key: string; branch: string; worktree_dir: string; mode: string; review_sel: string | null }
       | undefined
     if (!work) return
     const perRun = (work.review_sel ? JSON.parse(work.review_sel) : undefined) as Record<string, { agentID?: string; model?: ModelRef } | undefined> | undefined
-    const sel = resolveSel(workId, 'fixer', perRun)
+    const configured = resolveSel(workId, 'fixer', perRun)
+    const sel = resume ? { agentID: resume.agentID ?? configured.agentID, model: resume.model ?? configured.model } : configured
     const now = Date.now()
     const res = getDb()
       .prepare(
@@ -607,19 +780,35 @@ class ReviewManager {
     this.push(workId, round)
 
     this.starting.add(workId)
+    let resumedSessionId: string | undefined
     try {
       const api = openCodeService.api
-      const session = await api.session.create({
-        title: `${work.ticket_key || work.branch} · fix (after round ${round})`,
-        agent: sel.agentID ?? null,
-        model: sel.model ? { providerID: sel.model.providerID, id: sel.model.id } : null,
-        location: { directory: work.worktree_dir },
-        metadata: { revva: { kind: 'review', workId, round, role: 'fixer' } }
-      })
+      const previous = resume?.sessionId ? await api.session.get({ sessionID: resume.sessionId }).catch((err) => {
+        if ((err as { _tag?: string })._tag === 'SessionNotFoundError') return undefined
+        throw err
+      }) : undefined
+      resumedSessionId = previous?.id
+      if (previous && await realpath(previous.location.directory) !== await realpath(work.worktree_dir)) throw new Error('The fixer session moved to another folder. Move it back before resuming.')
+      const guard = previous ? [] : await skillGuardRules(work.worktree_dir)
+      const session =
+        previous ??
+        (await api.session.create({
+          title: `${work.ticket_key || work.branch} · fix (after round ${round})`,
+          agent: sel.agentID ?? null,
+          model: sel.model ? { providerID: sel.model.providerID, id: sel.model.id } : null,
+          location: { directory: work.worktree_dir },
+          ...(guard.length ? { permissions: guard } : {}),
+          metadata: { revva: { kind: 'review', workId, round, role: 'fixer' } }
+        }))
       this.update(reviewId, 'running', undefined, undefined, session.id)
       this.trackSession(session.id, { workId, round, role: 'fixer', reviewId, remainingMs: SESSION_TIMEOUT_MS, deadline: 0 })
       this.starting.delete(workId)
-      await api.session.prompt({ sessionID: session.id, text: fixerPrompt(work, round, changes) })
+      if (previous) getDb().prepare('UPDATE review SET agent_id = ?, provider_id = ?, model_id = ? WHERE id = ?')
+        .run(previous.agent ?? null, previous.model?.providerID ?? null, previous.model?.id ?? null, reviewId)
+      await api.session.prompt({ sessionID: session.id, delivery: 'steer', text: [
+        ...(resume ? ['Resume the interrupted fixer from its existing work. Inspect partial changes and any commits before continuing. Do not reset, stash, clean, discard or overwrite unrelated edits. Finish the outstanding findings rather than starting over.', ''] : []),
+        fixerPrompt(work, round, changes)
+      ].join('\n') })
     } catch (err) {
       for (const [sessionId, tracked] of this.sessions) {
         if (tracked.reviewId === reviewId) {
@@ -627,13 +816,15 @@ class ReviewManager {
           this.sessions.delete(sessionId)
           sessionIndex.forget(sessionId)
           inboxManager.forgetSession(sessionId)
-          void openCodeService.api.session.interrupt({ sessionID: sessionId }).catch(() => undefined)
+          // A network failure doesn't authorize killing the pre-existing fixer.
+          if (sessionId !== resumedSessionId) void openCodeService.api.session.interrupt({ sessionID: sessionId }).catch(() => undefined)
         }
       }
       this.update(reviewId, 'error', undefined, describeError(err))
       workManager.setReviewState(workId, 'WAITING_HUMAN', `Could not start fixer: ${describeError(err)}`)
     } finally {
       this.starting.delete(workId)
+      if (this.recoverAfterStart.delete(workId)) void this.recover()
     }
     this.push(workId, round)
   }
@@ -689,6 +880,7 @@ class ReviewManager {
     error?: string,
     sessionId?: string
   ): void {
+    if (status !== 'running' && status !== 'pending') this.activity.delete(reviewId)
     getDb()
       .prepare(
         `UPDATE review SET status = ?,

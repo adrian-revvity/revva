@@ -24,18 +24,23 @@ import { notifyInbound } from '../notify'
 import { collectAdfText, fetchLastAssistantText, isConflict, promptImageFiles } from '../util'
 import { reviewManager } from '../review'
 import { shipManager } from '../ship'
-import { performRemoval, preflightWorktreeRemoval, requireAbsenceOfAgents, staleConfirmationError } from '../worktree-safety'
+import { throughputMeter } from '../opencode/throughput'
+import { performRemoval, preflightWorktreeRemoval, probeActiveAgentsInside, requireAbsenceOfAgents, staleConfirmationError } from '../worktree-safety'
+import { checkoutBranch, listRepoBranches } from '../branches'
 import { renderPrompt, DEFAULT_START_PROMPT, BUILD_COMPLETION_INSTRUCTIONS } from '@shared/prompts'
 import {
   IPC,
+  type ConversationCheckoutResult,
   type PromptImage,
   type PromptRefs,
   type StartWorkInput,
   type WorkAbandonPreflight,
   type WorkState,
+  type WorkFollowUp,
   type WorkSummary
 } from '@shared/types'
 import { fileAttachments, skillAttachments } from '../opencode/prompt-refs'
+import { skillGuardRules } from '../opencode/skill-guard'
 
 const exec = promisify(execFile)
 
@@ -58,6 +63,18 @@ interface WorkRow {
   seen_at: number | null
   created_at: number
   updated_at: number
+  review_after_followup: number
+}
+
+interface FollowUpRow {
+  id: string
+  work_id: string
+  text: string
+  images: string
+  refs: string
+  status: WorkFollowUp['status']
+  error: string | null
+  created_at: number
 }
 
 function slugBranch(key: string): string {
@@ -82,10 +99,15 @@ class WorkManager {
   private wired = false
   /** Invalidate an async completion check when a new turn/follow-up starts. */
   private buildRevisions = new Map<string, number>()
+  private prompting = new Set<string>()
+  private draining = new Set<string>()
+  private deferredCompletions = new Map<string, { work: WorkRow; revision: number }>()
 
   wire(): void {
     if (this.wired) return
     this.wired = true
+    // Never replay an ambiguously delivered prompt after a crash.
+    getDb().prepare("UPDATE work_followup SET status = 'error', error = 'Revva restarted during delivery. Check the conversation before retrying; the message may already have arrived.' WHERE status = 'sending'").run()
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
   }
 
@@ -137,7 +159,7 @@ class WorkManager {
     }
     if (existing && existing.state !== 'ABANDONED') {
       if (existing.state === 'SHIPPED') throw new Error('The shipped run’s review folder cannot be reassigned. Start another linked conversation for new work.')
-      if (reviewManager.isBusyReviewing(existing.id) || shipManager.isShipping(existing.id)) throw new Error('Stop review or wait for shipping before changing the review folder.')
+      if (reviewManager.isBusyReviewing(existing.id) || shipManager.isShipping(existing.id) || this.isPrompting(existing.id) || this.hasFollowUps(existing.id)) throw new Error('Stop review and send or remove saved follow-ups before changing the review folder.')
       await reviewManager.requireStoppedReviews(existing.id)
     }
     const [session, active] = await Promise.all([
@@ -159,7 +181,7 @@ class WorkManager {
       blocker = 'Choose a Git repository or worktree for this conversation before reviewing or shipping. Its transcript and files stay where they are.'
     }
     if (existing && existing.state !== 'ABANDONED') {
-      if (reviewManager.isBusyReviewing(existing.id) || shipManager.isShipping(existing.id)) throw new Error('Review or shipping started while selecting the folder; retry once it finishes.')
+      if (reviewManager.isBusyReviewing(existing.id) || shipManager.isShipping(existing.id) || this.isPrompting(existing.id) || this.hasFollowUps(existing.id)) throw new Error('Review, shipping or a follow-up started while selecting the folder; retry once it finishes.')
       if (existing.pr_url && existing.branch && (existing.repo_dir !== repoDir || existing.branch !== branch)) throw new Error('This conversation is linked to a PR. Choose that PR’s existing repository and branch, not an unrelated checkout.')
     }
     // Recheck after the service/FS probes: the user may have unlinked meanwhile.
@@ -185,10 +207,117 @@ class WorkManager {
     return this.toSummary(getDb().prepare('SELECT * FROM work WHERE id = ?').get(id) as WorkRow)
   }
 
+  /**
+   * Point a conversation at one of Revva's known worktrees and/or check a branch out
+   * in it — both picked from lists Revva already has, never by navigating folders.
+   *
+   * The conversation's own OpenCode session is moved (`session.move`), so the agent
+   * works where the user picked, and the transcript stays where it was: messages are
+   * not touched, nothing is deleted, no branch is renamed. Revva's review anchor is
+   * re-read from git by re-running `conversationContext`, so review/ship follow the
+   * new checkout instead of the folder they happened to see last.
+   *
+   * Refusals all happen before the first write and say so: a running response, a
+   * live review/ship/follow-up, a shipped run, a PR-linked conversation (those stay
+   * on the PR's repository and branch), an agent or terminal inside the folder being
+   * moved into, a dirty checkout when a branch is requested, a branch another worktree
+   * holds, a branch name two remotes both carry. Git is then asked with plain
+   * `checkout`/`checkout --track` only: it can discard or rewrite nothing, and its own
+   * refusal is reported verbatim.
+   */
+  async setCheckout(sessionId: string, input: { directory?: string; branch?: string }): Promise<ConversationCheckoutResult> {
+    const chat = getDb().prepare('SELECT ticket_key, pr_url FROM chat WHERE session_id = ?').get(sessionId) as
+      | { ticket_key: string | null; pr_url: string | null }
+      | undefined
+    if (!chat) throw new Error('Conversation not found.')
+    const branch = input.branch?.trim()
+    const wanted = input.directory?.trim()
+    if (!wanted && !branch) throw new Error('Pick a worktree or a branch first.')
+
+    const work = this.workBySession(sessionId)
+    if (work && work.state !== 'ABANDONED') {
+      if (work.state === 'SHIPPED') throw new Error('This run shipped from its checkout. Start another linked conversation to work somewhere else.')
+      if (this.isPrompting(work.id) || this.hasFollowUps(work.id)) throw new Error('Send or remove the saved follow-ups before changing where this conversation works.')
+      if (reviewManager.isBusyReviewing(work.id) || reviewManager.isStartingReview(work.id)) throw new Error('Stop review before changing where this conversation works.')
+      if (shipManager.isShipping(work.id)) throw new Error('Shipping is in progress; wait for it to finish before changing where this conversation works.')
+      await reviewManager.requireStoppedReviews(work.id)
+    }
+
+    const api = openCodeService.api
+    const session = await api.session.get({ sessionID: sessionId })
+    const from = await realpath(session.location.directory).catch(() => session.location.directory)
+    let to = from
+    if (wanted) {
+      try {
+        to = await realpath(wanted)
+      } catch {
+        throw new Error(`That worktree is gone: ${wanted}. Nothing was changed.`)
+      }
+    }
+    if (to === from && !branch) return { work: work && work.state !== 'ABANDONED' ? this.toSummary(work) : null, note: 'Already working there — nothing changed.' }
+
+    // The target must be a checkout this repository registered, and the branch must be
+    // one the picker could have offered (current, free, local or on exactly one remote).
+    // Both are proven before the first write; `checkoutBranch` proves them again right
+    // before git runs, because the user may have changed things in another window.
+    if (chat.pr_url && branch) throw new Error('This conversation is linked to a PR, so it stays on the PR’s branch. Pick its worktree instead, or open another conversation for a different branch.')
+    const inventory = await listRepoBranches(to)
+    if (branch) {
+      const found = inventory.branches.find((b) => b.name === branch)
+      if (!found) throw new Error(`No branch named ${branch} in ${inventory.repoDir}, locally or on a remote. Nothing was changed.`)
+      if (found.checkedOutIn) throw new Error(`Branch ${branch} is checked out in ${found.checkedOutIn}. Git allows one checkout per branch — pick that worktree instead. Nothing was changed.`)
+      if (found.remotes) throw new Error(`${branch} exists on ${found.remotes.length} remotes (${found.remotes.join(', ')}). Revva will not guess which one — nothing was changed.`)
+    }
+    // A PR-linked run keeps working on its PR's repository and branch, so refuse a
+    // worktree that would move it off them *before* the session moves, not after.
+    if (chat.pr_url && work && work.state !== 'ABANDONED' && work.branch) {
+      if (inventory.repoDir !== work.repo_dir || (inventory.current && inventory.current !== work.branch)) {
+        throw new Error(`This conversation is linked to a PR, so it works in ${work.repo_dir} on ${work.branch}. Pick a worktree of that branch, or open another conversation. Nothing was changed.`)
+      }
+    }
+
+    // A response in flight would keep working in the folder we are leaving, and an
+    // agent or terminal inside the folder we are moving into (or switching in place)
+    // would meet a checkout change under its feet. The folder being left is not
+    // probed: nothing is written there, and an unrelated session in it keeps its own work.
+    const active = await api.session.active().catch(() => undefined)
+    if (!active) throw new Error('The OpenCode service could not be consulted about running sessions — nothing was changed.')
+    if (sessionId in active) throw new Error('This conversation is answering right now. Stop the response before changing its worktree or branch.')
+    const proof = await probeActiveAgentsInside(to)
+    if (!proof.free) throw new Error(`Nothing was changed: ${to} — ${proof.reason}.`)
+
+    let note = ''
+    if (to !== from) {
+      await api.session.move({ sessionID: sessionId, directory: to })
+      getDb().prepare('UPDATE chat SET directory = ? WHERE session_id = ?').run(to, sessionId)
+      note = `Now working in ${to}`
+    }
+    if (branch) {
+      const switchNote = await checkoutBranch(to, branch)
+      note = note ? `${note}. ${switchNote}` : switchNote
+    }
+
+    // Re-read the checkout (folder, repository, branch, detached state) from git so
+    // review and shipping follow the new state instead of the last one they saw.
+    const linked = chat.ticket_key || chat.pr_url || (work && work.state !== 'ABANDONED')
+    let refreshed: WorkSummary | null = null
+    if (linked) {
+      try {
+        refreshed = await this.conversationContext(sessionId, to)
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err)
+        throw new Error(`${note ? `${note}. ` : ''}Revva could not re-read that checkout: ${reason} Nothing was lost — reopen Details to see where it stands.`)
+      }
+    }
+    if (!note) note = 'Nothing changed.'
+    return { work: refreshed, note: note.endsWith('.') ? note : `${note}.` }
+  }
+
   /** Removing a conversation never deletes its folder or branch. */
   async forgetConversation(sessionId: string): Promise<void> {
     const work = this.workBySession(sessionId)
     if (!work || work.state === 'ABANDONED') return
+    if (this.hasFollowUps(work.id) || this.isPrompting(work.id)) throw new Error('Send or remove the saved follow-ups before detaching or deleting this conversation.')
     if (reviewManager.isBusyReviewing(work.id) || shipManager.isShipping(work.id)) throw new Error('Stop review or wait for shipping before deleting this conversation.')
     await reviewManager.requireStoppedReviews(work.id)
     if (reviewManager.isBusyReviewing(work.id) || shipManager.isShipping(work.id)) throw new Error('Review or shipping started; wait before deleting this conversation.')
@@ -214,6 +343,7 @@ class WorkManager {
   async requireEditableLinks(sessionId: string): Promise<void> {
     const work = this.workBySession(sessionId)
     if (!work || work.state === 'ABANDONED') return
+    if (this.isPrompting(work.id)) throw new Error('A follow-up is being delivered; wait before changing the conversation’s links.')
     if (reviewManager.isBusyReviewing(work.id) || shipManager.isShipping(work.id)) throw new Error('Stop review or wait for shipping before changing the conversation’s links.')
     await reviewManager.requireStoppedReviews(work.id)
   }
@@ -266,11 +396,13 @@ class WorkManager {
 
     // Build session in the worktree.
     const api = openCodeService.api
+    const guard = await skillGuardRules(worktreeDir)
     const session = await api.session.create({
       title: `${ticket.key}: ${ticket.summary}`.slice(0, 100),
       agent: input.agentID ?? null,
       model: input.model ? { providerID: input.model.providerID, id: input.model.id } : null,
       location: { directory: worktreeDir },
+      ...(guard.length ? { permissions: guard } : {}),
       metadata: { revva: { kind: 'chat', workId: id, ticketKey: ticket.key, phase: 'build', mode: input.mode } }
     })
     getDb().prepare('UPDATE work SET session_id = ? WHERE id = ?').run(session.id, id)
@@ -434,11 +566,17 @@ class WorkManager {
   }
 
   /** Called by the review pipeline (REVIEW/FIXING/APPROVED/WAITING_HUMAN). */
-  setReviewState(id: string, state: WorkState, blocker?: string): void {
+  setReviewState(id: string, state: WorkState, blocker?: string | null): void {
     const work = getDb().prepare('SELECT state FROM work WHERE id = ?').get(id) as { state: string } | undefined
     if (!work || work.state === 'ABANDONED' || work.state === 'SHIPPED') return
-    if (work.state === state && !blocker) return
-    this.setState(id, state, blocker)
+    // Explicit null clears a stale reconnect error, even if the state is unchanged.
+    if (work.state === state && blocker === undefined) return
+    this.setState(id, state, blocker ?? undefined)
+    if (state === 'APPROVED' || state === 'WAITING_HUMAN') {
+      // ReviewManager releases starting/stopping guards before this runs.
+      // Startup recovery holds saved messages for explicit resume.
+      if (this.wired && openCodeService.connected) setTimeout(() => void this.drainFollowUps(id), 0)
+    }
   }
 
   private emit(id: string, state: WorkState): void {
@@ -450,6 +588,8 @@ class WorkManager {
   }
 
   private onEvent(e: RawEvent): void {
+    // Detail is routed by the shared bus, without a SQLite read per token.
+    if (!['session.execution.started', 'session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(e.type)) return
     const data = (e.data ?? {}) as Record<string, unknown>
     const sessionId = data.sessionID
     if (typeof sessionId !== 'string') return
@@ -464,27 +604,9 @@ class WorkManager {
         if (work.owns_worktree === 0 && work.state !== 'BUILDING') this.setState(work.id, 'BUILDING')
         break
       }
-      case 'session.text.delta': {
-        if (work.state !== 'BUILDING') return
-        streamBuffer.push({
-          kind: 'work.delta',
-          workId: work.id,
-          sessionId,
-          messageId: String(data.assistantMessageID ?? ''),
-          text: String(data.delta ?? '')
-        })
-        break
-      }
       case 'session.execution.succeeded': {
         if (work.state !== 'BUILDING') return
         streamBuffer.flush(sessionId)
-        // Ticket-linked conversations reuse a work row for workflow utilities,
-        // but only Revva-owned worktrees are implementation builds that should
-        // automatically enter review when the agent finishes.
-        if (work.owns_worktree === 0) {
-          this.setState(work.id, 'READY')
-          break
-        }
         void this.finishBuildTurn(work, this.buildRevisions.get(sessionId) ?? 0)
         break
       }
@@ -509,15 +631,39 @@ class WorkManager {
   private async finishBuildTurn(work: WorkRow, revision: number): Promise<void> {
     const sessionId = work.session_id!
     const stillCurrent = (): boolean => this.workBySession(sessionId)?.state === 'BUILDING' && (this.buildRevisions.get(sessionId) ?? 0) === revision
+    // Fast completions can arrive before prompt acceptance. Let queue removal
+    // and the submission guard settle before deciding whether to re-review.
+    if (this.isPrompting(work.id)) {
+      this.deferredCompletions.set(work.id, { work, revision })
+      return
+    }
+    if (!stillCurrent()) return
+    // PR-linked conversations are always ordinary chats. Even a stale
+    // re-review latch must not turn their replies into implementation turns.
+    const ordinaryPrChat = work.owns_worktree === 0 && !!work.pr_url
+    if (work.owns_worktree === 0 && (!work.review_after_followup || ordinaryPrChat)) {
+      if (ordinaryPrChat && work.review_after_followup) {
+        getDb().prepare('UPDATE work SET review_after_followup = 0 WHERE id = ?').run(work.id)
+      }
+      this.setState(work.id, 'READY')
+      await this.drainFollowUps(work.id)
+      return
+    }
     try {
       const text = await fetchLastAssistantText(sessionId)
       if (!stillCurrent()) return
+      if (this.hasFollowUps(work.id)) {
+        this.setState(work.id, 'READY')
+        await this.drainFollowUps(work.id)
+        return
+      }
       const lastLine = text.split('\n').map((line) => line.trim().replace(/[*`>_#]/g, '').trim()).filter(Boolean).at(-1)
       if (lastLine !== 'REVVA: DONE') {
         this.setState(work.id, 'WAITING_HUMAN', 'The build turn ended without declaring implementation complete. Review was not started. Read the agent’s reply and send a follow-up, or start review manually when ready.')
         return
       }
       this.setState(work.id, 'REVIEW')
+      getDb().prepare('UPDATE work SET review_after_followup = 0 WHERE id = ?').run(work.id)
       await reviewManager.startRound(work.id, reviewManager.latestRound(work.id) + 1, true)
     } catch (err) {
       if ((this.buildRevisions.get(sessionId) ?? 0) !== revision) return
@@ -574,6 +720,7 @@ class WorkManager {
   async abandon(id: string, confirmedSignature: string, confirmed: boolean): Promise<string | undefined> {
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(id) as WorkRow | undefined
     if (!work) return
+    if (this.hasFollowUps(id) || this.isPrompting(id)) throw new Error('Send or remove the saved follow-ups before abandoning this work. Nothing was removed.')
     if (work.owns_worktree === 0) throw new Error('Existing conversation folders are never removed by Abandon. Remove the ticket link instead; files and transcript are kept.')
     if (shipManager.isShipping(id)) throw new Error('Shipping is in progress; wait for it to finish before abandoning this work.')
     // Active review ⇒ refuse before anything (including any cancellation) can happen.
@@ -611,7 +758,7 @@ class WorkManager {
     // identity) lands last, directly before the unlink. These are awaited
     // probes: they narrow the race window rather than closing it, and no claim
     // of race-freedom is made anywhere.
-    if (reviewManager.isBusyReviewing(id) || reviewManager.isStartingReview(id) || shipManager.isShipping(id)) {
+    if (reviewManager.isBusyReviewing(id) || reviewManager.isStartingReview(id) || shipManager.isShipping(id) || this.isPrompting(id) || this.hasFollowUps(id)) {
       throw new Error('A review or ship started just now — nothing was removed. Try abandoning again once it settles.')
     }
     await requireAbsenceOfAgents(preflight.directory)
@@ -620,7 +767,7 @@ class WorkManager {
     // Synchronous last word, directly before the git subprocess starts: no
     // await between here and performRemoval, so within this process no review
     // or ship round can slip in after the final content proof.
-    if (reviewManager.isBusyReviewing(id) || reviewManager.isStartingReview(id) || shipManager.isShipping(id)) {
+    if (reviewManager.isBusyReviewing(id) || reviewManager.isStartingReview(id) || shipManager.isShipping(id) || this.isPrompting(id) || this.hasFollowUps(id)) {
       throw new Error('A review or ship started just now — nothing was removed. Try abandoning again once it settles.')
     }
 
@@ -668,8 +815,172 @@ class WorkManager {
     return note
   }
 
-  /** Follow-up message into a running/finished build session. */
-  async followUp(sessionId: string, text: string, images: PromptImage[] = [], queued = false, refs?: PromptRefs): Promise<void> {
+  /** Pipeline occupancy is independent of the build session's activity. */
+  isPrompting(workId: string): boolean {
+    return this.prompting.has(workId) || this.draining.has(workId)
+  }
+
+  hasFollowUps(workId: string): boolean {
+    return !!getDb().prepare('SELECT 1 FROM work_followup WHERE work_id = ? LIMIT 1').get(workId)
+  }
+
+  queuedFollowUps(workId: string): WorkFollowUp[] {
+    const rows = getDb().prepare('SELECT * FROM work_followup WHERE work_id = ? ORDER BY created_at, rowid').all(workId) as FollowUpRow[]
+    return rows.map((row) => ({
+      id: row.id, text: row.text, imageCount: (JSON.parse(row.images) as PromptImage[]).length,
+      createdAt: row.created_at, status: row.status, error: row.error ?? undefined
+    }))
+  }
+
+  private queueChanged(workId: string): void {
+    pushToWindows({ kind: 'work.queue', workId })
+  }
+
+  editQueued(workId: string, id: string, text: string, refs?: PromptRefs): void {
+    const row = this.requireQueued(workId, id)
+    if (!text.trim() && !(JSON.parse(row.images) as PromptImage[]).length) throw new Error('Add a message or keep an image attachment.')
+    getDb().prepare('UPDATE work_followup SET text = ?, refs = ? WHERE id = ?').run(text, JSON.stringify(refs ?? { skills: [], files: [] }), id)
+    this.queueChanged(workId)
+  }
+
+  cancelQueued(workId: string, id: string): void {
+    this.requireQueued(workId, id)
+    getDb().prepare('DELETE FROM work_followup WHERE id = ?').run(id)
+    this.queueChanged(workId)
+    void this.drainFollowUps(workId)
+  }
+
+  private requireQueued(workId: string, id: string): FollowUpRow {
+    const row = getDb().prepare('SELECT * FROM work_followup WHERE work_id = ? AND id = ?').get(workId, id) as FollowUpRow | undefined
+    if (!row) throw new Error('This follow-up was already sent or removed.')
+    if (row.status === 'sending') throw new Error('This follow-up is being delivered; wait for it to finish.')
+    return row
+  }
+
+  private enqueue(work: WorkRow, text: string, images: PromptImage[], refs?: PromptRefs): 'queued' {
+    if (!text.trim() && !images.length) throw new Error('Add a message or an image attachment.')
+    getDb().prepare('INSERT INTO work_followup(id, work_id, text, images, refs, created_at) VALUES(?,?,?,?,?,?)')
+      .run(randomUUID(), work.id, text, JSON.stringify(images), JSON.stringify(refs ?? { skills: [], files: [] }), Date.now())
+    this.queueChanged(work.id)
+    return 'queued'
+  }
+
+  /** Keep review/fixer writers isolated; queue at ticket level even when the build is idle. */
+  async followUp(sessionId: string, text: string, images: PromptImage[] = [], queued = false, refs?: PromptRefs, sentAt?: unknown): Promise<void | 'queued'> {
+    const work = this.workBySession(sessionId)
+    if (work?.state === 'ABANDONED') throw new Error('This work was abandoned; start a new ticket run instead.')
+    if (work && shipManager.isShipping(work.id)) throw new Error('Shipping is in progress; wait for it to finish before sending a follow-up.')
+    if (work && (reviewManager.isBusyReviewing(work.id) || ['REVIEW', 'FIXING'].includes(work.state) || this.isPrompting(work.id) || this.hasFollowUps(work.id))) {
+      const result = this.enqueue(work, text, images, refs)
+      // Also handles a submit racing the end of a review cycle.
+      if (!['REVIEW', 'FIXING', 'BUILDING'].includes(work.state)) void this.drainFollowUps(work.id)
+      return result
+    }
+    await throughputMeter.measurePrompt(sessionId, sentAt, () => this.deliverFollowUp(sessionId, text, images, queued, refs))
+  }
+
+  /** Explicit takeover. Failed stop leaves the draft intact and never starts another writer. */
+  async promptNow(sessionId: string, text: string, images: PromptImage[] = [], refs?: PromptRefs): Promise<void> {
+    const work = this.workBySession(sessionId)
+    if (!work || work.state === 'ABANDONED') throw new Error('Ticket workflow not found.')
+    if (this.isPrompting(work.id)) throw new Error('Another follow-up is being delivered; wait for it to finish.')
+    this.draining.add(work.id)
+    try {
+      if (reviewManager.isBusyReviewing(work.id) || ['REVIEW', 'FIXING', 'WAITING_HUMAN'].includes(work.state)) await reviewManager.stopWork(work.id)
+      await reviewManager.requireStoppedReviews(work.id)
+      const active = await openCodeService.api.session.active()
+      if (sessionId in active) throw new Error('Implementation is running. Queue a message or stop the response first.')
+      await throughputMeter.measurePrompt(sessionId, undefined, () => this.deliverFollowUp(sessionId, text, images, false, refs, true))
+    } finally {
+      this.draining.delete(work.id)
+      this.resumeCompletion(work.id)
+    }
+  }
+
+  async sendQueuedNow(workId: string, id: string): Promise<void> {
+    const row = this.requireQueued(workId, id)
+    const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(workId) as WorkRow | undefined
+    if (!work?.session_id || work.state === 'ABANDONED') throw new Error('Ticket workflow not found. The saved message is kept.')
+    if (this.isPrompting(workId)) throw new Error('Another follow-up is being delivered; wait for it to finish.')
+    this.draining.add(workId)
+    try {
+      if (reviewManager.isBusyReviewing(workId) || ['REVIEW', 'FIXING', 'WAITING_HUMAN'].includes(work.state)) await reviewManager.stopWork(workId)
+      await this.deliverQueued(work, this.requireQueued(workId, row.id))
+    } finally {
+      this.draining.delete(workId)
+      this.resumeCompletion(workId)
+    }
+  }
+
+  /** One saved message per build turn. Remaining messages run before re-review or shipping. */
+  async drainFollowUps(workId: string): Promise<boolean> {
+    if (!this.hasFollowUps(workId)) return false
+    if (this.isPrompting(workId) || reviewManager.isBusyReviewing(workId) || shipManager.isShipping(workId)) return true
+    const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(workId) as WorkRow | undefined
+    if (!work?.session_id || ['ABANDONED', 'SHIPPED', 'BUILDING', 'REVIEW', 'FIXING'].includes(work.state)) return true
+    const row = getDb().prepare('SELECT * FROM work_followup WHERE work_id = ? ORDER BY created_at, rowid LIMIT 1').get(workId) as FollowUpRow
+    if (row.status !== 'queued') {
+      // Failed/uncertain delivery requires a human retry, not an approval badge.
+      if (row.status === 'error' && work.state !== 'WAITING_HUMAN') this.setState(workId, 'WAITING_HUMAN', 'A saved follow-up needs attention. Check the conversation before retrying delivery, or remove the saved message.')
+      return true
+    }
+    this.draining.add(workId)
+    try {
+      await this.deliverQueued(work, row)
+    } catch (err) {
+      console.warn('[work] follow-up held:', describeError(err))
+      this.setState(workId, 'WAITING_HUMAN', 'Follow-up delivery is held. Inspect the saved message below and retry or remove it; shipping is paused.')
+    } finally {
+      this.draining.delete(workId)
+      this.resumeCompletion(workId)
+    }
+    return true
+  }
+
+  private async deliverQueued(work: WorkRow, row: FollowUpRow): Promise<void> {
+    // Claim before I/O so edits/removals cannot race submission.
+    getDb().prepare("UPDATE work_followup SET status = 'sending', error = NULL WHERE id = ?").run(row.id)
+    this.queueChanged(work.id)
+    try {
+      await reviewManager.requireStoppedReviews(work.id)
+      const active = await openCodeService.api.session.active()
+      if (work.session_id! in active) throw new Error('Implementation is still running. Wait for it to finish before retrying this follow-up.')
+      await throughputMeter.measurePrompt(work.session_id!, undefined, () => this.deliverFollowUp(
+        work.session_id!, row.text, JSON.parse(row.images) as PromptImage[], false, JSON.parse(row.refs) as PromptRefs, true
+      ))
+      getDb().prepare('DELETE FROM work_followup WHERE id = ?').run(row.id)
+    } catch (err) {
+      getDb().prepare("UPDATE work_followup SET status = 'error', error = ? WHERE id = ?")
+        .run(`${describeError(err)} Check the conversation before retrying; if submission reached OpenCode, the message may already have arrived.`, row.id)
+      throw err
+    } finally {
+      this.queueChanged(work.id)
+    }
+  }
+
+  /** Internal delivery path, protected against review/ship startup across awaits. */
+  private async deliverFollowUp(sessionId: string, text: string, images: PromptImage[] = [], queued = false, refs?: PromptRefs, reReview = false): Promise<void> {
+    const work = this.workBySession(sessionId)
+    if (work) this.prompting.add(work.id)
+    try {
+      await this.submitFollowUp(sessionId, text, images, queued, refs, reReview)
+    } finally {
+      if (work) {
+        this.prompting.delete(work.id)
+        this.resumeCompletion(work.id)
+      }
+    }
+  }
+
+  private resumeCompletion(workId: string): void {
+    if (this.isPrompting(workId)) return
+    const pending = this.deferredCompletions.get(workId)
+    if (!pending) return
+    this.deferredCompletions.delete(workId)
+    void this.finishBuildTurn(pending.work, pending.revision)
+  }
+
+  private async submitFollowUp(sessionId: string, text: string, images: PromptImage[], queued: boolean, refs?: PromptRefs, reReview = false): Promise<void> {
     let work = this.workBySession(sessionId)
     let resumed = false
     if (work) {
@@ -684,17 +995,21 @@ class WorkManager {
       // Recheck after the service probe: a reviewer/ship may have started.
       if (reviewManager.isBusyReviewing(work.id) || shipManager.isShipping(work.id) || work.state === 'REVIEW' || work.state === 'FIXING') throw new Error('Review or shipping started while checking the session; try again once it finishes.')
       // A human re-prompting a settled build takes it back through review.
-      if (['WAITING_HUMAN', 'APPROVED', 'SHIPPED'].includes(work.state)) {
+      if (work.state !== 'BUILDING') {
         this.setState(work.id, 'BUILDING')
         resumed = true
       }
+      const ordinaryPrChat = work.owns_worktree === 0 && !!work.pr_url
+      if (reReview && !ordinaryPrChat) getDb().prepare('UPDATE work SET review_after_followup = 1 WHERE id = ?').run(work.id)
       this.touch(work.id)
     }
     const files = [...promptImageFiles(images), ...(refs && work ? fileAttachments(refs, work.worktree_dir) : [])]
     const skills = refs ? skillAttachments(refs) : []
     const payload = {
       sessionID: sessionId,
-      text: work && work.owns_worktree !== 0 ? `${text}\n\n${BUILD_COMPLETION_INSTRUCTIONS}` : text,
+      text: work && !work.pr_url && (work.owns_worktree !== 0 || reReview || work.review_after_followup)
+        ? `${text}\n\n${BUILD_COMPLETION_INSTRUCTIONS}`
+        : text,
       ...(files.length ? { files } : {}),
       ...(skills.length ? { skills } : {}),
       delivery: (queued ? 'queue' : 'steer') as 'queue' | 'steer'

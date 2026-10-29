@@ -11,10 +11,12 @@ import { pushToWindows } from '../push'
 import { openCodeService } from './service'
 import { streamBuffer } from './stream-buffer'
 
-const TRANSCRIPT_RESET_EVENTS = new Set(['session.message.content.updated', 'session.revert.committed', 'session.compaction.ended'])
+const TRANSCRIPT_RESET_EVENTS = new Set(['session.message.content.updated', 'session.revert.committed', 'session.revert.cleared', 'session.compaction.ended'])
 const TOOL_STATE_EVENTS = new Set(['session.tool.called', 'session.tool.success', 'session.tool.failed'])
 
 class EventBus extends EventEmitter {
+  generation = 0
+  established = false
   private abort: AbortController | undefined
   private running = false
 
@@ -34,6 +36,7 @@ class EventBus extends EventEmitter {
   }
 
   private stopStream(): void {
+    this.established = false
     this.abort?.abort()
     this.abort = undefined
   }
@@ -52,14 +55,25 @@ class EventBus extends EventEmitter {
           backoff = 1000
           // Resync only after the live stream is established. Doing this when
           // it disconnects leaves a gap during backoff with no later recovery.
-          if ((event as RawEvent).type === 'server.connected') this.emit('stream:reconnect')
+          if ((event as RawEvent).type === 'server.connected') {
+            this.established = true
+            this.generation++
+            this.emit('stream:reconnect')
+          }
           if (process.env.REVVA_DEBUG_EVENTS) console.log('[bus]', (event as RawEvent).type)
           this.emit('event', event)
           const raw = event as RawEvent
+          streamBuffer.onEvent(raw)
+          if (raw.type === 'session.step.streamed' && typeof raw.data?.sessionID === 'string') {
+            // A draft may become readable before its tools finish. This is a
+            // targeted recovery hint, not a reason to clear the observed prefix.
+            pushToWindows({ kind: 'session.transcript', sessionId: raw.data.sessionID, reset: false })
+          }
           if ((raw.type === 'session.step.ended' || raw.type === 'session.step.failed') && typeof raw.data?.sessionID === 'string') {
             streamBuffer.flush(raw.data.sessionID)
           }
           if (TRANSCRIPT_RESET_EVENTS.has(raw.type) && typeof raw.data?.sessionID === 'string') {
+            streamBuffer.reset(raw.data.sessionID)
             pushToWindows({ kind: 'session.transcript', sessionId: raw.data.sessionID })
           }
           if (TOOL_STATE_EVENTS.has(raw.type) && typeof raw.data?.sessionID === 'string') {
@@ -76,6 +90,7 @@ class EventBus extends EventEmitter {
       } catch {
         // stream error — fall through to reconnect
       }
+      this.established = false
       if (!this.running || controller.signal.aborted) return
       if (Date.now() - startedAt > 60_000) backoff = 1000
       await new Promise((r) => setTimeout(r, backoff))

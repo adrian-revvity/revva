@@ -4,7 +4,7 @@
  * prompt image mapping). Keep dependencies minimal: no imports from feature
  * modules other than the OpenCode service wrapper.
  */
-import { openCodeService } from './opencode/service'
+import { latestAssistantText } from './opencode/transcript-requests'
 import type { PromptImage } from '@shared/types'
 
 /** Depth-first collect of ADF/markdown-ish `{text, content}` nodes into plain text. */
@@ -25,15 +25,7 @@ export function collectAdfText(node: unknown): string[] {
 /** Concatenated text parts of a session's last assistant message ('' when none).
  *  Lives here so review + rework share one implementation. */
 export async function fetchLastAssistantText(sessionID: string): Promise<string> {
-  // desc so the limit keeps the newest messages; first assistant = final reply.
-  const res = await openCodeService.api.message.list({ sessionID, order: 'desc', limit: 200 })
-  const last = res.data.find((m) => m.type === 'assistant')
-  let text = ''
-  for (const part of (last as { content?: unknown[] })?.content ?? []) {
-    const p = part as Record<string, unknown>
-    if (p.type === 'text' && typeof p.text === 'string') text += p.text
-  }
-  return text
+  return latestAssistantText(sessionID, AbortSignal.timeout(30_000))
 }
 
 /** The SDK error for "session busy" / conflicts carries status 409. */

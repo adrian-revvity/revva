@@ -11,6 +11,11 @@ import { keepAwake } from './keep-awake'
 import { openCodeService } from './opencode/service'
 import { chatManager } from './opencode/chats'
 import { throughputMeter } from './opencode/throughput'
+import { transcriptSubscriptions } from './opencode/transcript-subscriptions'
+import { transcriptRequests, compactLatestAnswer, invalidateLatestAnswers, recordExecutionStart } from './opencode/transcript-requests'
+import { contextUsage, locationModels, sessionMetadata } from './opencode/session-metrics'
+import { performanceMeter } from './opencode/performance'
+import { eventBus, type RawEvent } from './opencode/bus'
 import { inboxManager } from './opencode/inbox'
 import { triageManager } from './opencode/triage'
 import { listAgents, listModels, listSkills } from './opencode/inventory'
@@ -40,7 +45,9 @@ import {
   promptImageSchema,
   promptRefsSchema,
   worktreeRemoveInputSchema,
-  worktreeInspectInputSchema,
+  worktreeBranchesInputSchema,
+  worktreeListInputSchema,
+  conversationCheckoutInputSchema,
   workAbandonInputSchema,
   type PromptImage,
   type PromptRefs
@@ -69,6 +76,35 @@ function sessionDirectory(sessionId: string): string {
 }
 
 export function registerIpc(): void {
+  const id = (value: unknown): string => z.string().min(1).max(500).parse(value)
+  const history = (e: Electron.IpcMainInvokeEvent, sessionId: string, since?: string, requestId?: string): Promise<import('@shared/types').TranscriptPage> =>
+    transcriptRequests.run(e.sender, requestId === undefined ? undefined : id(requestId), async (signal) => {
+      const result = await chatManager.messages(id(sessionId), typeof since === 'string' ? since : undefined, signal)
+      performanceMeter.add('history.ipc.count')
+      if (performanceMeter.enabled) performanceMeter.add('history.ipc.bytes', Buffer.byteLength(JSON.stringify(result)))
+      return result
+    })
+  ipcMain.handle(IPC.transcriptSubscribe, (e, sessionId: unknown, token: unknown) => transcriptSubscriptions.subscribe(e.sender, id(sessionId), id(token)))
+  ipcMain.handle(IPC.transcriptUnsubscribe, (e, token: unknown) => transcriptSubscriptions.unsubscribe(e.sender, id(token)))
+  ipcMain.handle(IPC.transcriptCancel, (e, requestId: unknown) => transcriptRequests.cancel(e.sender, id(requestId)))
+  ipcMain.handle(IPC.transcriptLatest, (e, sessionId: unknown, generation: unknown, requestId: unknown) =>
+    transcriptRequests.run(e.sender, id(requestId), async (signal) => {
+      const answer = await compactLatestAnswer(id(sessionId), z.number().finite().parse(generation), signal)
+      performanceMeter.add('preview.ipc.count')
+      if (performanceMeter.enabled) performanceMeter.add('preview.ipc.bytes', Buffer.byteLength(JSON.stringify(answer)))
+      return answer
+    }))
+  ipcMain.handle(IPC.performanceFrame, (_e, delay: unknown) => {
+    if (typeof delay === 'number' && Number.isFinite(delay) && delay >= 0 && delay < 60_000) {
+      performanceMeter.add('renderer.frame.ms', delay)
+      performanceMeter.add('renderer.frames')
+    }
+  })
+  eventBus.on('stream:reconnect', () => invalidateLatestAnswers())
+  eventBus.on('event', (event: RawEvent) => {
+    if (event.type === 'session.execution.started' && typeof event.data?.sessionID === 'string' && typeof event.created === 'number') recordExecutionStart(event.data.sessionID, event.created)
+    if (['session.execution.started', 'session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted', 'session.revert.committed', 'session.revert.cleared', 'session.compaction.ended', 'session.message.content.updated'].includes(event.type) && typeof event.data?.sessionID === 'string') invalidateLatestAnswers(event.data.sessionID)
+  })
   /* ---------- service ---------- */
   ipcMain.handle(IPC.serviceStatus, () => openCodeService.getStatus())
   ipcMain.handle(IPC.serviceRetry, async () => {
@@ -189,7 +225,7 @@ export function registerIpc(): void {
   /* ---------- chats ---------- */
   ipcMain.handle(IPC.chatList, () => chatManager.list())
   ipcMain.handle(IPC.chatCreate, (_e, input: unknown) => chatManager.create(chatCreateInputSchema.parse(input)))
-  ipcMain.handle(IPC.chatMessages, (_e, sessionId: string, since?: string) => chatManager.messages(String(sessionId), typeof since === 'string' ? since : undefined))
+  ipcMain.handle(IPC.chatMessages, history)
   ipcMain.handle(IPC.chatPrompt, (_e, sessionId: string, text: string, images?: unknown, queued?: unknown, refs?: unknown, sentAt?: unknown) =>
     throughputMeter.measurePrompt(String(sessionId), sentAt, () =>
       chatManager.prompt(String(sessionId), String(text), promptImageList(images), Boolean(queued), promptRefs(refs)))
@@ -207,10 +243,9 @@ export function registerIpc(): void {
   })
   ipcMain.handle(IPC.chatDelete, (_e, sessionId: string) => chatManager.remove(String(sessionId)))
   ipcMain.handle(IPC.sessionModel, async (_e, sessionId: string) => {
-    const api = openCodeService.api
-    const session = await api.session.get({ sessionID: String(sessionId) })
+    const session = await sessionMetadata(String(sessionId))
     if (!session.model) return null
-    const models = await api.model.list({ location: { directory: session.location.directory } }).catch(() => undefined)
+    const models = await locationModels(session.location.directory).catch(() => undefined)
     const selected = models?.data.find((model) =>
       model.providerID === session.model?.providerID &&
       (model.id === session.model.id || model.modelID === session.model.id)
@@ -229,7 +264,7 @@ export function registerIpc(): void {
     getDb().prepare('UPDATE chat SET provider_id = ?, model_id = ? WHERE session_id = ?').run(ref.providerID, ref.id, String(sessionId))
   })
   ipcMain.handle(IPC.sessionAgent, async (_e, sessionId: string) => {
-    const session = await openCodeService.api.session.get({ sessionID: String(sessionId) })
+    const session = await sessionMetadata(String(sessionId))
     return session.agent ?? null
   })
   ipcMain.handle(IPC.sessionSetAgent, async (_e, sessionId: string, agentID: unknown) => {
@@ -241,27 +276,7 @@ export function registerIpc(): void {
     if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 500) throw new Error('Invalid session ID.')
     clipboard.writeText(sessionId)
   })
-  ipcMain.handle(IPC.sessionContextUsage, async (_e, sessionId: string) => {
-    const api = openCodeService.api
-    const [messages, session] = await Promise.all([
-      api.session.context({ sessionID: String(sessionId) }),
-      api.session.get({ sessionID: String(sessionId) })
-    ])
-    // Context excludes history before compaction. Use the last reported response,
-    // not a sum of usage across turns.
-    const boundary = session.revert?.messageID
-    const end = boundary ? messages.findIndex((message) => message.id === boundary) : messages.length
-    if (end < 0) return null
-    const last = messages.slice(0, end).findLast((message) => message.type === 'assistant' && message.tokens !== undefined)
-    if (!last || last.type !== 'assistant' || !last.tokens) return null
-    const usage = last.tokens
-    const tokens = usage.input + usage.output + usage.reasoning + usage.cache.read + usage.cache.write
-    if (!Number.isFinite(tokens) || tokens <= 0) return null
-    const models = await api.model.list({ location: { directory: session.location.directory } }).catch(() => undefined)
-    const model = models?.data.find((m) => m.providerID === last.model.providerID && (m.id === last.model.id || m.modelID === last.model.id))
-    const limit = model?.limit?.context
-    return { tokens, limit: limit && limit > 0 ? limit : undefined, providerID: last.model.providerID, modelID: last.model.id }
-  })
+  ipcMain.handle(IPC.sessionContextUsage, (_e, sessionId: string) => contextUsage(String(sessionId)))
   ipcMain.handle(IPC.sessionActive, async () => Object.keys(await openCodeService.api.session.active()))
   ipcMain.handle(IPC.sessionQueue, (_e, sessionId: string) => chatManager.queue(String(sessionId)))
   ipcMain.handle(IPC.sessionQueueCancel, (_e, sessionId: string, inboxId: string) =>
@@ -272,7 +287,13 @@ export function registerIpc(): void {
   )
 
   /* ---------- worktree cleanup ---------- */
-  ipcMain.handle(IPC.worktreeList, () => worktreeManager.list())
+  ipcMain.handle(IPC.worktreeList, (_e, input?: unknown) =>
+    worktreeManager.list(worktreeListInputSchema.parse(input ?? {}))
+  )
+  ipcMain.handle(IPC.worktreeBranches, (_e, input: unknown) => {
+    const { directory } = worktreeBranchesInputSchema.parse(input)
+    return worktreeManager.branches(directory)
+  })
   ipcMain.handle(IPC.worktreePreflight, (_e, input: unknown) => {
     const { repoDir, directory } = worktreeRemoveInputSchema.parse(input)
     return worktreeManager.preflight(repoDir, directory)
@@ -281,10 +302,7 @@ export function registerIpc(): void {
     const parsed = worktreeRemoveInputSchema.parse(input)
     return worktreeManager.remove(parsed.repoDir, parsed.directory, parsed.confirmedSignature, parsed.confirmed)
   })
-  ipcMain.handle(IPC.worktreeInspect, (_e, input: unknown) => {
-    const parsed = worktreeInspectInputSchema.parse(input)
-    return worktreeManager.inspect(parsed.repoDir, parsed.directory)
-  })
+  ipcMain.handle(IPC.worktreeCleanupChat, () => worktreeManager.cleanupChat())
 
   /* ---------- jira ---------- */
   ipcMain.handle(IPC.jiraStatus, () => ({
@@ -318,16 +336,24 @@ export function registerIpc(): void {
     if (directory !== undefined && typeof directory !== 'string') throw new Error('Invalid review folder.')
     return workManager.conversationContext(String(sessionId), directory)
   })
+  ipcMain.handle(IPC.workSetCheckout, (_e, sessionId: unknown, input: unknown) =>
+    workManager.setCheckout(id(sessionId), conversationCheckoutInputSchema.parse(input))
+  )
   ipcMain.handle(IPC.workAbandonPreflight, (_e, id: string) => workManager.abandonPreflight(String(id)))
   ipcMain.handle(IPC.workAbandon, (_e, input: unknown) => {
     const parsed = workAbandonInputSchema.parse(input)
     return workManager.abandon(parsed.id, parsed.confirmedSignature, parsed.confirmed)
   })
-  ipcMain.handle(IPC.workMessages, (_e, sessionId: string, since?: string) => chatManager.messages(String(sessionId), typeof since === 'string' ? since : undefined))
+  ipcMain.handle(IPC.workMessages, history)
   ipcMain.handle(IPC.workPrompt, (_e, sessionId: string, text: string, images?: unknown, queued?: unknown, refs?: unknown, sentAt?: unknown) =>
-    throughputMeter.measurePrompt(String(sessionId), sentAt, () =>
-      workManager.followUp(String(sessionId), String(text), promptImageList(images), Boolean(queued), promptRefs(refs)))
-  )
+    workManager.followUp(String(sessionId), String(text), promptImageList(images), Boolean(queued), promptRefs(refs), sentAt))
+  ipcMain.handle(IPC.workPromptNow, (_e, sessionId: string, text: string, images?: unknown, refs?: unknown) =>
+    workManager.promptNow(String(sessionId), z.string().max(200_000).parse(text), promptImageList(images), promptRefs(refs)))
+  ipcMain.handle(IPC.workQueue, (_e, workId: string) => workManager.queuedFollowUps(String(workId)))
+  ipcMain.handle(IPC.workQueueEdit, (_e, workId: string, id: string, text: unknown, refs?: unknown) =>
+    workManager.editQueued(String(workId), String(id), z.string().max(200_000).parse(text), promptRefs(refs)))
+  ipcMain.handle(IPC.workQueueCancel, (_e, workId: string, id: string) => workManager.cancelQueued(String(workId), String(id)))
+  ipcMain.handle(IPC.workQueueSend, (_e, workId: string, id: string) => workManager.sendQueuedNow(String(workId), String(id)))
   ipcMain.handle(IPC.workInterrupt, (_e, sessionId: string) => workManager.interrupt(String(sessionId)))
   ipcMain.handle(IPC.workReviews, (_e, workId: string) => reviewManager.reviewsFor(String(workId)))
   ipcMain.handle(IPC.workReviewStart, async (_e, workId: string) => {

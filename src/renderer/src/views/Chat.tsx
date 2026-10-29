@@ -15,7 +15,8 @@ import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from '@/compone
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
-import { EMPTY_STREAM, mergeHistory, mergeTranscript, streamKey, type LiveTranscript } from '@/lib/transcript-stream'
+import { EMPTY_STREAM, beginTranscriptSnapshot, displayTranscript, finishTranscriptSnapshot, mergeHistory, mergeTranscript, streamKey, transcriptReady, useTranscriptVisibility, type LiveTranscript } from '@/lib/transcript-stream'
+import { transcriptRequest } from '@/lib/transcript-requests'
 import { SessionStats } from '@/components/session-stats'
 import { MD_COMPONENTS } from '@/components/message-markdown'
 import { Choice } from './NewChatDialog'
@@ -23,6 +24,8 @@ import type { ChatMessage, ChatToolCall, FileHit, ModelRef, PromptImage, PromptR
 import { FormCard, PermissionCard, useInbox } from './InboxView'
 import { PrConversationActions } from './PrConversationActions'
 import { ConversationEnvironment, ConversationActions, ConversationDetails } from './ConversationEnvironment'
+import { WorkAgentActivity } from './WorkAgentActivity'
+import { WorkFollowUpQueue } from './WorkFollowUpQueue'
 
 const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp'
 const MAX_IMAGES = 8
@@ -124,11 +127,11 @@ async function filesToImages(files: File[]): Promise<PromptImage[]> {
 
 /** Everything a transcript surface needs, so chats and ticket cockpit share one view. */
 export interface TranscriptDrive {
-  /** Stable cache key prefix, e.g. ['chat-messages'] or ['work-messages']. */
+  /** Shared transcript cache prefix: simultaneous surfaces coalesce HTTP work. */
   queryKey: readonly unknown[]
-  load(sessionId: string, since?: string): Promise<TranscriptPage>
+  load(sessionId: string, since?: string, requestId?: string): Promise<TranscriptPage>
   /** `queued` = session is busy; park the message in the inbox behind the running turn. */
-  send(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs, sentAt?: number): Promise<void>
+  send(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs, sentAt?: number): Promise<void | 'queued'>
   interrupt(sessionId: string): Promise<void>
 }
 
@@ -170,7 +173,8 @@ export function TranscriptView({
   emptyHint,
   readOnly,
   onNewSession,
-  hideSessionDetails
+  hideSessionDetails,
+  work
 }: {
   sessionId: string
   drive: TranscriptDrive
@@ -182,6 +186,7 @@ export function TranscriptView({
   onNewSession?: () => void
   /** Session details are shown elsewhere for ticket transcripts. */
   hideSessionDetails?: boolean
+  work?: WorkSummary
 }): React.JSX.Element {
   const qc = useQueryClient()
   const pending = useInbox().filter((item) => item.sessionID === sessionId)
@@ -193,9 +198,21 @@ export function TranscriptView({
     refetchInterval: (q) => q.state.status === 'error' ? 5000 : q.state.data?.length ? 10_000 : 60_000
   })
   const running = sendingSession === sessionId || (activity.data?.includes(sessionId) ?? false)
+  const reviewing = work?.state === 'REVIEW' || work?.state === 'FIXING'
+  const visible = useTranscriptVisibility()
+  const [attachment, setAttachment] = useState<{ sessionId: string; ready: Promise<void> } | null>(null)
+  useEffect(() => {
+    const display = displayTranscript(qc, sessionId)
+    setAttachment({ sessionId, ready: display.ready })
+    return display.release
+  }, [qc, sessionId])
   const messages = useQuery({
     queryKey: [...drive.queryKey, sessionId],
     queryFn: async ({ signal }) => {
+      // Rapid A → B → A can leave React holding A's old attachment promise.
+      // Await the current subscription, not a released surface's acknowledgement.
+      await transcriptReady(sessionId)
+      if (signal.aborted) throw signal.reason
       const old = qc.getQueryData<ChatMessage[]>([...drive.queryKey, sessionId]) ?? []
       const resetKey = ['transcript-reset', sessionId] as const
       const generation = qc.getQueryData<number>(resetKey) ?? 0
@@ -203,14 +220,27 @@ export function TranscriptView({
       // last persisted step. Optimistic ids aren't valid server cursors.
       const anchor = old.find((row) => row.tools?.some((tool) => tool.state === 'running' || tool.state === 'streaming'))
         ?? old.findLast((row) => !row.id.startsWith('pending-'))
-      const page = await drive.load(sessionId, generation ? undefined : anchor?.id)
+      const authoritative = beginTranscriptSnapshot(sessionId)
+      const page = await transcriptRequest(signal, (requestId) => drive.load(sessionId, generation || authoritative ? undefined : anchor?.id, requestId))
       if (signal.aborted) throw signal.reason
+      if ((qc.getQueryData<number>(resetKey) ?? 0) !== generation) throw new Error('Transcript changed during snapshot; retrying.')
+      const history = page.reset ? page.messages : mergeHistory(old, page.messages)
+      if (!finishTranscriptSnapshot(qc, sessionId, history, page.missingPrefixes)) {
+        qc.setQueryData<number>(resetKey, (old = 0) => old + 1)
+        throw new Error('Transcript stream gap; retrying snapshot.')
+      }
       if (generation && qc.getQueryData<number>(resetKey) === generation) qc.setQueryData(resetKey, 0)
-      return page.reset ? page.messages : mergeHistory(old, page.messages)
+      return history
     },
+    enabled: visible && attachment?.sessionId === sessionId,
     refetchOnMount: 'always',
-    refetchInterval: (q) => q.state.status === 'error' ? 5000 : running ? 10_000 : false
+    refetchInterval: (q) => !visible ? false : q.state.status === 'error' ? 5000 : running ? 10_000 : false
   })
+  useEffect(() => {
+    if (visible) return
+    void qc.cancelQueries({ queryKey: [...drive.queryKey, sessionId] })
+    void qc.cancelQueries({ queryKey: ['session-context-usage', sessionId] })
+  }, [visible, qc, drive, sessionId])
   const live = useQuery<LiveTranscript>({
     queryKey: streamKey(sessionId),
     queryFn: () => EMPTY_STREAM,
@@ -229,28 +259,11 @@ export function TranscriptView({
     }
     wasRunning.current = running
   }, [running, sessionId, drive, qc])
-  useEffect(() => {
-    if (!messages.data) return
-    // Prune only after the snapshot is committed. A cancelled/in-flight fetch
-    // must never delete live text that is not yet present in the history cache.
-    const savedById = new Map(messages.data.map((row) => [row.id, row]))
-    qc.setQueryData<LiveTranscript>(streamKey(sessionId), (current = EMPTY_STREAM) => {
-      let remaining: LiveTranscript | undefined
-      for (const message of Object.values(current)) {
-        const saved = savedById.get(message.id)
-        if (saved && saved.text.trim().startsWith(message.text.trim())) {
-          remaining ??= { ...current }
-          delete remaining[message.id]
-        }
-      }
-      return remaining ?? current
-    })
-  }, [messages.data, sessionId, qc])
   const model = useQuery({
     queryKey: ['session-model', sessionId],
     queryFn: () => window.revva.session.model(sessionId)
   })
-  const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models() })
+  const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models(), enabled: false })
   const modelLabel = model.data
     ? `${model.data.providerID}/${model.data.id}${model.data.variant ? ` · ${model.data.variant}` : ''}`
     : model.isError ? 'Unavailable' : model.isPending ? 'Loading…' : 'Service default'
@@ -430,7 +443,7 @@ export function TranscriptView({
   }
 
   const send = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (stopReview?: boolean) => {
       const sentAt = Date.now()
       const text = input.trim()
       const images = pendingImages
@@ -445,7 +458,7 @@ export function TranscriptView({
       const refs = extractRefs(text, skills.data ?? [])
       const messageKey = [...drive.queryKey, sessionId]
       const optimisticId = `pending-${crypto.randomUUID()}`
-      if (!running) {
+      if (!running && (!reviewing || stopReview)) {
         qc.setQueryData<ChatMessage[]>(messageKey, (old = []) => [...old, {
           id: optimisticId,
           role: 'user',
@@ -457,15 +470,24 @@ export function TranscriptView({
         }])
       }
       // Start before awaiting IPC: completion may arrive before prompt() resolves.
-      setSendingSession(sessionId)
+      if (!reviewing || stopReview) setSendingSession(sessionId)
       try {
-        await drive.send(sessionId, text, images.length ? images : undefined, running, refs, sentAt)
+        const result = stopReview && work
+          ? await window.revva.work.promptNow(sessionId, text, images, refs)
+          : await drive.send(sessionId, text, images.length ? images : undefined, running, refs, sentAt)
+        if (result === 'queued') {
+          // The pipeline may have become busy after the UI's activity snapshot.
+          qc.setQueryData<ChatMessage[]>(messageKey, (old = []) => old.filter((message) => message.id !== optimisticId))
+          if (work) void qc.invalidateQueries({ queryKey: ['work-queue', work.id] })
+          else void qc.invalidateQueries({ queryKey: ['works'] })
+        }
       } catch (error) {
         qc.setQueryData<ChatMessage[]>(messageKey, (old = []) => old.filter((message) => message.id !== optimisticId))
         throw error
       } finally {
         setSendingSession((current) => current === sessionId ? null : current)
         void qc.invalidateQueries({ queryKey: ['session-activity'] })
+        if (work) void qc.invalidateQueries({ queryKey: ['work-queue', work.id] })
       }
       if (qc.getQueryData(draftKey) === input) {
         qc.setQueryData(draftKey, '')
@@ -555,18 +577,13 @@ export function TranscriptView({
                 />
               )
             )}
-            {running && groups[groups.length - 1]?.kind !== 'assistant' && (
-              <MessageRow
-                message={{ id: 'streaming', role: 'assistant', text: '', createdAt: Date.now() }}
-                streaming
-              />
-            )}
             <div ref={bottomRef} />
           </div>
         </ScrollArea>
       </div>
 
-      {running && (
+      {work && <WorkAgentActivity key={work.id} work={work} />}
+      {running && !reviewing && (
         <div className="shrink-0 px-3 py-1.5 sm:px-6" role="status" aria-live="polite">
           <div className="mx-auto flex max-w-3xl items-center gap-2 overflow-hidden">
             <Badge variant="secondary" className="shrink-0 text-[10px]">Thinking</Badge>
@@ -592,6 +609,11 @@ export function TranscriptView({
 
       {!readOnly && (
         <div className="shrink-0 border-t px-3 py-3 sm:px-6">
+          {work && <WorkFollowUpQueue work={work} running={running} refsForText={(text) => extractRefs(text, skills.data ?? [])} />}
+          {reviewing && <div className="mx-auto mb-2 flex max-w-3xl flex-wrap items-center gap-2">
+            <p className="min-w-0 flex-1 text-xs text-muted-foreground">{work?.state === 'FIXING' ? 'Fixing' : 'Review'} in progress. Follow-ups run after this cycle, before shipping.</p>
+            <Button type="button" size="xs" variant="outline" disabled={!canSend} onClick={() => send.mutate(true)}>{send.isPending ? 'Sending…' : 'Stop review and send now'}</Button>
+          </div>}
           {queued.length > 0 && (
             <div className="mx-auto mb-2 flex max-w-3xl flex-col gap-1">
               {queued.map((q, i) => (
@@ -614,7 +636,7 @@ export function TranscriptView({
             className="relative mx-auto max-w-3xl"
             onSubmit={(e) => {
               e.preventDefault()
-              send.mutate()
+              if (canSend) send.mutate(undefined)
             }}
             onPaste={(e) => {
               const files = Array.from(e.clipboardData.files)
@@ -704,11 +726,13 @@ export function TranscriptView({
                   }
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault()
-                    send.mutate()
+                    if (canSend) send.mutate(undefined)
                   }
                 }}
                 placeholder={
-                  running
+                  reviewing
+                    ? 'Queue a follow-up for after review/fixing…'
+                    : running
                     ? 'Running — send to queue your message…'
                     : 'Message…'
                 }
@@ -767,7 +791,7 @@ export function TranscriptView({
                     <Square />
                   </Button>
                 )}
-                <Button type="submit" size="icon-sm" className={!running ? 'ml-auto' : undefined} aria-label={running ? 'Queue message' : 'Send message'} title={running ? 'Queue message' : 'Send message'} disabled={!canSend}>
+                <Button type="submit" size="icon-sm" className={!running ? 'ml-auto' : undefined} aria-label={reviewing ? 'Queue follow-up' : running ? 'Queue message' : 'Send message'} title={reviewing ? 'Queue follow-up' : running ? 'Queue message' : 'Send message'} disabled={!canSend}>
                   <ArrowUp />
                 </Button>
               </div>
@@ -795,27 +819,29 @@ function QueuedRow({ item, position, onCancel, onSteer, steering }: {
         {steered ? 'Steering into this turn' : `#${position} queued`}
       </span>
       <span className="truncate">{item.text || (item.imageCount > 0 ? `${item.imageCount} image(s)` : '(empty)')}</span>
-      {!steered && (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              aria-label="Steer the running agent with this message now"
-              className="ml-auto shrink-0 rounded px-1.5 py-0.5 font-medium text-foreground hover:bg-black/10 hover:text-foreground dark:hover:bg-white/10"
-              disabled={steering}
-              onClick={onSteer}
-            >
-              {steering ? 'Steering…' : 'Steer now'}
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="top" className="max-w-xs">
-            Send this message into the current run at the next step boundary instead of waiting for the queue.
-          </TooltipContent>
-        </Tooltip>
-      )}
-      <button type="button" aria-label="Remove queued message" className={cn('shrink-0 rounded p-0.5 hover:bg-black/10 hover:text-foreground dark:hover:bg-white/10', !steered && 'ml-auto')} onClick={onCancel}>
-        <X className="size-3" />
-      </button>
+      <div className="ml-auto flex shrink-0 items-center gap-1">
+        {!steered && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                aria-label="Steer the running agent with this message now"
+                className="rounded px-1.5 py-0.5 font-medium text-foreground hover:bg-black/10 hover:text-foreground dark:hover:bg-white/10"
+                disabled={steering}
+                onClick={onSteer}
+              >
+                {steering ? 'Steering…' : 'Steer now'}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-xs">
+              Send this message into the current run at the next step boundary instead of waiting for the queue.
+            </TooltipContent>
+          </Tooltip>
+        )}
+        <button type="button" aria-label="Remove queued message" className="rounded p-0.5 hover:bg-black/10 hover:text-foreground dark:hover:bg-white/10" onClick={onCancel}>
+          <X className="size-3" />
+        </button>
+      </div>
     </div>
   )
 }
@@ -866,7 +892,7 @@ function AssistantTurn({
 }: {
   messages: ChatMessage[]
   streaming: boolean
-}): React.JSX.Element {
+}): React.JSX.Element | null {
   const tools = messages.flatMap((m) => m.tools ?? [])
   const thinking = messages.map((m) => m.thinking).filter(Boolean).join('\n\n')
   const texts = messages.map((m) => m.text).filter((t) => t.trim() !== '')
@@ -875,7 +901,9 @@ function AssistantTurn({
 
   const [stepsOpen, setStepsOpen] = useState(false)
 
-  const nothingYet = shown.length === 0 && tools.length === 0 && !thinking
+  // A turn with no real content yet (no text, no tools, no reasoning) gets no
+  // card — the footer badge already says Thinking while the step spins up.
+  if (shown.length === 0 && tools.length === 0 && !thinking) return null
   return (
     <div className="flex justify-start">
       <div className="flex max-w-[85%] flex-col gap-1.5 rounded-lg bg-muted px-3.5 py-2.5 text-[13px] leading-relaxed">
@@ -898,16 +926,12 @@ function AssistantTurn({
             </CollapsibleContent>
           </Collapsible>
         )}
-        {nothingYet ? (
-          <span className="italic text-muted-foreground">{busy ? 'Thinking…' : '…'}</span>
-        ) : (
-          shown.map((text, i) => (
-            <div key={i} className="min-w-0">
-              <AssistantMarkdown text={text} streaming={streaming && i === shown.length - 1} />
-              {streaming && i === shown.length - 1 && <span className="animate-pulse">▍</span>}
-            </div>
-          ))
-        )}
+        {shown.map((text, i) => (
+          <div key={i} className="min-w-0">
+            <AssistantMarkdown text={text} streaming={streaming && i === shown.length - 1} />
+            {streaming && i === shown.length - 1 && <span className="animate-pulse">▍</span>}
+          </div>
+        ))}
       </div>
     </div>
   )
@@ -923,8 +947,7 @@ export const MessageRow = memo(function MessageRow({ message, streaming }: { mes
       <div
         className={cn(
           'flex min-w-0 max-w-[85%] flex-col gap-2 rounded-lg px-3.5 py-2.5 text-[13px] leading-relaxed',
-          isUser ? 'bg-primary text-primary-foreground' : 'bg-muted',
-          streaming && empty && 'italic text-muted-foreground'
+          isUser ? 'bg-primary text-primary-foreground' : 'bg-muted'
         )}
       >
         {images.length > 0 && (
@@ -944,9 +967,7 @@ export const MessageRow = memo(function MessageRow({ message, streaming }: { mes
             ))}
           </div>
         )}
-        {empty && streaming ? (
-          'Thinking…'
-        ) : isUser ? (
+        {isUser ? (
           <div className="min-w-0">
             <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_BUBBLE_MD_COMPONENTS}>{message.text}</ReactMarkdown>
           </div>
@@ -1051,8 +1072,8 @@ function ComposerRolePickers({ sessionId, container }: {
   const [modelOpen, setModelOpen] = useState(false)
   const [agentOpen, setAgentOpen] = useState(false)
   const [search, setSearch] = useState('')
-  const agents = useQuery({ queryKey: ['agents'], queryFn: () => window.revva.inventory.agents(), staleTime: 60_000 })
-  const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models(), staleTime: 60_000 })
+  const agents = useQuery({ queryKey: ['agents'], queryFn: () => window.revva.inventory.agents(), staleTime: 60_000, enabled: agentOpen })
+  const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models(), staleTime: 60_000, enabled: modelOpen })
   const model = useQuery({ queryKey: ['session-model', sessionId], queryFn: () => window.revva.session.model(sessionId) })
   const agent = useQuery({ queryKey: ['session-agent', sessionId], queryFn: () => window.revva.session.agent(sessionId) })
   const switchModel = useMutation({
@@ -1126,7 +1147,7 @@ function ComposerRolePickers({ sessionId, container }: {
                 {otherModels.map(modelRow)}
               </>
             )}
-            {modelMatches.length === 0 && <p className="px-2 py-1.5 text-xs text-muted-foreground">No models match.</p>}
+            {modelMatches.length === 0 && <p role={models.isError ? 'alert' : 'status'} className="px-2 py-1.5 text-xs text-muted-foreground">{models.isPending ? 'Loading models…' : models.isError ? 'Couldn’t load models. Close and reopen to retry.' : 'No models match.'}</p>}
           </div>
         </PopoverContent>
       </Popover>
@@ -1156,7 +1177,7 @@ function ComposerRolePickers({ sessionId, container }: {
                 />
               )
             })}
-            {agentMatches.length === 0 && <p className="px-2 py-1.5 text-xs text-muted-foreground">No agents match.</p>}
+            {agentMatches.length === 0 && <p role={agents.isError ? 'alert' : 'status'} className="px-2 py-1.5 text-xs text-muted-foreground">{agents.isPending ? 'Loading agents…' : agents.isError ? 'Couldn’t load agents. Close and reopen to retry.' : 'No agents match.'}</p>}
           </div>
         </PopoverContent>
       </Popover>
@@ -1201,14 +1222,14 @@ function ComposerRolePickers({ sessionId, container }: {
 
 export const chatDrive: TranscriptDrive = {
   queryKey: ['chat-messages'],
-  load: (id, since) => window.revva.chat.messages(id, since),
+  load: (id, since, requestId) => window.revva.chat.messages(id, since, requestId),
   send: (id, text, images, queued, refs, sentAt) => window.revva.chat.prompt(id, text, images, queued, refs, sentAt),
   interrupt: (id) => window.revva.chat.interrupt(id)
 }
 
 export const workDrive: TranscriptDrive = {
-  queryKey: ['work-messages'],
-  load: (id, since) => window.revva.work.messages(id, since),
+  queryKey: ['chat-messages'],
+  load: (id, since, requestId) => window.revva.work.messages(id, since, requestId),
   send: (id, text, images, queued, refs, sentAt) => window.revva.work.prompt(id, text, images, queued, refs, sentAt),
   interrupt: (id) => window.revva.work.interrupt(id)
 }
@@ -1279,6 +1300,7 @@ export function ChatView({ sessionId, onOpenChat, work: providedWork }: { sessio
       key={sessionId}
       sessionId={sessionId}
       drive={chatWork ? workDrive : chatDrive}
+      work={chatWork}
       hideSessionDetails
       emptyHint={chat?.ticketKey ? `Ask anything about ${chat.ticketKey}.` : 'Ask anything about this project — this chat is not attached to a ticket.'}
       onNewSession={onOpenChat && chat ? newSession : undefined}

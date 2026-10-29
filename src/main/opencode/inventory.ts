@@ -6,6 +6,7 @@ import { openCodeService } from './service'
 import { scriptManager } from '../scripts'
 import { favoriteModels } from '../db'
 import type { AgentInfo, ModelInfo, SkillInfo } from '@shared/types'
+import { performanceMeter } from './performance'
 
 export async function listAgents(): Promise<AgentInfo[]> {
   const res = await openCodeService.api.agent.list({})
@@ -17,7 +18,7 @@ export async function listAgents(): Promise<AgentInfo[]> {
 
 export async function listModels(): Promise<ModelInfo[]> {
   const [res, gating, favorites] = await Promise.all([
-    openCodeService.api.model.list({}),
+    performanceMeter.request('picker.models', () => openCodeService.api.model.list({})),
     morningGate(),
     Promise.resolve(favoriteModels())
   ])

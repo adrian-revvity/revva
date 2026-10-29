@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, FolderX, GitBranch, MessageSquareText, RefreshCw, Trash2, TriangleAlert } from 'lucide-react'
+import { AlertTriangle, FolderX, GitBranch, RefreshCw, Sparkles, Trash2, TriangleAlert } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -153,13 +153,17 @@ export function WorktreeRemovalDialog({
 }
 
 /**
- * Worktree cleanup: every linked worktree across known repos. Removing first asks
- * the main process for a removal proof (worktree-safety.ts) that counts exactly
- * what removal would destroy; anything that destroys content needs its own
- * checkbox in the confirmation dialog, and every removal is re-proven — and
- * aborted on any drift — immediately before it happens. Deletion is not
- * race-free against external writers; the dialog says so. Branches are deleted
- * only when git allows it (`branch -d` — never unmerged work).
+ * Worktree cleanup: every linked worktree across known repos, with two paths.
+ * "Clean up with agent" hands the whole set to one chat whose agent checks each
+ * worktree for work that would be lost and removes only the provably-safe ones
+ * with plain `git worktree remove` (git itself refuses anything dirty; locked
+ * and live-work worktrees are off-limits). Manual removal first asks the main
+ * process for a removal proof (worktree-safety.ts) that counts exactly what
+ * removal would destroy; anything that destroys content needs its own checkbox
+ * in the confirmation dialog, and every removal is re-proven — and aborted on
+ * any drift — immediately before it happens. Deletion is not race-free against
+ * external writers; the dialog says so. Branches are deleted only when git
+ * allows it (`branch -d` — never unmerged work).
  */
 export function WorktreesDialog({
   open,
@@ -267,18 +271,20 @@ export function WorktreesDialog({
   })
 
   /**
-   * "Can I remove this?" — opens an audit chat that reads the worktree (dirty
-   * files, unpushed/unmerged commits) and answers whether removal is safe or
-   * work must be committed first. Read-only; the chat only advises.
+   * "Clean up with agent": opens one chat primed to audit every worktree for
+   * work that would be lost (uncommitted, unpushed, unmerged) and remove only
+   * the provably-safe ones itself — plain `git worktree remove`, never force,
+   * so git's own guard refuses anything the agent misjudges. The agent reports
+   * what it kept and why; locked and live-work worktrees are off-limits.
    */
-  const inspect = useMutation({
-    mutationFn: (w: WorktreeInfo) => window.revva.worktrees.inspect({ repoDir: w.repoDir, directory: w.directory }),
+  const cleanup = useMutation({
+    mutationFn: () => window.revva.worktrees.cleanupChat(),
     onSuccess: (res) => {
       void qc.invalidateQueries({ queryKey: ['chats'] })
       onOpenChange(false)
       onOpenChat(res.sessionId)
     },
-    onError: (err) => setError(`Could not start the check: ${(err as Error).message}`)
+    onError: (err) => setError(`Could not start the cleanup: ${(err as Error).message}`)
   })
 
   const targets = items.filter((w) => selected.has(keyOf(w)))
@@ -294,7 +300,9 @@ export function WorktreesDialog({
             {worktrees.data && <Badge variant="secondary">{items.length}</Badge>}
           </DialogTitle>
           <DialogDescription>
-            Linked worktrees across your repos. Removal always previews first: you see exactly what
+            Linked worktrees across your repos. Clean up with agent hands them to one chat that
+            checks each for uncommitted or unpushed work and removes only the ones that hold
+            nothing. Manual removal always previews first: you see exactly what
             gets destroyed (counts, never contents), tick each worktree whose files would go, and
             revva re-fingerprints staged contents and files right before deleting — aborting when
             content was staged, added, removed, or normally edited since the preview. A writer that
@@ -335,8 +343,18 @@ export function WorktreesDialog({
           )}
           <Button
             size="sm"
-            variant="destructive"
+            variant="outline"
             className="ml-auto"
+            title="Open a chat where an agent checks every worktree for uncommitted or unpushed work, removes the ones that hold nothing, and reports what it kept"
+            disabled={items.length === 0 || cleanup.isPending}
+            onClick={() => cleanup.mutate()}
+          >
+            {cleanup.isPending ? <RefreshCw className="mr-1 size-3.5 animate-spin" /> : <Sparkles className="mr-1 size-3.5" />}
+            {cleanup.isPending ? 'Starting…' : 'Clean up with agent'}
+          </Button>
+          <Button
+            size="sm"
+            variant="destructive"
             disabled={targets.length === 0 || busy}
             onClick={() => preflight.mutate(targets)}
           >
@@ -391,25 +409,6 @@ export function WorktreesDialog({
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="h-6 gap-1 px-2 text-[11px]"
-                    title="Open a chat that checks whether this worktree can be removed, or whether commits are missing first"
-                    disabled={inspect.isPending}
-                    onClick={(e) => {
-                      e.preventDefault() // the row is a label — don't toggle selection
-                      e.stopPropagation()
-                      inspect.mutate(w)
-                    }}
-                  >
-                    {inspect.isPending && inspect.variables?.directory === w.directory ? (
-                      <RefreshCw className="size-3.5 animate-spin" />
-                    ) : (
-                      <MessageSquareText className="size-3.5" />
-                    )}
-                    Can I remove this?
-                  </Button>
                   {w.busy && (
                     <Badge variant="outline" className="border-amber-500/40 text-amber-600 dark:text-amber-400">
                       {w.ticketKey ?? 'live work'}

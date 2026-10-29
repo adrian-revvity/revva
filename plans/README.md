@@ -9,13 +9,13 @@ conditions, and update your row when done.
 `src/renderer` React). Verification gates are `pnpm typecheck` && `pnpm build`
 only — **no automated tests by owner policy (AGENTS.md); never add test
 frameworks**. Manual click-through via `pnpm dev` is the functional check.
-All plans stamped commit `830a20f` (typecheck clean there as of 2026-10-28).
+Original plans stamped commit `830a20f` (typecheck clean there as of 2026-10-28); later plans carry their own commit and baseline notes.
 
 > **Before executing anything**: as of plan-writing, the main working tree had
 > uncommitted in-flight changes (`App.tsx`, `Chat.tsx`, `works.ts`, `ipc.ts`,
 > `worktrees.ts`, …) overlapping several plans' files. Executors must run in a
-> clean branch/worktree per their plan's Git workflow section — commit or
-> stash the in-flight work first.
+> clean branch/worktree per their plan's Git workflow section. Preserve existing
+> work; do not commit, stash, reset, or overwrite it without owner authorization.
 
 ## Execution order & status
 
@@ -33,11 +33,13 @@ All plans stamped commit `830a20f` (typecheck clean there as of 2026-10-28).
 | 010 | [Bind review completion to the correct execution](010-review-completion-freshness.md) | P1 | M | — | TODO |
 | 011 | [Choose queue or steer in the composer](011-queue-or-steer-composer.md) | P2 | S–M | — | TODO |
 | 012 | [Add human diff comments to ticket work](012-inline-diff-review.md) | P2 | L | 010 | TODO |
+| 016 | [Reduce conversation lag and background OpenCode work](016-visible-conversation-performance.md) | P1 | L | Completed 002/003/004/006 | BLOCKED on remaining verification, 2026-10-29 — prefix cache + visible-only delivery verified live; controlled benchmark 1,042,963→19,690 streamed chars (displayed) and →0 (background); remaining: reviewer-dialog live pass, compaction boundary, review gates, forced form recovery |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
 
 ## Dependency notes
 
+- **016** was added 2026-10-29 at `e079ed2` against the current dirty working tree. It extends completed streaming/polling/recovery plans rather than repeating them. Covers visible-only incremental detail, timing diagnostics, cancellation, lighter metrics/previews, bounded reconnect scans, and targeted refreshes. Its verification notes record the current unrelated typecheck failures. No source fixes were applied during this audit/handoff.
 - **New plans 009–012** were added 2026-10-29 at commit `ecf85d5` and are based on a dirty working tree. Preserve and inspect the existing in-flight changes; don't reset, stash, or overwrite them. Execute 009 → 010 → 011 → 012 as the recommended order; 012 depends on 010 because feedback must not weaken the review gate. 011 is otherwise independent.
 - **002 after 001**: both edit `wire()`/`ensureSchema` regions of the same
   module set; 001's deletions shift lines 002's excerpts cite.

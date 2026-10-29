@@ -4,17 +4,30 @@
  * Placeholders: {ticketKey} {summary} {description} {prUrl} {prNumber} {repo} {title} {base} {head}
  */
 
+const PROPORTIONAL_WORK_GUIDANCE = `Keep investigation proportional to the task:
+- For a small, localized change, inspect the relevant implementation and its immediate dependencies, then make the smallest correct patch. Broaden investigation only when a specific uncertainty or evidence requires it.
+- Batch independent searches and reads when possible. Reuse information already gathered; repeat a search or read only to resolve a specific uncertainty or inspect changed content.
+- Once you can explain the relevant behavior and identify the change, move to implementation rather than continuing broad discovery.
+- Use skills when directly relevant or required by the repository. Use research/planning subagents only when the task's complexity warrants their overhead.
+- Run the repository's required checks; efficiency is not a reason to skip verification or safety rules.`
+
 export const DEFAULT_START_PROMPT = `You are working on Jira ticket {ticketKey}: {summary}.
 
 {description}
 
-Tackle this ticket end to end: read the whole ticket, understand the surrounding code before touching it, and follow the repository's engineering and testing policies — small focused changes, no drive-by refactors. Use available skills and subagents where they help with planning or research. Keep the tree committable and commit your work with clear messages referencing {ticketKey}.
+Tackle this ticket end to end: read the whole ticket, understand the relevant code before touching it, and follow the repository's engineering and testing policies — small focused changes, no drive-by refactors. Keep the tree committable and commit your work with clear messages referencing {ticketKey}.
+
+${PROPORTIONAL_WORK_GUIDANCE}
 
 Do not push and do not open PRs — revva runs reviews and ships for you.`
 
 export const DEFAULT_TACKLE_PROMPT = `Open a working session on Jira ticket {ticketKey}: {summary}.
 
-Tackle this ticket with me: explore the relevant code, think out loud about the approach, follow good practices, use agents/skills when useful, and ask before anything destructive. Make commits when it makes sense.
+{description}
+
+Tackle this ticket with me: inspect the relevant code, briefly explain the approach, follow the repository's engineering and testing policies, and ask before anything destructive. Make commits when it makes sense.
+
+${PROPORTIONAL_WORK_GUIDANCE}
 
 By default do NOT push or open PRs — that is revva's job. But if I ask during the conversation (e.g. "push when the changes are done"), push the branch and update the linked PR if one exists, otherwise open one.`
 
@@ -36,8 +49,15 @@ Write Markdown that will be embedded inside the existing PR body:
 export const PROMPT_PLACEHOLDER_HELP =
   'Placeholders: {ticketKey} {summary} {description} {prUrl} {prNumber} {repo} {title} {base} {head}'
 
+/** Always appended to ticket-seeded prompts: the repo's own workflow skills gate on plugins Revva cannot enable. */
+export const WORKFLOW_SKILL_GUARD = `Revva workflow guard:
+- Work from this prompt directly. Do not run the repository's ticket or review workflow skills or slash commands (e.g. /jiraWork, /reviewPR) — Revva orchestrates those steps itself.
+- Never stop because such a skill or an optional plugin (e.g. superpowers) is missing or not enabled; treat that as irrelevant. A missing skill or plugin is only a blocker if the ticket's actual implementation needs it.`
+
 /** Always appended, including when the user customized the start template. */
-export const BUILD_COMPLETION_INSTRUCTIONS = `Revva implementation phase:
+export const BUILD_COMPLETION_INSTRUCTIONS = `${WORKFLOW_SKILL_GUARD}
+
+Revva implementation phase:
 - Do not launch code-review, test-audit or UI-review agents during implementation; Revva runs the independent review team after you finish. Run the repository's appropriate verification yourself.
 - Only when the ticket is fully implemented, verified according to repo policy, and committed, end your final message with exactly REVVA: DONE on its own last line.
 - If blocked, missing a dependency/plugin, asking a question, or only presenting a plan, explain what is needed and do NOT emit REVVA: DONE. Ending a turn alone does not start review.`
