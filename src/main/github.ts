@@ -657,12 +657,12 @@ class GitHubManager {
     const pr = await this.detail(prUrl)
     const ticketKey = this.ticketForPr(pr)
     const { directory, onPrBranch } = await this.chatDirectoryForPr(pr, ticketKey)
-    const sel = roleConfigGet('prReview')
+    const generalSelection = settingGet<{ agentID?: string; model?: { providerID: string; id: string } } | undefined>('chat.lastSelection')
     const chat = await chatManager.create({
       directory,
       title: `${ticketKey ?? `${pr.repo}#${pr.number}`} · PR #${pr.number} chat`.slice(0, 80),
-      agentID: sel?.agentID,
-      model: sel?.model,
+      agentID: generalSelection?.agentID,
+      model: generalSelection?.model,
       ticketKey,
       prUrl: pr.url
     })

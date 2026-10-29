@@ -10,6 +10,7 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 - **Active work in the Inbox meter** — the Inbox’s active meter now includes ticket work in the same active states as the sidebar, even when its background agent sessions are not the ticket’s primary session.
 - **Ticket status stays visible beside its chat** — sidebar chat entries now show their linked ticket workflow state, and the Workflow popover displays agent/review details inline instead of opening a separate dialog.
 - **Ticket-linked chats stay ordinary chats** — existing conversations still get ticket workflow controls, but no longer receive build-completion instructions or trigger automatic review/fixer rounds just because they are linked to a ticket.
+- **Chat with a PR uses your general chat setup** — it now reuses the agent and model from the last New chat selection instead of the dedicated PR-review role; PR linking, workflow actions and headers are unchanged.
 
 ## [1.1.0] - 2026-10-29
 
