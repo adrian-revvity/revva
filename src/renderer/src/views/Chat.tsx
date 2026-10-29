@@ -546,6 +546,19 @@ export function TranscriptView({
   const rows = useMemo(() => mergeTranscript(messages.data ?? [], live.data ?? []), [messages.data, live.data])
   /** Consecutive assistant messages are steps of one agent turn — one card each. */
   const groups = useMemo(() => groupRows(rows), [rows])
+  const latestGroup = groups.at(-1)
+  const currentTurn = running && latestGroup?.kind === 'assistant' ? latestGroup : null
+  const latestTool = currentTurn?.kind === 'assistant'
+    ? currentTurn.msgs.flatMap((message) => message.tools ?? []).at(-1)
+    : undefined
+  const activityText = currentTurn?.kind === 'assistant'
+    ? [
+        `Step ${currentTurn.msgs.length}`,
+        latestTool
+          ? `${latestTool.state === 'error' ? 'Failed' : latestTool.state === 'completed' ? 'Last' : 'Running'}: ${latestTool.name}${latestTool.detail ? ` · ${latestTool.detail.split('\n')[0]}` : ''}`
+          : currentTurn.msgs.at(-1)?.thinking ? 'Reasoning' : 'Generating response'
+      ].filter(Boolean).join(' · ')
+    : 'Preparing response…'
   const queued = queue.data ?? []
   const canSend = (input.trim().length > 0 || pendingImages.length > 0) && !send.isPending
 
@@ -593,6 +606,15 @@ export function TranscriptView({
           </div>
         </ScrollArea>
       </div>
+
+      {running && (
+        <div className="shrink-0 px-3 py-1.5 sm:px-6" role="status" aria-live="polite">
+          <div className="mx-auto flex max-w-3xl items-center gap-2 overflow-hidden">
+            <Badge variant="secondary" className="shrink-0 text-[10px]">Thinking</Badge>
+            <span className="truncate text-[11px] text-muted-foreground" title={activityText}>{activityText}</span>
+          </div>
+        </div>
+      )}
 
       {!readOnly && pending.length > 0 && (
         <section aria-label="Waiting on you" className="max-h-[40vh] shrink-0 overflow-y-auto border-t bg-muted/30 px-3 py-3 sm:px-6">
