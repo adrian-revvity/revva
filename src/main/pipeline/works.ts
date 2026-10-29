@@ -20,6 +20,7 @@ import { getDb, settingGet } from '../db'
 import { sessionIndex } from '../opencode/session-index'
 import { streamBuffer } from '../opencode/stream-buffer'
 import { pushToWindows } from '../push'
+import { notifyInbound } from '../notify'
 import { collectAdfText, isConflict, promptImageFiles } from '../util'
 import { reviewManager } from '../review'
 import { shipManager } from '../ship'
@@ -55,6 +56,17 @@ function slugBranch(key: string): string {
 
 /** States where the last move came from the pipeline, not from you — these flag unread. */
 export const UNREAD_WORTHY_STATES = new Set(['APPROVED', 'WAITING_HUMAN', 'REWORK', 'SHIPPED'])
+
+/** Human phrasing for the OS notification body. */
+function stateLabel(state: WorkState): string {
+  switch (state) {
+    case 'APPROVED': return 'approved'
+    case 'WAITING_HUMAN': return 'needs you'
+    case 'REWORK': return 'rework requested'
+    case 'SHIPPED': return 'shipped'
+    default: return state.toLowerCase()
+  }
+}
 
 class WorkManager {
   private wired = false
@@ -278,6 +290,11 @@ class WorkManager {
 
   private setState(id: string, state: WorkState, blocker?: string): void {
     getDb().prepare('UPDATE work SET state = ?, blocker = ?, updated_at = ? WHERE id = ?').run(state, blocker ?? null, Date.now(), id)
+    // A pipeline move into an unread-worthy state raises a finished-unseen inbox card.
+    if (UNREAD_WORTHY_STATES.has(state)) {
+      const work = getDb().prepare('SELECT ticket_key FROM work WHERE id = ?').get(id) as { ticket_key: string } | undefined
+      if (work) notifyInbound(`work:${id}`, 'Ticket work update', `${work.ticket_key} · ${stateLabel(state)}${blocker ? ` — ${blocker}` : ''}`)
+    }
     this.emit(id, state)
   }
 

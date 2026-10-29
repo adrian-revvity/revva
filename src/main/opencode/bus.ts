@@ -46,18 +46,24 @@ class EventBus extends EventEmitter {
       try {
         for await (const event of client.event.subscribe({ signal: controller.signal })) {
           backoff = 1000
+          // Resync only after the live stream is established. Doing this when
+          // it disconnects leaves a gap during backoff with no later recovery.
+          if ((event as RawEvent).type === 'server.connected') this.emit('stream:reconnect')
           if (process.env.REVVA_DEBUG_EVENTS) console.log('[bus]', (event as RawEvent).type)
           this.emit('event', event)
+          if ((event as RawEvent).type === 'mcp.status.changed') {
+            pushToWindows({ kind: 'mcp.changed' })
+          }
           this.pushActivity(event as RawEvent)
           this.pushInbox(event as RawEvent)
           this.pushModel(event as RawEvent)
+          this.pushAgent(event as RawEvent)
         }
       } catch {
         // stream error — fall through to reconnect
       }
       if (!this.running || controller.signal.aborted) return
       if (Date.now() - startedAt > 60_000) backoff = 1000
-      this.emit('stream:reconnect')
       await new Promise((r) => setTimeout(r, backoff))
       backoff = Math.min(backoff * 2, 15_000)
     }
@@ -66,18 +72,7 @@ class EventBus extends EventEmitter {
   private pushActivity(event: RawEvent): void {
     const sessionId = event.data?.sessionID
     if (typeof sessionId !== 'string') return
-    let running: boolean | undefined
-    if (event.type === 'session.execution.started') running = true
-    else if (
-      event.type === 'session.execution.succeeded' ||
-      event.type === 'session.execution.failed' ||
-      event.type === 'session.execution.interrupted'
-    ) running = false
-    else if (event.type === 'session.status') {
-      const status = event.data?.status as { type?: unknown } | undefined
-      if (status?.type === 'busy' || status?.type === 'retry') running = true
-      else if (status?.type === 'idle') running = false
-    }
+    const running = runningSignal(event)
     if (running === undefined) return
     const update: PushEvent = { kind: 'session.activity', sessionId, running }
     pushToWindows(update)
@@ -98,6 +93,14 @@ class EventBus extends EventEmitter {
     const update: PushEvent = { kind: 'session.model', sessionId }
     pushToWindows(update)
   }
+
+  private pushAgent(event: RawEvent): void {
+    if (event.type !== 'session.agent.selected') return
+    const sessionId = event.data?.sessionID
+    if (typeof sessionId !== 'string') return
+    const update: PushEvent = { kind: 'session.agent', sessionId }
+    pushToWindows(update)
+  }
 }
 
 export const eventBus = new EventBus()
@@ -107,4 +110,25 @@ export interface RawEvent {
   type: string
   data?: Record<string, unknown>
   [key: string]: unknown
+}
+
+/**
+ * True when the event says the session started running, false when it stopped,
+ * undefined when the event says nothing about running state. Shared with the
+ * watchdog so "still marked busy" cannot drift from what the UI is told.
+ */
+export function runningSignal(event: RawEvent): boolean | undefined {
+  if (event.type === 'session.execution.started') return true
+  if (
+    event.type === 'session.execution.succeeded' ||
+    event.type === 'session.execution.failed' ||
+    event.type === 'session.execution.interrupted'
+  )
+    return false
+  if (event.type === 'session.status') {
+    const status = event.data?.status as { type?: unknown } | undefined
+    if (status?.type === 'busy' || status?.type === 'retry') return true
+    if (status?.type === 'idle') return false
+  }
+  return undefined
 }

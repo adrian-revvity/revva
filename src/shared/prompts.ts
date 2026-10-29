@@ -24,6 +24,15 @@ The PR branch is checked out in this directory. Inspect the diff with \`gh pr vi
 
 End your report with exactly one final line: \`VERDICT: APPROVED\` when clean, or \`VERDICT: CHANGES\` when there are blockers or majors.`
 
+export const DEFAULT_PR_DESCRIPTION_PROMPT = `You write the description of pull request {prUrl} ({repo}#{prNumber}: {title}, {head} → {base}) for human reviewers at a small product team. Reviewers skim: lead with what a reader gets out of the change, then the notable decisions.
+
+Write Markdown that will be embedded inside the existing PR body:
+- Start with \`## Summary\`, then \`## Changes\` grouping the work by theme (not one bullet per commit), and add \`## Testing\`, \`## Risk\`, or \`## Follow-ups\` only when the evidence supports them.
+- Explain why, not just what. Name the important files in backticks.
+- Say plainly what is unverified or risky when the diff suggests it. Never invent behaviour, ticket numbers, test commands, or metrics that the facts and diff do not show.
+- Under 220 words. No top-level \`#\` heading. No preamble or closing remarks — output only the Markdown section.
+- Never output HTML comments.`
+
 export const PROMPT_PLACEHOLDER_HELP =
   'Placeholders: {ticketKey} {summary} {description} {prUrl} {prNumber} {repo} {title} {base} {head}'
 

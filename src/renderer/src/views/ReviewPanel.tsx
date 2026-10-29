@@ -176,7 +176,6 @@ function ReviewDetail({ row, canRetry, auto, onClose }: {
 
 /** Read-only live transcript of one reviewer/fixer session. */
 function ReviewTranscript({ row, onClose }: { row: ReviewRow; onClose: () => void }): React.JSX.Element | null {
-  const qc = useQueryClient()
   const sessionId = row.sessionId
   const running = row.status === 'running' || row.status === 'pending'
 
@@ -187,19 +186,9 @@ function ReviewTranscript({ row, onClose }: { row: ReviewRow; onClose: () => voi
       send: async () => {
         throw new Error('Reviews are read-only.')
       },
-      interrupt: (id) => window.revva.work.interrupt(id),
-      subscribe: (_id, onDelta, onDone) =>
-        window.revva.events.on((event: PushEvent) => {
-          // review.delta carries accumulated text (main buffers per message).
-          if (event.kind === 'review.delta' && event.sessionId === _id) {
-            onDelta(event.text)
-          } else if (event.kind === 'review.updated') {
-            const fresh = (qc.getQueryData<ReviewRow[]>(['reviews', event.workId]) ?? []).find((r) => r.id === row.id)
-            if (fresh && fresh.status !== 'running' && fresh.status !== 'pending') onDone()
-          }
-        })
+      interrupt: (id) => window.revva.work.interrupt(id)
     }
-  }, [qc, row.id])
+  }, [])
 
   if (!sessionId) return <p className="px-1 py-2 text-[11px] text-muted-foreground">No session yet.</p>
   return (

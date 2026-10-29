@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, memo, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowUp, Check, ChevronRight, Copy, ImageIcon, Square, X } from 'lucide-react'
+import { ArrowUp, Bot, Check, ChevronDown, ChevronRight, Copy, Cpu, ImageIcon, Square, Tag, X } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Button } from '@/components/ui/button'
@@ -10,14 +10,45 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from '@/components/ui/popover'
+import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
+import { mergeTranscript, streamKey } from '@/lib/transcript-stream'
 import { MD_COMPONENTS } from '@/components/message-markdown'
-import type { ChatMessage, ChatToolCall, FileHit, PromptImage, PromptRefs, QueuedMessage, SkillInfo } from '@shared/types'
+import { Choice } from './NewChatDialog'
+import type { ChatMessage, ChatToolCall, FileHit, ModelRef, PromptImage, PromptRefs, PushEvent, QueuedMessage, SkillInfo } from '@shared/types'
 import { FormCard, PermissionCard, useInbox } from './InboxView'
+import { PrConversationActions } from './PrConversationActions'
 
 const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp'
 const MAX_IMAGES = 8
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+// Preserve ordinary line breaks in user-written prompts while rendering Markdown.
+const USER_MD_COMPONENTS: typeof MD_COMPONENTS = {
+  ...MD_COMPONENTS,
+  p: ({ node: _node, ...props }) => <p className="my-1.5 whitespace-pre-wrap first:mt-0 last:mb-0" {...props} />,
+  a: ({ node: _node, ...props }) => (
+    <a
+      {...props}
+      className="underline underline-offset-2"
+      onClick={(e) => {
+        e.preventDefault()
+        if (props.href) void window.revva.shell.openExternal(props.href)
+      }}
+    />
+  )
+}
+const USER_BUBBLE_MD_COMPONENTS: typeof MD_COMPONENTS = {
+  ...USER_MD_COMPONENTS,
+  pre: ({ node: _node, ...props }) => (
+    <pre {...props} className="overflow-x-auto rounded-md border border-primary-foreground/20 bg-primary-foreground/10 px-3 py-2 text-xs leading-relaxed [&_code]:bg-transparent [&_code]:p-0" />
+  ),
+  code: ({ node: _node, ...props }) => (
+    <code {...props} className="rounded bg-primary-foreground/15 px-1 py-0.5 font-mono text-[11px]" />
+  )
+}
 
 /* ---------- composer tokens: /skill and @file ---------- */
 
@@ -96,15 +127,6 @@ export interface TranscriptDrive {
   /** `queued` = session is busy; park the message in the inbox behind the running turn. */
   send(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs): Promise<void>
   interrupt(sessionId: string): Promise<void>
-  /**
-   * Subscribe to streaming for this session. `onDelta` receives the FULL accumulated
-   * text (callers normalize increment-vs-accumulate); `onDone` fires on completion.
-   */
-  subscribe(
-    sessionId: string,
-    onDelta: (accumulated: string) => void,
-    onDone: () => void
-  ): () => void
 }
 
 export function SessionIdButton({ sessionId }: { sessionId: string }): React.JSX.Element {
@@ -160,11 +182,53 @@ export function TranscriptView({
 }): React.JSX.Element {
   const qc = useQueryClient()
   const pending = useInbox().filter((item) => item.sessionID === sessionId)
+  const [sendingSession, setSendingSession] = useState<string | null>(null)
+  const throughputKey = useMemo(() => ['session-throughput', sessionId] as const, [sessionId])
+  const [throughput, setThroughput] = useState<Extract<PushEvent, { kind: 'session.throughput' }> | null>(
+    () => qc.getQueryData<Extract<PushEvent, { kind: 'session.throughput' }>>(throughputKey) ?? null
+  )
+  const activity = useQuery({
+    queryKey: ['session-activity'],
+    queryFn: () => window.revva.session.active(),
+    refetchOnMount: 'always',
+    refetchInterval: (q) => q.state.status === 'error' ? 5000 : q.state.data?.length ? 10_000 : 60_000
+  })
+  const running = sendingSession === sessionId || (activity.data?.includes(sessionId) ?? false)
   const messages = useQuery({
     queryKey: [...drive.queryKey, sessionId],
     queryFn: () => drive.load(sessionId),
-    refetchInterval: (q) => (q.state.status === 'error' ? 5000 : false)
+    refetchOnMount: 'always',
+    refetchInterval: (q) => q.state.status === 'error' ? 5000 : running ? 3000 : false
   })
+  const live = useQuery<ChatMessage[]>({
+    queryKey: streamKey(sessionId),
+    queryFn: () => [],
+    initialData: [],
+    enabled: false
+  })
+  const wasRunning = useRef(running)
+  useEffect(() => {
+    // Polling/focus recovery can discover a completion whose push was missed.
+    // Fetch the final transcript before the running-only heartbeat stops.
+    if (wasRunning.current && !running) {
+      void qc.invalidateQueries({ queryKey: [...drive.queryKey, sessionId] })
+      void qc.invalidateQueries({ queryKey: ['session-queue', sessionId] })
+      void qc.invalidateQueries({ queryKey: ['session-context-usage', sessionId] })
+    }
+    wasRunning.current = running
+  }, [running, sessionId, drive, qc])
+  useEffect(() => {
+    if (!messages.data) return
+    // Prune only after the snapshot is committed. A cancelled/in-flight fetch
+    // must never delete live text that is not yet present in the history cache.
+    qc.setQueryData<ChatMessage[]>(streamKey(sessionId), (current = []) => {
+      const remaining = current.filter((message) => {
+        const saved = messages.data.find((row) => row.id === message.id)
+        return !saved || !saved.text.trim().startsWith(message.text.trim())
+      })
+      return remaining.length === current.length ? current : remaining
+    })
+  }, [messages.data, sessionId, qc])
   const model = useQuery({
     queryKey: ['session-model', sessionId],
     queryFn: () => window.revva.session.model(sessionId)
@@ -182,16 +246,24 @@ export function TranscriptView({
   })
   // Keep drafts in the renderer cache when a transcript unmounts or changes sessions.
   const draftKey = ['session-draft', sessionId] as const
-  const { data: input } = useQuery({
+  useQuery({
     queryKey: draftKey,
     queryFn: () => '',
     initialData: '',
     enabled: false,
     gcTime: Infinity
   })
+  const [draft, setDraft] = useState(() => ({
+    sessionId,
+    text: qc.getQueryData<string>(draftKey) ?? ''
+  }))
+  const input = draft.sessionId === sessionId ? draft.text : qc.getQueryData<string>(draftKey) ?? ''
+  const updateDraft = (text: string): void => {
+    setDraft({ sessionId, text })
+    qc.setQueryData(draftKey, text)
+  }
+  const [preview, setPreview] = useState(false)
 
-  /** Live streamed text for the in-flight assistant message (null when idle). */
-  const [streamingText, setStreamingText] = useState<string | null>(null)
   /** Images staged in the composer, waiting to be sent with the next message. */
   const [pendingImages, setPendingImages] = useState<PromptImage[]>([])
   /** Token under the caret (drives the /skill @file menu) and the highlighted row. */
@@ -199,9 +271,10 @@ export function TranscriptView({
   const [tokenIndex, setTokenIndex] = useState(0)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  /** The composer form doubles as the popover portal target for the role pickers. */
+  const composerRef = useRef<HTMLFormElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const positionedSessionRef = useRef<string | null>(null)
-  const running = streamingText !== null
   const contextUsage = useQuery({
     queryKey: ['session-context-usage', sessionId],
     queryFn: () => window.revva.session.contextUsage(sessionId),
@@ -211,21 +284,49 @@ export function TranscriptView({
   const usageLabel = usage?.limit
     ? `${Math.round(usage.tokens / usage.limit * 100)}%`
     : '—'
-  const contextIndicator = (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          aria-label={`Context usage: ${usageLabel}`}
-          className="shrink-0 rounded px-1 py-2 text-xs tabular-nums text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
-        >
-          {usageLabel}
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="top" className="max-w-xs">
-        {usage ? `${usage.tokens.toLocaleString()} tokens` : contextUsage.isPending ? 'Loading…' : 'Token count unavailable'}
-      </TooltipContent>
-    </Tooltip>
+  const throughputLabel = throughput && throughput.tokensPerSecond < 10
+    ? throughput.tokensPerSecond.toFixed(1)
+    : Math.round(throughput?.tokensPerSecond ?? 0).toString()
+  const speedValue = throughput
+    ? `~${throughputLabel} t/s`
+    : running ? 'Waiting' : '—'
+  const speedLabel = throughput && !throughput.running ? 'Last' : 'Speed'
+  const statsCard = (
+    <section aria-label="Context and model speed" className="pointer-events-auto w-40 overflow-hidden rounded-xl border bg-background/95 shadow-lg shadow-black/10 backdrop-blur-sm dark:shadow-black/40">
+      <div className="grid grid-cols-[0.8fr_1.2fr] divide-x">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button type="button" className="min-w-0 px-2 py-1.5 text-left hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring">
+              <span className="block text-[10px] text-muted-foreground">Context</span>
+              <span className="block truncate text-sm font-medium tabular-nums">{usageLabel}</span>
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="max-w-xs">
+            {usage
+              ? `${usage.tokens.toLocaleString()} context tokens${usage.limit ? ` of ${usage.limit.toLocaleString()}` : ''}`
+              : contextUsage.isPending ? 'Loading context usage…' : 'Context token count unavailable'}
+          </TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button type="button" className="min-w-0 px-2 py-1.5 text-left hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring">
+              <span className="block text-[10px] text-muted-foreground">{speedLabel}</span>
+              <span className="block truncate text-sm font-semibold tabular-nums text-foreground">{speedValue}</span>
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="max-w-xs">
+            {throughput
+              ? <>
+                  <div>{throughput.running ? 'Current estimate' : 'Last response'}: {throughput.windowTokens.toFixed(0)} estimated tokens in the last {throughput.elapsedMs < 1000 ? 'under 1s' : `${Math.round(throughput.elapsedMs / 1000)}s`} ({throughput.tokensPerSecond.toFixed(1)} tokens/s).</div>
+                  <div>Includes time with no streamed output; estimated from text and reasoning (~4 characters/token).</div>
+                  <div>{throughput.msSinceOutput === null ? 'Waiting for the first output.' : `Last output ${Math.max(0, throughput.msSinceOutput / 1000).toFixed(1)}s ago.`}</div>
+                  <div className="mt-1 text-muted-foreground">{shortModelLabel}</div>
+                </>
+              : running ? 'Waiting for the first streamed output.' : 'Speed appears after the first response.'}
+          </TooltipContent>
+        </Tooltip>
+      </div>
+    </section>
   )
 
   const skills = useQuery({
@@ -273,23 +374,10 @@ export function TranscriptView({
   const menuItems = menuList.length
 
   useEffect(() => {
-    setStreamingText(null)
     setPendingImages([])
-  }, [sessionId])
-
-  useEffect(() => {
-    return drive.subscribe(
-      sessionId,
-      (text) => setStreamingText(text),
-      () => {
-        setStreamingText(null)
-        void qc.invalidateQueries({ queryKey: [...drive.queryKey, sessionId] })
-        void qc.invalidateQueries({ queryKey: ['session-queue', sessionId] })
-        void qc.invalidateQueries({ queryKey: ['session-model', sessionId] })
-        void qc.invalidateQueries({ queryKey: ['session-context-usage', sessionId] })
-      }
-    )
-  }, [sessionId, drive, qc])
+    setPreview(false)
+    setThroughput(qc.getQueryData<Extract<PushEvent, { kind: 'session.throughput' }>>(throughputKey) ?? null)
+  }, [sessionId, qc, throughputKey])
 
   // Main pushes queue/model changes for every session (bus forwards all sessions, so
   // the TUI and other clients are covered); these pushes are the update channel.
@@ -301,11 +389,21 @@ export function TranscriptView({
       if (event.kind === 'session.model' && event.sessionId === sessionId) {
         void qc.invalidateQueries({ queryKey: ['session-model', sessionId] })
       }
+      if (event.kind === 'session.agent' && event.sessionId === sessionId) {
+        void qc.invalidateQueries({ queryKey: ['session-agent', sessionId] })
+      }
+      if (event.kind === 'session.throughput' && event.sessionId === sessionId) {
+        qc.setQueryData(throughputKey, event)
+        setThroughput(event)
+      }
       if (event.kind === 'session.activity' && event.sessionId === sessionId && !event.running) {
+        void qc.invalidateQueries({ queryKey: ['session-queue', sessionId] })
+        void qc.invalidateQueries({ queryKey: ['session-model', sessionId] })
+        void qc.invalidateQueries({ queryKey: ['session-agent', sessionId] })
         void qc.invalidateQueries({ queryKey: ['session-context-usage', sessionId] })
       }
     })
-  }, [sessionId, qc])
+  }, [sessionId, qc, throughputKey])
 
   // Stick-to-bottom: jump instantly (smooth animations restart per token and
   // fight the user), and only while the user is already at the bottom.
@@ -332,7 +430,7 @@ export function TranscriptView({
   }, [sessionId, messages.data])
   useEffect(() => {
     if (stick.current) bottomRef.current?.scrollIntoView({ block: 'end' })
-  }, [messages.data, streamingText])
+  }, [messages.data, live.data, running])
 
   const addImages = async (files: File[]): Promise<void> => {
     const images = await filesToImages(files)
@@ -352,7 +450,7 @@ export function TranscriptView({
     if (!token || !el) return
     const caret = el.selectionStart
     const next = input.slice(0, token.start) + insert + ' ' + input.slice(caret)
-    qc.setQueryData(draftKey, next)
+    updateDraft(next)
     const pos = token.start + insert.length + 1
     requestAnimationFrame(() => {
       el.focus()
@@ -364,7 +462,7 @@ export function TranscriptView({
   /** Accept the highlighted menu row: fire its action or insert its token. */
   const pickMenu = (item: MenuItem): void => {
     if (item.run) {
-      qc.setQueryData(draftKey, '')
+      updateDraft('')
       setToken(null)
       item.run()
     } else {
@@ -378,34 +476,46 @@ export function TranscriptView({
       const images = pendingImages
       // '/new' on its own is a command, not a message.
       if (text === '/new' && images.length === 0 && onNewSession) {
-        qc.setQueryData(draftKey, '')
+        updateDraft('')
         setToken(null)
         onNewSession()
         return
       }
       if (!text && images.length === 0) return
       const refs = extractRefs(text, skills.data ?? [])
-      await drive.send(sessionId, text, images.length ? images : undefined, running, refs)
-      if (qc.getQueryData(draftKey) === input) qc.setQueryData(draftKey, '')
+      const messageKey = [...drive.queryKey, sessionId]
+      const optimisticId = `pending-${crypto.randomUUID()}`
+      if (!running) {
+        qc.setQueryData<ChatMessage[]>(messageKey, (old = []) => [...old, {
+          id: optimisticId,
+          role: 'user',
+          text,
+          images: images.length
+            ? images.map((img) => ({ name: img.name, mime: img.mime, data: `data:${img.mime};base64,${img.data}` }))
+            : undefined,
+          createdAt: Date.now()
+        }])
+      }
+      // Start before awaiting IPC: completion may arrive before prompt() resolves.
+      setSendingSession(sessionId)
+      try {
+        await drive.send(sessionId, text, images.length ? images : undefined, running, refs)
+      } catch (error) {
+        qc.setQueryData<ChatMessage[]>(messageKey, (old = []) => old.filter((message) => message.id !== optimisticId))
+        throw error
+      } finally {
+        setSendingSession((current) => current === sessionId ? null : current)
+        void qc.invalidateQueries({ queryKey: ['session-activity'] })
+      }
+      if (qc.getQueryData(draftKey) === input) {
+        qc.setQueryData(draftKey, '')
+        setDraft((current) => current.sessionId === sessionId && current.text === input ? { sessionId, text: '' } : current)
+      }
       setPendingImages((current) => current.filter((image) => !images.includes(image)))
       setToken(null)
       if (running) {
         // Queued behind the running turn — it shows up in the queue strip, not the transcript.
         void qc.invalidateQueries({ queryKey: ['session-queue', sessionId] })
-      } else {
-        setStreamingText((prev) => prev ?? '')
-        qc.setQueryData<ChatMessage[]>([...drive.queryKey, sessionId], (old) => [
-          ...(old ?? []),
-          {
-            id: `pending-${Date.now()}`,
-            role: 'user',
-            text,
-            images: images.length
-              ? images.map((img) => ({ name: img.name, mime: img.mime, data: `data:${img.mime};base64,${img.data}` }))
-              : undefined,
-            createdAt: Date.now()
-          }
-        ])
       }
     },
     onSettled: () => {
@@ -421,10 +531,13 @@ export function TranscriptView({
 
   const interrupt = useMutation({
     mutationFn: () => drive.interrupt(sessionId),
-    onSettled: () => setStreamingText(null)
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: ['session-activity'] })
+      void qc.invalidateQueries({ queryKey: [...drive.queryKey, sessionId] })
+    }
   })
 
-  const rows = useMemo(() => messages.data ?? [], [messages.data])
+  const rows = useMemo(() => mergeTranscript(messages.data ?? [], live.data ?? []), [messages.data, live.data])
   /** Consecutive assistant messages are steps of one agent turn — one card each. */
   const groups = useMemo(() => groupRows(rows), [rows])
   const queued = queue.data ?? []
@@ -444,10 +557,13 @@ export function TranscriptView({
         )}
       </div>
       <div ref={scrollWrapRef} className="relative flex min-h-0 flex-1 flex-col">
+        <div className="pointer-events-none absolute right-3 top-3 z-10 sm:right-6">
+          {statsCard}
+        </div>
         <ScrollArea className="min-h-0 flex-1">
-          <div className="mx-auto flex max-w-3xl flex-col gap-4 px-6 py-5">
+          <div className="mx-auto flex max-w-3xl flex-col gap-4 px-6 pb-5 pt-16">
             {messages.isLoading && <Skeleton className="h-16 w-full" />}
-            {!messages.isLoading && rows.length === 0 && !running && (
+            {!messages.isLoading && !messages.isError && rows.length === 0 && !running && (
               <p className="mt-10 text-center text-sm text-muted-foreground">{emptyHint}</p>
             )}
             {groups.map((g, i) =>
@@ -458,13 +574,12 @@ export function TranscriptView({
                   key={g.msgs[0]?.id ?? i}
                   messages={g.msgs}
                   streaming={running && i === groups.length - 1}
-                  streamingText={running && i === groups.length - 1 ? streamingText : null}
                 />
               )
             )}
             {running && groups[groups.length - 1]?.kind !== 'assistant' && (
               <MessageRow
-                message={{ id: 'streaming', role: 'assistant', text: streamingText ?? '', createdAt: Date.now() }}
+                message={{ id: 'streaming', role: 'assistant', text: '', createdAt: Date.now() }}
                 streaming
               />
             )}
@@ -501,6 +616,7 @@ export function TranscriptView({
             <p role="alert" className="mx-auto mb-2 max-w-3xl text-xs text-destructive">{send.error.message}</p>
           )}
           <form
+            ref={composerRef}
             className="relative mx-auto max-w-3xl"
             onSubmit={(e) => {
               e.preventDefault()
@@ -567,12 +683,13 @@ export function TranscriptView({
                 ref={textareaRef}
                 value={input}
                 onChange={(e) => {
-                  qc.setQueryData(draftKey, e.target.value)
+                  updateDraft(e.target.value)
                   updateToken()
                 }}
                 onSelect={updateToken}
                 onBlur={() => setToken(null)}
                 onKeyDown={(e) => {
+                  if (e.nativeEvent.isComposing) return
                   if (token && menuItems > 0) {
                     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
                       e.preventDefault()
@@ -604,8 +721,18 @@ export function TranscriptView({
                 aria-label="Message"
                 aria-describedby="composer-hint"
                 rows={2}
-                className="max-h-48 min-h-16 resize-none rounded-none border-0 bg-transparent px-4 pb-2 pt-3 shadow-none focus-visible:ring-0 dark:bg-transparent"
+                hidden={preview}
+                className={cn('max-h-48 min-h-16 resize-none rounded-none border-0 bg-transparent px-4 pb-2 pt-3 shadow-none focus-visible:ring-0 dark:bg-transparent', preview && 'hidden')}
               />
+              {preview && (
+                <div aria-label="Message preview" className="max-h-48 min-h-16 overflow-auto px-4 pb-2 pt-3 text-sm">
+                  {input ? (
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>{input}</ReactMarkdown>
+                  ) : (
+                    <span className="text-muted-foreground">Nothing to preview</span>
+                  )}
+                </div>
+              )}
               <div className="flex min-w-0 items-center gap-1 px-2 pb-2">
                 <input
                   ref={fileInputRef}
@@ -629,10 +756,22 @@ export function TranscriptView({
                 >
                   <ImageIcon />
                 </Button>
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => {
+                    setPreview((current) => !current)
+                    setToken(null)
+                    if (preview) requestAnimationFrame(() => textareaRef.current?.focus())
+                  }}
+                >
+                  {preview ? 'Edit' : 'Preview'}
+                </Button>
+                <ComposerRolePickers key={sessionId} sessionId={sessionId} container={composerRef} />
                 <span id="composer-hint" className="min-w-0 flex-1 truncate px-1 text-xs text-muted-foreground">
                   Enter to send · Shift+Enter for a new line
                 </span>
-                {contextIndicator}
                 {running && (
                   <Button type="button" size="icon-sm" variant="outline" aria-label="Stop response" title="Stop response" onClick={() => interrupt.mutate()}>
                     <Square />
@@ -646,7 +785,6 @@ export function TranscriptView({
           </form>
         </div>
       )}
-      {readOnly && <div className="shrink-0 border-t px-6 py-1 text-right">{contextIndicator}</div>}
     </div>
   )
 }
@@ -668,6 +806,25 @@ function QueuedRow({ item, position, onCancel }: { item: QueuedMessage; position
 
 type TranscriptGroup = { kind: 'user'; msg: ChatMessage } | { kind: 'assistant'; msgs: ChatMessage[] }
 
+/** Pace Markdown parsing during streaming without delaying the completed message. */
+const RenderedAssistantMarkdown = memo(function RenderedAssistantMarkdown({ text }: { text: string }): React.JSX.Element {
+  return <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>{text}</ReactMarkdown>
+})
+
+const AssistantMarkdown = memo(function AssistantMarkdown({ text, streaming }: { text: string; streaming?: boolean }): React.JSX.Element {
+  const latest = useRef(text)
+  const [rendered, setRendered] = useState(text)
+  useEffect(() => {
+    latest.current = text
+  }, [text])
+  useEffect(() => {
+    if (!streaming) return
+    const timer = window.setInterval(() => setRendered(latest.current), 150)
+    return () => window.clearInterval(timer)
+  }, [streaming])
+  return <RenderedAssistantMarkdown text={streaming ? rendered : text} />
+})
+
 /** Collapse consecutive assistant messages (one per agent-loop step) into a single
  *  turn group, so a chain of tool calls reads as one thought process, not N bubbles. */
 function groupRows(rows: ChatMessage[]): TranscriptGroup[] {
@@ -684,26 +841,21 @@ function groupRows(rows: ChatMessage[]): TranscriptGroup[] {
 }
 
 /** One agent turn as a single card: thoughts and tool steps collapsed inside,
- *  the answer(s) visible. Auto-collapses the step list once the turn is done. */
+ *  the answer(s) visible. The step list stays collapsed unless the user opens it. */
 function AssistantTurn({
   messages,
-  streaming,
-  streamingText
+  streaming
 }: {
   messages: ChatMessage[]
   streaming: boolean
-  streamingText: string | null
 }): React.JSX.Element {
   const tools = messages.flatMap((m) => m.tools ?? [])
   const thinking = messages.map((m) => m.thinking).filter(Boolean).join('\n\n')
   const texts = messages.map((m) => m.text).filter((t) => t.trim() !== '')
-  const shown = streaming && streamingText !== null ? [...texts, streamingText] : texts
+  const shown = texts
   const busy = streaming || tools.some((t) => t.state === 'running' || t.state === 'streaming')
 
-  const [stepsOpen, setStepsOpen] = useState(true)
-  useEffect(() => {
-    setStepsOpen(busy)
-  }, [busy])
+  const [stepsOpen, setStepsOpen] = useState(false)
 
   const nothingYet = shown.length === 0 && tools.length === 0 && !thinking
   return (
@@ -733,9 +885,7 @@ function AssistantTurn({
         ) : (
           shown.map((text, i) => (
             <div key={i} className="min-w-0">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
-                {text}
-              </ReactMarkdown>
+              <AssistantMarkdown text={text} streaming={streaming && i === shown.length - 1} />
               {streaming && i === shown.length - 1 && <span className="animate-pulse">▍</span>}
             </div>
           ))
@@ -754,8 +904,8 @@ export const MessageRow = memo(function MessageRow({ message, streaming }: { mes
     <div className={cn('flex', isUser ? 'justify-end' : 'justify-start')}>
       <div
         className={cn(
-          'flex max-w-[85%] flex-col gap-2 rounded-lg px-3.5 py-2.5 text-[13px] leading-relaxed',
-          isUser ? 'bg-primary whitespace-pre-wrap text-primary-foreground' : 'bg-muted',
+          'flex min-w-0 max-w-[85%] flex-col gap-2 rounded-lg px-3.5 py-2.5 text-[13px] leading-relaxed',
+          isUser ? 'bg-primary text-primary-foreground' : 'bg-muted',
           streaming && empty && 'italic text-muted-foreground'
         )}
       >
@@ -777,7 +927,9 @@ export const MessageRow = memo(function MessageRow({ message, streaming }: { mes
         {empty && streaming ? (
           'Thinking…'
         ) : isUser ? (
-          message.text
+          <div className="min-w-0">
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_BUBBLE_MD_COMPONENTS}>{message.text}</ReactMarkdown>
+          </div>
         ) : (
           <div className="min-w-0">
             {message.thinking && <ThinkingBlock text={message.thinking} />}
@@ -787,16 +939,7 @@ export const MessageRow = memo(function MessageRow({ message, streaming }: { mes
             {!empty && (
               <>
                 {tools.length > 0 && <div className="mt-1" />}
-                {streaming ? (
-                  // Plain text while streaming: re-parsing ReactMarkdown over the
-                  // growing text on every push is the quadratic cost; markdown
-                  // runs once when the completed row swaps in after the refetch.
-                  <p className="whitespace-pre-wrap">{message.text}</p>
-                ) : (
-                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
-                    {message.text}
-                  </ReactMarkdown>
-                )}
+                <AssistantMarkdown text={message.text} streaming={streaming} />
               </>
             )}
             {streaming && <span className="animate-pulse">▍</span>}
@@ -875,24 +1018,163 @@ export function RunningBadge({ running }: { running: boolean }): React.JSX.Eleme
   )
 }
 
+/* ---------- composer model/agent pickers ---------- */
+
+/** Model + agent dropdowns in the composer footer: switch mid-conversation, applies
+ *  to subsequent turns (OpenCode switchModel/switchAgent — history is untouched). */
+function ComposerRolePickers({ sessionId, container }: {
+  sessionId: string
+  /** Composer element the menus portal into, so they stay anchored to it. */
+  container: React.RefObject<HTMLElement | null>
+}): React.JSX.Element {
+  const qc = useQueryClient()
+  const [modelOpen, setModelOpen] = useState(false)
+  const [agentOpen, setAgentOpen] = useState(false)
+  const [search, setSearch] = useState('')
+  const agents = useQuery({ queryKey: ['agents'], queryFn: () => window.revva.inventory.agents(), staleTime: 60_000 })
+  const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models(), staleTime: 60_000 })
+  const model = useQuery({ queryKey: ['session-model', sessionId], queryFn: () => window.revva.session.model(sessionId) })
+  const agent = useQuery({ queryKey: ['session-agent', sessionId], queryFn: () => window.revva.session.agent(sessionId) })
+  const switchModel = useMutation({
+    mutationFn: (ref: ModelRef) => window.revva.session.setModel(sessionId, ref),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['session-model', sessionId] })
+  })
+  const switchAgent = useMutation({
+    mutationFn: (agentID: string) => window.revva.session.setAgent(sessionId, agentID),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['session-agent', sessionId] })
+  })
+  const error = switchModel.error ?? switchAgent.error
+
+  const currentModel = model.data
+    ? models.data?.find((m) => m.providerID === model.data?.providerID && m.id === model.data?.id)?.name || model.data.id
+    : 'Model: default'
+  const currentAgent = agent.data
+    ? agents.data?.find((a) => a.id === agent.data)?.name || agent.data
+    : 'Agent: default'
+  const q = search.trim().toLowerCase()
+  const modelMatches = (models.data ?? []).filter((m) => !q || `${m.name ?? ''} ${m.id} ${m.providerID}`.toLowerCase().includes(q))
+  // Inventory already orders favorites first; group them under a heading so the
+  // pick matches the star the user set in Setup.
+  const favoriteModels = modelMatches.filter((m) => m.favorite)
+  const otherModels = modelMatches.filter((m) => !m.favorite)
+  const modelRow = (m: (typeof modelMatches)[number]): React.JSX.Element => {
+    const active = model.data?.providerID === m.providerID && model.data?.id === m.id
+    return (
+      <Choice
+        key={`${m.providerID}::${m.id}`}
+        label={m.name || m.id}
+        detail={m.gated || m.providerID}
+        disabled={!!m.gated || active}
+        selected={active}
+        onClick={() => { switchModel.mutate({ providerID: m.providerID, id: m.id }); setModelOpen(false) }}
+      />
+    )
+  }
+  const agentMatches = (agents.data ?? []).filter((a) => !q || `${a.name ?? ''} ${a.id}`.toLowerCase().includes(q))
+  const busy = switchModel.isPending || switchAgent.isPending
+
+  return (
+    <>
+      <Popover open={modelOpen} onOpenChange={(next) => { setModelOpen(next); if (!next) setSearch('') }}>
+        <PopoverTrigger
+          render={<Button type="button" size="xs" variant="ghost" className="min-w-0 max-w-44" aria-label="Switch model for this conversation" disabled={busy} />}
+        >
+          <Cpu data-icon="inline-start" />
+          <span className="truncate">{currentModel}</span>
+          <ChevronDown data-icon="inline-end" />
+        </PopoverTrigger>
+        <PopoverContent container={container} align="start" className="w-80 max-w-[calc(100vw-2rem)] gap-2 p-3">
+          <PopoverTitle>Switch model</PopoverTitle>
+          <p className="text-[11px] text-muted-foreground">Applies to the next turn; this conversation keeps its history.</p>
+          <Input aria-label="Search models" placeholder="Search models…" value={search} onChange={(e) => setSearch(e.target.value)} className="h-7 text-xs" />
+          <div className="max-h-64 overflow-y-auto">
+            {favoriteModels.length > 0 && (
+              <>
+                <p className="px-2 pb-0.5 pt-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Favorites</p>
+                {favoriteModels.map(modelRow)}
+              </>
+            )}
+            {otherModels.length > 0 && (
+              <>
+                {favoriteModels.length > 0 && (
+                  <p className="px-2 pb-0.5 pt-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">All models</p>
+                )}
+                {otherModels.map(modelRow)}
+              </>
+            )}
+            {modelMatches.length === 0 && <p className="px-2 py-1.5 text-xs text-muted-foreground">No models match.</p>}
+          </div>
+        </PopoverContent>
+      </Popover>
+      <Popover open={agentOpen} onOpenChange={(next) => { setAgentOpen(next); if (!next) setSearch('') }}>
+        <PopoverTrigger
+          render={<Button type="button" size="xs" variant="ghost" className="min-w-0 max-w-40" aria-label="Switch agent for this conversation" disabled={busy} />}
+        >
+          <Bot data-icon="inline-start" />
+          <span className="truncate">{currentAgent}</span>
+          <ChevronDown data-icon="inline-end" />
+        </PopoverTrigger>
+        <PopoverContent container={container} align="start" className="w-72 max-w-[calc(100vw-2rem)] gap-2 p-3">
+          <PopoverTitle>Switch agent</PopoverTitle>
+          <p className="text-[11px] text-muted-foreground">Applies to the next turn; this conversation keeps its history.</p>
+          <Input aria-label="Search agents" placeholder="Search agents…" value={search} onChange={(e) => setSearch(e.target.value)} className="h-7 text-xs" />
+          <div className="max-h-64 overflow-y-auto">
+            {agentMatches.map((a) => {
+              const active = agent.data === a.id
+              return (
+                <Choice
+                  key={a.id}
+                  label={a.name || a.id}
+                  detail={a.id}
+                  disabled={active}
+                  selected={active}
+                  onClick={() => { switchAgent.mutate(a.id); setAgentOpen(false) }}
+                />
+              )
+            })}
+            {agentMatches.length === 0 && <p className="px-2 py-1.5 text-xs text-muted-foreground">No agents match.</p>}
+          </div>
+        </PopoverContent>
+      </Popover>
+      {error instanceof Error && (
+        <span role="alert" className="max-w-48 truncate text-[11px] text-destructive" title={error.message}>
+          {error.message}
+        </span>
+      )}
+    </>
+  )
+}
+
 /* ---------- Concrete drives ---------- */
 
 export const chatDrive: TranscriptDrive = {
   queryKey: ['chat-messages'],
   load: (id) => window.revva.chat.messages(id),
   send: (id, text, images, queued, refs) => window.revva.chat.prompt(id, text, images, queued, refs),
-  interrupt: (id) => window.revva.chat.interrupt(id),
-  subscribe: (id, onDelta, onDone) =>
-    window.revva.events.on((event) => {
-      if (event.kind === 'chat.delta' && event.sessionId === id) onDelta(event.text)
-      else if (event.kind === 'chat.idle' && (event.sessionId === id || event.sessionId === '*')) onDone()
-    })
+  interrupt: (id) => window.revva.chat.interrupt(id)
 }
 
 export function ChatView({ sessionId, onOpenChat }: { sessionId: string; onOpenChat?: (sessionId: string) => void }): React.JSX.Element {
   const qc = useQueryClient()
   const chats = useQuery({ queryKey: ['chats'], queryFn: () => window.revva.chat.list() })
   const chat = chats.data?.find((c) => c.sessionId === sessionId)
+  const works = useQuery({ queryKey: ['works'], queryFn: () => window.revva.work.list() })
+  /** Pipeline work for this chat's ticket — gives the review action in the header. */
+  const chatWork = (works.data ?? []).find((w) => w.ticketKey === chat?.ticketKey && w.state !== 'ABANDONED' && w.state !== 'SHIPPED')
+  const ticketKeys = [...new Set([
+    ...(works.data ?? []).filter((work) => work.state !== 'ABANDONED').map((work) => work.ticketKey),
+    ...(chats.data ?? []).flatMap((item) => item.ticketKey ? [item.ticketKey] : [])
+  ])].sort()
+  const tag = useMutation({
+    mutationFn: (ticketKey: string | null) => window.revva.chat.setTicket(sessionId, ticketKey),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['chats'] })
+  })
+  const [customTicket, setCustomTicket] = useState('')
+  const attachTypedTicket = (): void => {
+    const key = customTicket.trim()
+    if (!key) return
+    tag.mutate(key, { onSuccess: () => setCustomTicket('') })
+  }
   /** `/new` — fresh context: a new session with this chat's directory/agent/model/links. */
   const newSession = (): void => {
     if (!chat || !onOpenChat) return
@@ -912,13 +1194,60 @@ export function ChatView({ sessionId, onOpenChat }: { sessionId: string; onOpenC
   }
   return (
     <TranscriptView
+      key={sessionId}
       sessionId={sessionId}
       drive={chatDrive}
-      emptyHint="Ask anything about this project — this chat is not attached to a ticket."
+      emptyHint={chat?.ticketKey ? `Ask anything about ${chat.ticketKey}.` : 'Ask anything about this project — this chat is not attached to a ticket.'}
       onNewSession={onOpenChat && chat ? newSession : undefined}
       header={
         <>
           <span className="truncate text-[13px] font-medium">{chat?.title ?? 'Chat'}</span>
+          {chat && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" disabled={tag.isPending} className="h-6 gap-1 px-2 text-[11px]">
+                  <Tag data-icon="inline-start" /> {chat.ticketKey ?? 'Link ticket'} <ChevronDown data-icon="inline-end" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel>Move to ticket</DropdownMenuLabel>
+                  {ticketKeys.map((key) => <DropdownMenuItem key={key} disabled={key === chat.ticketKey} onSelect={() => tag.mutate(key)}>{key}</DropdownMenuItem>)}
+                  {ticketKeys.length === 0 && <DropdownMenuItem disabled>No ticket groups yet</DropdownMenuItem>}
+                </DropdownMenuGroup>
+                <DropdownMenuSeparator />
+                {/* Typed keys skip the group list — the main process normalizes and validates them. */}
+                <div className="flex items-center gap-1.5 px-1.5 py-1" onKeyDown={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()}>
+                  <Input
+                    value={customTicket}
+                    onChange={(e) => setCustomTicket(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); attachTypedTicket() } }}
+                    placeholder="CLN-1234"
+                    aria-label="Ticket number"
+                    className="h-6 w-28 text-[11px]"
+                  />
+                  <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" disabled={!customTicket.trim() || tag.isPending} onClick={attachTypedTicket}>
+                    Link
+                  </Button>
+                </div>
+                {chat.ticketKey && <DropdownMenuItem onSelect={() => tag.mutate(null)}>Remove ticket link</DropdownMenuItem>}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+          {chat && (
+            <PrConversationActions
+              prUrl={chat.prUrl ?? chatWork?.prUrl}
+              directory={chat.directory}
+              work={chatWork}
+              onOpenChat={onOpenChat}
+              onAskAgent={async (text) => {
+                await window.revva.chat.prompt(sessionId, text)
+                void qc.invalidateQueries({ queryKey: ['chat-messages', sessionId] })
+                void qc.invalidateQueries({ queryKey: ['chats'] })
+              }}
+            />
+          )}
+          {tag.error && <span role="alert" className="text-xs text-destructive">{tag.error instanceof Error ? tag.error.message : String(tag.error)}</span>}
           {chat && (
             <Badge variant="outline" className="max-w-72 truncate font-mono text-[10px] font-normal">
               {chat.directory}

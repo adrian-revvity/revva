@@ -2,11 +2,12 @@ import { useEffect, useMemo } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { CircleDot } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
-import type { PushEvent, WorkSummary } from '@shared/types'
+import type { WorkSummary } from '@shared/types'
 import { SessionIdButton, TranscriptView, type TranscriptDrive } from './Chat'
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from '@/components/ui/popover'
 import { workStateLabels } from '@/lib/work-state'
 import { ReviewPanel, ReviewRerunButton } from './ReviewPanel'
+import { PrMenu } from './PrConversationActions'
 import { ShipHeaderButton, ShipPanel } from './ShipPanel'
 import { CommentsStrip } from './CommentsStrip'
 
@@ -61,16 +62,7 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
       queryKey: ['work-messages'],
       load: (id) => window.revva.work.messages(id),
       send: (id, text, images, queued, refs) => window.revva.work.prompt(id, text, images, queued, refs),
-      interrupt: (id) => window.revva.work.interrupt(id),
-      subscribe: (_id, onDelta, onDone) =>
-        window.revva.events.on((event: PushEvent) => {
-          // work.delta carries accumulated text (main buffers per message).
-          if (event.kind === 'work.delta' && event.workId === work.id) {
-            onDelta(event.text)
-          } else if (event.kind === 'work.updated' && event.workId === work.id) {
-            if (event.state !== 'BUILDING' && event.state !== 'REWORK') onDone()
-          }
-        })
+      interrupt: (id) => window.revva.work.interrupt(id)
     }
   }, [work.id])
 
@@ -89,6 +81,7 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
       )}
       <CommentsStrip workId={work.id} />
       <TranscriptView
+      key={sessionId}
       sessionId={sessionId}
       drive={drive}
       emptyHint="The build session is spinning up — output appears here live."
@@ -103,9 +96,17 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
           {work.mode === 'auto' && (
             <Badge className="text-[10px]">AUTO</Badge>
           )}
-          {(work.state === 'APPROVED' || work.state === 'WAITING_HUMAN') && (
+          {!work.prUrl && (work.state === 'APPROVED' || work.state === 'WAITING_HUMAN') && (
             <ReviewRerunButton workId={work.id} />
           )}
+          {work.prUrl && <PrMenu
+            prUrl={work.prUrl}
+            work={work}
+            onAskAgent={async (text) => {
+              await window.revva.work.prompt(sessionId, text)
+              void qc.invalidateQueries({ queryKey: ['work-messages', sessionId] })
+            }}
+          />}
           <ShipHeaderButton work={work} />
         </>
       }

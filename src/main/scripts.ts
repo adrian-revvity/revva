@@ -178,16 +178,16 @@ class ScriptManager {
     if (!openCodeService.connected) return []
     try {
       const res = await openCodeService.api.provider.list()
-      const out: { providerID: string; baseURL: string; port: number; up: boolean }[] = []
-      for (const p of res.data) {
-        const base = (p.settings as Record<string, unknown> | undefined)?.baseURL
-        if (typeof base === 'string' && /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?/i.test(base)) {
+      const probed = await Promise.all(
+        res.data.map(async (p) => {
+          const base = (p.settings as Record<string, unknown> | undefined)?.baseURL
+          if (typeof base !== 'string' || !/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?/i.test(base)) return undefined
           const url = new URL(base)
           const port = Number(url.port) || (url.protocol === 'https:' ? 443 : 80)
-          out.push({ providerID: p.id, baseURL: base, port, up: await portListening(port) })
-        }
-      }
-      return out
+          return { providerID: p.id, baseURL: base, port, up: await portListening(port) }
+        })
+      )
+      return probed.filter((n): n is { providerID: string; baseURL: string; port: number; up: boolean } => !!n)
     } catch {
       return []
     }

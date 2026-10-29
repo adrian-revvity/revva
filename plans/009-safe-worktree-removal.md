@@ -6,6 +6,8 @@
 
 P1 · M · HIGH risk (deletion) · no dependencies. Revva's abandon flow forces removal, potentially discarding uncommitted or untracked files. Preserving the branch with `git branch -d` does not preserve those files. Make preservation the default and require informed explicit confirmation for any destructive removal. Reference: [Orca path and registration guards](https://github.com/stablyai/orca/blob/38c111697ace/src/main/worktree-removal-safety.ts).
 
+**Owner decision, 2026-10-29:** allow in-app removal after explicit confirmation and an immediate fail-closed recheck of contents and active OpenCode sessions. Warn that external programs can still change files between the check and deletion; do not claim the operation is race-free. This replaces the original requirement for an impossible cross-process guarantee. If active OpenCode sessions cannot be checked or stopped reliably, refuse removal.
+
 ## Current state and scope
 
 - `src/main/pipeline/works.ts` `abandon`: cancels reviews, removes session, then `git worktree remove --force` with errors swallowed; marks abandoned even if removal failed.
@@ -25,4 +27,4 @@ In scope: `src/main/pipeline/works.ts`, `src/main/worktrees.ts`, a new `src/main
 
 Run `pnpm typecheck`, then `pnpm build`; both exit 0. In a **disposable** repository/worktree created specifically for the manual check, use `pnpm dev` to verify: clean removal; tracked edit, untracked file, and ignored file warnings; cancel leaves files/session intact; explicit force removes only the intended checkout; failed removal preserves work state; main, unregistered and nested worktrees are refused; a changed preflight is rejected. Never perform destructive checks on existing user worktrees. Confirm a branch with unmerged commits remains. `git diff --check` exits 0 and no out-of-scope changes are introduced. Update `plans/README.md` only when complete.
 
-STOP if path/ownership proof cannot be established, the main worktree cannot be identified reliably, active agents cannot be prevented from changing contents between preflight and removal, or a verification fails twice. Err on preservation rather than improvising cleanup. Review future changes to symlink handling, ignored files, and concurrent sessions against this boundary.
+STOP if path/ownership proof cannot be established, the main worktree cannot be identified reliably, active OpenCode sessions cannot be checked reliably, or a verification fails twice. External writers cannot be locked out: warn explicitly and recheck immediately before removal as the owner authorized above. Err on preservation rather than improvising cleanup. Review future changes to symlink handling, ignored files, and concurrent sessions against this boundary.

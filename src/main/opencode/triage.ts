@@ -14,7 +14,6 @@ import { getDb } from '../db'
 import { inboxManager } from './inbox'
 import { chatManager } from './chats'
 import { workManager, UNREAD_WORTHY_STATES } from '../pipeline/works'
-import { openCodeService } from './service'
 import { IPC, type FinishedRun, type TriageEntry } from '@shared/types'
 
 /** How far back an unseen finish still counts as actionable (stale ones don't). */
@@ -87,53 +86,7 @@ class TriageManager {
         updatedAt: w.updated_at
       })
     }
-    // Attach message previews after the snapshot logic; async fills land as pushes.
-    for (const run of out) void this.attachPreview(run)
     return out
-  }
-
-  /** Keyed by (session, updatedAt) so a fresh reply invalidates the cached message. */
-  private previews = new Map<string, string>()
-  private previewLoads = new Set<string>()
-
-  private previewKey(run: FinishedRun): string {
-    return `${run.source}:${run.sessionID}:${run.updatedAt}`
-  }
-
-  private async attachPreview(run: FinishedRun): Promise<void> {
-    if (!openCodeService.connected) return
-    const key = this.previewKey(run)
-    const cached = this.previews.get(key)
-    if (cached) {
-      run.preview = cached
-      return
-    }
-    if (this.previewLoads.has(key)) return
-    this.previewLoads.add(key)
-    try {
-      const res = await openCodeService.api.message.list({ sessionID: run.sessionID, order: 'desc', limit: 20 })
-      let text = ''
-      for (const m of res.data) {
-        if (m.type === 'user') break
-        if (m.type !== 'assistant') continue
-        for (const part of m.content ?? []) {
-          const p = part as Record<string, unknown>
-          if (p.type === 'text' && typeof p.text === 'string') text += p.text
-        }
-        if (text.trim()) break
-      }
-      const preview = text.trim()
-      if (!preview) return
-      // Keep the cache bounded; previews are only needed while cards are unseen.
-      if (this.previews.size > 200) this.previews.clear()
-      this.previews.set(key, preview)
-      run.preview = preview
-      this.push()
-    } catch {
-      /* transcript unavailable — card renders without the preview */
-    } finally {
-      this.previewLoads.delete(key)
-    }
   }
 }
 

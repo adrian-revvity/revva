@@ -4,8 +4,6 @@ import {
   MessageSquare,
   Plus,
   Settings,
-  Server,
-  RefreshCw,
   Kanban,
   LayoutDashboard,
   Hammer,
@@ -14,6 +12,10 @@ import {
   Trash2,
   FolderGit2,
   TriangleAlert,
+  ChevronRight,
+  Undo2,
+  Eraser,
+  Coffee,
   Inbox as InboxIcon
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -21,7 +23,10 @@ import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+import { ConnectionStatus } from '@/components/ConnectionStatus'
 import { cn } from '@/lib/utils'
+import { subscribeTranscripts } from '@/lib/transcript-stream'
 import { workStateLabels } from '@/lib/work-state'
 import { SetupView } from '@/views/Setup'
 import { ChatView } from '@/views/Chat'
@@ -60,6 +65,8 @@ export default function App(): React.JSX.Element {
   const [newChatOpen, setNewChatOpen] = useState(false)
   const [worktreesOpen, setWorktreesOpen] = useState(false)
 
+  useEffect(() => subscribeTranscripts(qc), [qc])
+
   const status = useQuery({
     queryKey: ['service-status'],
     queryFn: () => window.revva.service.status(),
@@ -80,6 +87,11 @@ export default function App(): React.JSX.Element {
     queryFn: () => window.revva.session.active(),
     enabled: status.data?.state === 'connected',
   })
+  // Warm the New chat dialog's inventory while it is still closed: opening the
+  // dialog then reads cache instead of blocking on a cold service round-trip.
+  useQuery({ queryKey: ['workspaces'], queryFn: () => window.revva.workspace.list(), staleTime: 5 * 60_000 })
+  useQuery({ queryKey: ['agents'], queryFn: () => window.revva.inventory.agents(), staleTime: 60_000, enabled: status.data?.state === 'connected' })
+  useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models(), staleTime: 60_000, enabled: status.data?.state === 'connected' })
   const pending = useInbox()
   const ghAlerts = useGithubAlerts()
   const worktreeCount = worktrees.data?.length
@@ -100,10 +112,7 @@ export default function App(): React.JSX.Element {
       if (event.kind === 'chat.idle' || event.kind === 'chat.message' || event.kind === 'chat.renamed') void chats.refetch()
       if (event.kind === 'chat.idle' && event.sessionId === '*') void qc.invalidateQueries({ queryKey: ['session-activity'] })
       if (event.kind === 'session.activity') {
-        if (!qc.getQueryData<string[]>(['session-activity'])) {
-          void qc.invalidateQueries({ queryKey: ['session-activity'] })
-          return
-        }
+        const hadSnapshot = !!qc.getQueryData<string[]>(['session-activity'])
         void qc.cancelQueries({ queryKey: ['session-activity'] })
         qc.setQueryData<string[]>(['session-activity'], (old) => {
           const ids = new Set(old ?? [])
@@ -111,6 +120,9 @@ export default function App(): React.JSX.Element {
           else ids.delete(event.sessionId)
           return [...ids]
         })
+        // Even the initial snapshot can race a start/finish event. Apply the
+        // event immediately, then fetch the other sessions if none were known.
+        if (!hadSnapshot) void qc.invalidateQueries({ queryKey: ['session-activity'] })
       }
       if (event.kind === 'work.updated') void works.refetch()
     })
@@ -130,7 +142,20 @@ export default function App(): React.JSX.Element {
   }
   const selectedSessionId = view.kind === 'chat' ? view.sessionId : activeWork?.sessionId
   const selectedActivity = selectedSessionId ? sessionActivity(selectedSessionId) : undefined
-  const ongoingWorks = (works.data ?? []).filter((w) => w.state !== 'SHIPPED' && w.state !== 'ABANDONED')
+  const ticketWorks = (works.data ?? []).filter((w) => w.state !== 'ABANDONED')
+  const ongoingWorks = ticketWorks.filter((w) => w.state !== 'SHIPPED')
+  const ticketGroups = new Map<string, { works: typeof ticketWorks; chats: NonNullable<typeof chats.data> }>()
+  for (const w of ticketWorks) {
+    const group = ticketGroups.get(w.ticketKey) ?? { works: [], chats: [] }
+    group.works.push(w)
+    ticketGroups.set(w.ticketKey, group)
+  }
+  for (const chat of chats.data ?? []) {
+    if (!chat.ticketKey) continue
+    const group = ticketGroups.get(chat.ticketKey) ?? { works: [], chats: [] }
+    group.chats.push(chat)
+    ticketGroups.set(chat.ticketKey, group)
+  }
   const runningWorks = ongoingWorks.filter(
     (w) => w.id !== activeWork?.id && (w.state === 'BUILDING' || w.state === 'REVIEW' || w.state === 'FIXING' || w.state === 'REWORK' || w.state === 'WAITING_HUMAN')
   )
@@ -147,6 +172,50 @@ export default function App(): React.JSX.Element {
       qc.invalidateQueries({ queryKey: ['chats'] })
       if (view.kind === 'chat' && view.sessionId === sessionId) setView({ kind: 'dashboard' })
     })
+  }
+  const unlinkFromTicket = (sessionId: string): void => {
+    void window.revva.chat
+      .setTicket(sessionId, null)
+      .then(() => qc.invalidateQueries({ queryKey: ['chats'] }))
+      .catch((err) => console.error('[chat] unlink failed:', err))
+  }
+  /** Hover actions on a chat row: unlink while it lives in a ticket group, plus delete. */
+  const chatActions = (chat: { sessionId: string; title: string; ticketKey?: string }): React.JSX.Element => (
+    <>
+      {chat.ticketKey && (
+        <NavAction title="Remove from ticket (keeps the chat)" neutral onClick={() => unlinkFromTicket(chat.sessionId)} icon={<Undo2 className="size-3.5" />} />
+      )}
+      <NavAction title="Delete chat" onClick={() => deleteChat(chat.sessionId, chat.title)} />
+    </>
+  )
+  /** Flat (unticketed) chats at rest — not thinking, not waiting on you, not
+   *  unread, not the one on screen — the bulk-clear target. Unknown activity
+   *  (service down) shows no button at all. */
+  const idleChats =
+    status.data?.state === 'connected' && activity.data
+      ? (chats.data ?? []).filter(
+          (c) =>
+            !c.ticketKey &&
+            !c.unread &&
+            !pending.some((item) => item.sessionID === c.sessionId) &&
+            !activity.data?.includes(c.sessionId) &&
+            !(view.kind === 'chat' && view.sessionId === c.sessionId)
+        )
+      : []
+  const clearIdleChats = (): void => {
+    if (idleChats.length === 0) return
+    if (
+      !confirm(
+        `Delete ${idleChats.length} idle chat${idleChats.length === 1 ? '' : 's'}?\n\n${idleChats
+          .slice(0, 8)
+          .map((c) => `• ${c.title}`)
+          .join('\n')}${idleChats.length > 8 ? `\n…and ${idleChats.length - 8} more` : ''}\n\nThe OpenCode sessions are removed too.`
+      )
+    )
+      return
+    void Promise.all(idleChats.map((c) => window.revva.chat.remove(c.sessionId).catch((err) => console.error('[chat] clear idle failed:', c.sessionId, err)))).then(() =>
+      qc.invalidateQueries({ queryKey: ['chats'] })
+    )
   }
   const abandonWork = (workId: string, ticketKey: string): void => {
     if (!confirm(`Abandon ${ticketKey}? The worktree is removed and the build session deleted. The branch is only deleted if fully merged — otherwise revva keeps it.`)) return
@@ -208,21 +277,39 @@ export default function App(): React.JSX.Element {
           <div className="px-2">
             {works.isLoading && <Skeleton className="mx-1 h-8" />}
             {works.isError && <p className="px-2 py-1.5 text-xs text-muted-foreground">Couldn’t load tickets</p>}
-            {!works.isLoading && !works.isError && ongoingWorks.length === 0 && (
-              <p className="px-2 py-1.5 text-xs text-muted-foreground">No ongoing tickets</p>
+            {!works.isLoading && !works.isError && !chats.isLoading && ticketGroups.size === 0 && (
+              <p className="px-2 py-1.5 text-xs text-muted-foreground">No ticket conversations</p>
             )}
-            {ongoingWorks.map((w) => (
-              <NavButton
-                key={w.id}
-                icon={<Hammer className={cn('size-4', w.state === 'BUILDING' && 'animate-pulse text-sky-500')} />}
-                label={w.ticketKey}
-                sublabel={workStateLabels[w.state]}
-                activity={w.sessionId && w.state !== 'WAITING_HUMAN' ? sessionActivity(w.sessionId) : undefined}
-                unread={!!w.unread}
-                active={view.kind === 'work' && view.workId === w.id}
-                onClick={() => setView({ kind: 'work', workId: w.id })}
-                actions={<NavAction title="Abandon work" onClick={() => abandonWork(w.id, w.ticketKey)} />}
-              />
+            {[...ticketGroups].map(([key, group]) => (
+              <Collapsible key={key} defaultOpen>
+                <CollapsibleTrigger className="group flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[13px] font-medium hover:bg-sidebar-accent focus-visible:outline-2 focus-visible:outline-sidebar-ring">
+                  <ChevronRight className="size-3.5 shrink-0 text-muted-foreground group-data-[panel-open]:rotate-90" />
+                  <span className="min-w-0 flex-1 truncate">{key}</span>
+                  {(group.works.some((w) => w.unread) || group.chats.some((c) => c.unread)) && <span className="size-2 rounded-full bg-primary" aria-label="Unread conversation" />}
+                  <span className="text-[10px] text-muted-foreground">{group.works.length + group.chats.length}</span>
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  <div className="ml-3 border-l pl-1">
+                    {group.works.map((w) => (
+                      <NavButton key={w.id} icon={<Hammer className={cn('size-4', w.state === 'BUILDING' && 'animate-pulse text-sky-500')} />}
+                        label={w.state === 'SHIPPED' ? 'Shipped work' : 'Ticket work'} sublabel={workStateLabels[w.state]}
+                        activity={w.sessionId && w.state !== 'WAITING_HUMAN' ? sessionActivity(w.sessionId) : undefined}
+                        unread={!!w.unread} active={view.kind === 'work' && view.workId === w.id}
+                        onClick={() => setView({ kind: 'work', workId: w.id })}
+                        actions={<NavAction title="Abandon work" onClick={() => abandonWork(w.id, w.ticketKey)} />} />
+                    ))}
+                    {group.chats.map((c) => (
+                      <NavButton key={c.sessionId} icon={c.prUrl ? <Hammer className="size-4 shrink-0" /> : <MessageSquare className="size-4 shrink-0" />} label={c.title}
+                        activity={sessionActivity(c.sessionId)} unread={!!c.unread} active={view.kind === 'chat' && view.sessionId === c.sessionId}
+                        onClick={() => {
+                          setView({ kind: 'chat', sessionId: c.sessionId })
+                          if (c.unread) void window.revva.chat.markSeen(c.sessionId).then(() => chats.refetch())
+                        }}
+                        actions={chatActions(c)} />
+                    ))}
+                  </div>
+                </CollapsibleContent>
+              </Collapsible>
             ))}
           </div>
           <Separator className="my-2" />
@@ -241,10 +328,10 @@ export default function App(): React.JSX.Element {
           </div>
           <div className="px-2">
             {chats.isLoading && <Skeleton className="mx-1 h-8" />}
-            {chats.data?.map((c) => (
+            {chats.data?.filter((c) => !c.ticketKey).map((c) => (
               <NavButton
                 key={c.sessionId}
-                icon={<MessageSquare className="size-4 shrink-0" />}
+                icon={c.prUrl ? <Hammer className="size-4 shrink-0" /> : <MessageSquare className="size-4 shrink-0" />}
                 label={c.title}
                 activity={sessionActivity(c.sessionId)}
                 unread={!!c.unread}
@@ -255,47 +342,33 @@ export default function App(): React.JSX.Element {
                     void window.revva.chat.markSeen(c.sessionId).then(() => chats.refetch())
                   }
                 }}
-                actions={<NavAction title="Delete chat" onClick={() => deleteChat(c.sessionId, c.title)} />}
+                actions={chatActions(c)}
               />
             ))}
+            {idleChats.length > 0 && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    className="mt-1 w-full justify-center gap-1.5 text-muted-foreground hover:text-destructive"
+                    onClick={clearIdleChats}
+                  >
+                    <Eraser className="size-3.5" /> Clear {idleChats.length} idle chat{idleChats.length === 1 ? '' : 's'}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">
+                  Chats at rest right now — thinking, waiting-on-you, unread and open chats are kept
+                </TooltipContent>
+              </Tooltip>
+            )}
           </div>
         </div>
 
         <Separator />
         <div className="flex items-center justify-between px-3 py-2">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                className={cn('flex items-center gap-1.5 text-[11px] font-medium', stateInfo.cls)}
-                onClick={() => setView({ kind: 'setup' })}
-              >
-                <Server className="size-3.5" />
-                {stateInfo.label}
-              </button>
-            </TooltipTrigger>
-            {st && (
-              <TooltipContent side="top">
-                {st.url && <div>{st.url}</div>}
-                {st.version && <div>opencode v{st.version}</div>}
-                {st.message && <div>{st.message}</div>}
-              </TooltipContent>
-            )}
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-7"
-                onClick={() =>
-                  void window.revva.service.retry().then((s) => qc.setQueryData(['service-status'], s))
-                }
-              >
-                <RefreshCw className="size-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Reconnect OpenCode service</TooltipContent>
-          </Tooltip>
+          <ConnectionStatus status={st} />
+          <KeepAwakeToggle />
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -506,18 +579,49 @@ function ActivityBadge({ activity }: { activity: SessionActivity }): React.JSX.E
   )
 }
 
-/** Tiny hover button for row actions (delete/abandon). */
-function NavAction({ title, onClick }: { title: string; onClick: () => void }): React.JSX.Element {
+/** Caffeinate equivalent: when on, the laptop is kept from sleeping. */
+function KeepAwakeToggle(): React.JSX.Element {
+  const [enabled, setEnabled] = useState(false)
+  useEffect(() => {
+    void window.revva.keepAwake.get().then(setEnabled)
+  }, [])
+  const toggle = (): void => {
+    void window.revva.keepAwake.set(!enabled).then(setEnabled)
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon"
+          className={cn('size-7', enabled && 'text-amber-600 dark:text-amber-400')}
+          aria-pressed={enabled}
+          aria-label={enabled ? 'Keep awake on — click to allow sleep' : 'Keep awake off — click to prevent sleep'}
+          onClick={toggle}
+        >
+          <Coffee className={cn('size-3.5', enabled && 'motion-safe:animate-pulse')} />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="top">
+        {enabled ? 'Keeping this Mac awake — click to allow sleep' : 'Prevent sleep while agents run'}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+/** Tiny hover button for row actions (delete/abandon/unlink). */
+function NavAction({ title, onClick, icon, neutral }: { title: string; onClick: () => void; icon?: React.ReactNode; neutral?: boolean }): React.JSX.Element {
   return (
     <button
       title={title}
+      aria-label={title}
       onClick={(e) => {
         e.stopPropagation()
         onClick()
       }}
-      className="rounded p-1 text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
+      className={cn('rounded p-1 text-muted-foreground', neutral ? 'hover:bg-accent hover:text-foreground' : 'hover:bg-destructive/15 hover:text-destructive')}
     >
-      <Trash2 className="size-3.5" />
+      {icon ?? <Trash2 className="size-3.5" />}
     </button>
   )
 }

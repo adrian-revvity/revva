@@ -6,13 +6,14 @@
  * session-scoped listings (global /api/form is location-scoped, so we go per session).
  * Every answer is written to an audit table.
  */
-import { BrowserWindow, Notification } from 'electron'
+import { EventEmitter } from 'node:events'
 import { getDb } from '../db'
 import { sessionIndex } from './session-index'
 import { openCodeService, describeError } from './service'
 import { eventBus, type RawEvent } from './bus'
 import type { PendingItem } from '@shared/types'
 import { pushToWindows } from '../push'
+import { notifyInbound } from '../notify'
 
 interface InboxRow {
   session_id: string
@@ -23,7 +24,7 @@ interface InboxRow {
   answered_at: number | null
 }
 
-class InboxManager {
+class InboxManager extends EventEmitter {
   private wired = false
   /** key: `form:<id>` / `perm:<id>` — live mirror of pending items. */
   private pending = new Map<string, PendingItem>()
@@ -40,6 +41,18 @@ class InboxManager {
 
   list(): PendingItem[] {
     return [...this.pending.values()].sort((a, b) => a.createdAt - b.createdAt)
+  }
+
+  /** Drop questions belonging to a review that is no longer being tracked. */
+  forgetSession(sessionID: string): void {
+    let changed = false
+    for (const [key, item] of this.pending) {
+      if (item.sessionID === sessionID) {
+        this.pending.delete(key)
+        changed = true
+      }
+    }
+    if (changed) this.push()
   }
 
   /** Answer a question form; answers are audited. */
@@ -59,11 +72,17 @@ class InboxManager {
 
   /** Re-pull pending items for every session we own (crash/SSE-gap safety net). */
   private resyncing = false
+  private resyncAgain = false
+  private revision = 0
   async resync(): Promise<void> {
     if (!openCodeService.connected) return
-    if (this.resyncing) return // two reconnects in one resync window: the final swap below is authoritative anyway
+    if (this.resyncing) {
+      this.resyncAgain = true
+      return
+    }
     this.resyncing = true
     try {
+      const revision = this.revision
       const sessionIds = this.knownSessions()
       const fresh = new Map<string, PendingItem>()
       // Sessions are independent; per-session the two list calls are too.
@@ -91,6 +110,8 @@ class InboxManager {
                 owner
               })
             }
+          } else {
+            for (const [key, item] of this.pending) if (item.sessionID === sessionID && item.kind === 'form') fresh.set(key, item)
           }
           if (perms.status === 'fulfilled') {
             for (const p of perms.value) {
@@ -107,9 +128,16 @@ class InboxManager {
                 owner
               })
             }
+          } else {
+            for (const [key, item] of this.pending) if (item.sessionID === sessionID && item.kind === 'permission') fresh.set(key, item)
           }
         })
       )
+      if (revision !== this.revision) {
+        this.resyncAgain = true
+        return
+      }
+      for (const [key, item] of fresh) if (!this.isKnown(item.sessionID)) fresh.delete(key)
       this.pending = fresh
       this.push()
       // Preview tails are fetched after the snapshot is up (resync runs on every
@@ -117,6 +145,10 @@ class InboxManager {
       for (const [key, item] of fresh) this.attachLastMessage(key, item.sessionID)
     } finally {
       this.resyncing = false
+      if (this.resyncAgain) {
+        this.resyncAgain = false
+        void this.resync()
+      }
     }
   }
 
@@ -126,7 +158,8 @@ class InboxManager {
     const works = db
       .prepare("SELECT session_id FROM work WHERE session_id IS NOT NULL AND state NOT IN ('SHIPPED','ABANDONED')")
       .all() as Array<{ session_id: string }>
-    return [...chats, ...works].map((r) => r.session_id).filter(Boolean)
+    const reviews = db.prepare("SELECT session_id FROM review WHERE session_id IS NOT NULL AND status = 'running'").all() as Array<{ session_id: string }>
+    return [...new Set([...chats, ...works, ...reviews].map((r) => r.session_id).filter((id) => !!id && this.isKnown(id)))]
   }
 
   private directoryCache = new Map<string, string>()
@@ -136,7 +169,8 @@ class InboxManager {
     if (cached) return cached
     const row =
       (getDb().prepare('SELECT directory FROM chat WHERE session_id = ?').get(sessionID) as { directory: string } | undefined) ??
-      (getDb().prepare('SELECT worktree_dir AS directory FROM work WHERE session_id = ?').get(sessionID) as { directory: string } | undefined)
+      (getDb().prepare('SELECT worktree_dir AS directory FROM work WHERE session_id = ?').get(sessionID) as { directory: string } | undefined) ??
+      (getDb().prepare('SELECT w.worktree_dir AS directory FROM review r JOIN work w ON w.id = r.work_id WHERE r.session_id = ?').get(sessionID) as { directory: string } | undefined)
     const dir = row?.directory ?? ''
     if (dir) this.directoryCache.set(sessionID, dir)
     return dir
@@ -148,6 +182,8 @@ class InboxManager {
     if (chat) return chat.title
     const work = getDb().prepare('SELECT ticket_key FROM work WHERE session_id = ?').get(sessionID) as { ticket_key: string } | undefined
     if (work) return work.ticket_key
+    const review = getDb().prepare('SELECT w.ticket_key, r.role FROM review r JOIN work w ON w.id = r.work_id WHERE r.session_id = ?').get(sessionID) as { ticket_key: string; role: string } | undefined
+    if (review) return `${review.ticket_key} · ${review.role} review`
     return sessionID
   }
 
@@ -262,26 +298,16 @@ class InboxManager {
 
   /** macOS notification so a blocked session is noticed without the window focused. */
   private notify(item: PendingItem): void {
-    if (!Notification.isSupported()) return
-    const notification = new Notification({
-      title: item.kind === 'form' ? 'Question from agent' : 'Permission request',
-      body: `${item.owner ?? item.directory}\n${item.title}`,
-      silent: false
-    })
-    notification.on('click', () => this.focusWindow())
-    notification.show()
-  }
-
-  /** Bring Revva to the front when the notification is clicked. */
-  private focusWindow(): void {
-    const win = BrowserWindow.getAllWindows()[0]
-    if (!win) return
-    if (win.isMinimized()) win.restore()
-    win.show()
-    win.focus()
+    notifyInbound(
+      item.sessionID,
+      item.kind === 'form' ? 'Question from agent' : 'Permission request',
+      `${item.owner ?? item.directory}\n${item.title}`
+    )
   }
 
   private push(): void {
+    this.revision++
+    this.emit('changed')
     pushToWindows({ kind: 'inbox', items: this.list() })
   }
 }

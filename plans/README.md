@@ -29,7 +29,7 @@ All plans stamped commit `830a20f` (typecheck clean there as of 2026-10-28).
 | 005 | Comment watcher: 5-min configurable poll, overlap guard, bounded fetch | P2 | S | — | DONE 2026-10-28 (hidden setting key jira.commentPollSecs) |
 | 007 | Extract 5 copy-pasted main-process helpers | P2 | M | 001; after 002/003 | DONE 2026-10-28 (+ fixed pushEvent script.status to array, pre-existing drift; worktrees.ts left for a follow-up per plan) |
 | 008 | Delete dead vendored UI (sidebar/dropdown/sheet) + `cn` dep | P3 | S | — | DONE 2026-10-28 (also dropped now-orphan hooks/use-mobile.ts; dropdown-menu restored 2026-10-29 for GitHubView's merge menu) |
-| 009 | [Protect worktree contents before removal](009-safe-worktree-removal.md) | P1 | M | — | TODO |
+| 009 | [Protect worktree contents before removal](009-safe-worktree-removal.md) | P1 | M | — | BLOCKED — isolated draft needs safety review and manual app verification |
 | 010 | [Bind review completion to the correct execution](010-review-completion-freshness.md) | P1 | M | — | TODO |
 | 011 | [Choose queue or steer in the composer](011-queue-or-steer-composer.md) | P2 | S–M | — | TODO |
 | 012 | [Add human diff comments to ticket work](012-inline-diff-review.md) | P2 | L | 010 | TODO |

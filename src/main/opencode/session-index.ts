@@ -5,7 +5,7 @@
  */
 import { getDb } from '../db'
 
-type SessionKind = 'chat' | 'work'
+type SessionKind = 'chat' | 'work' | 'review'
 
 class SessionIndex {
   private kinds = new Map<string, SessionKind>()

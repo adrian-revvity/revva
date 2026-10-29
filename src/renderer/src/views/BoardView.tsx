@@ -1,6 +1,18 @@
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ExternalLink, MessageSquare, Play, RefreshCw, Search, Link2 } from 'lucide-react'
+import {
+  ChevronDown,
+  Clock4,
+  CornerUpLeft,
+  ExternalLink,
+  MessageSquare,
+  Pin,
+  PinOff,
+  Play,
+  RefreshCw,
+  Search,
+  Link2
+} from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -13,6 +25,8 @@ import {
   SelectValue
 } from '@/components/ui/select'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { CardBoard, CardZone, moveToZone } from '@/components/CardBoard'
+import { useCardOrder } from '@/lib/use-card-order'
 import { cn } from '@/lib/utils'
 import { jiraStatusClasses } from '@/lib/status-colors'
 import type { Ticket, WorkSummary } from '@shared/types'
@@ -97,7 +111,7 @@ export function BoardView({
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
-      <div className="mx-auto max-w-3xl space-y-3 px-6 py-6">
+      <div className="mx-auto w-full max-w-[1600px] space-y-4 px-6 py-6">
         <div className="flex items-center justify-between gap-3">
           <div>
             <h2 className="text-lg font-semibold">Sprint board</h2>
@@ -150,7 +164,13 @@ export function BoardView({
             {openSession.error.message} (a workspace folder or prior work on this repo helps revva pick the directory)
           </p>
         )}
-        {board.isLoading && [0, 1, 2].map((i) => <Skeleton key={i} className="h-20" />)}
+        {board.isLoading && (
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(230px,1fr))] gap-2.5">
+            {[0, 1, 2, 3, 4, 5].map((i) => (
+              <Skeleton key={i} className="h-28" />
+            ))}
+          </div>
+        )}
         {board.data?.length === 0 && (
           <p className="py-10 text-center text-sm text-muted-foreground">
             No open tickets assigned to you.
@@ -162,86 +182,20 @@ export function BoardView({
           </p>
         )}
 
-        {visible.map((t) => {
-          const active = activeByTicket.get(t.key)
-          const parentsMissing = t.dependsOn.filter((d) => !board.data?.some((x) => x.key === d))
-          return (
-            <div key={t.key} className="rounded-lg border p-3.5">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <a
-                      href={t.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="font-mono text-xs font-medium hover:underline"
-                    >
-                      {t.key}
-                      {t.url && <ExternalLink className="ml-1 inline size-3 opacity-60" />}
-                    </a>
-                    <Badge variant="outline" className={cn('text-[10px]', jiraStatusClasses(t.status, t.statusCategory))}>
-                      {t.status}
-                    </Badge>
-                    {t.storyPoints !== undefined && (
-                      <Badge variant="secondary" className="text-[10px]">
-                        {t.storyPoints} pts
-                      </Badge>
-                    )}
-                  </div>
-                  <p className="mt-1 text-sm leading-snug">{t.summary}</p>
-                  {t.dependsOn.length > 0 && (
-                    <p className="mt-1.5 flex items-center gap-1 text-[11px] text-muted-foreground">
-                      <Link2 className="size-3" /> depends on{' '}
-                      {t.dependsOn.map((d) => (
-                        <Tooltip key={d}>
-                          <TooltipTrigger asChild>
-                            <span className="font-mono underline decoration-dotted">{d}</span>
-                          </TooltipTrigger>
-                          <TooltipContent>
-                            {board.data?.find((x) => x.key === d)?.summary ??
-                              'Not in your open tickets — pick its branch as base manually'}
-                          </TooltipContent>
-                        </Tooltip>
-                      ))}
-                      {parentsMissing.length > 0 && (
-                        <span className="text-amber-600 dark:text-amber-500">
-                          · parent not on board
-                        </span>
-                      )}
-                    </p>
-                  )}
-                </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    title="Open a plain agent session linked to this ticket (no pipeline)"
-                    disabled={sessionBusy === t.key}
-                    onClick={() => {
-                      setSessionBusy(t.key)
-                      openSession.mutate(t.key, {
-                        onSettled: () => setSessionBusy(null)
-                      })
-                    }}
-                  >
-                    <MessageSquare className="size-4" />
-                    Session
-                  </Button>
-                  {active ? (
-                    <Button size="sm" onClick={() => onStart(active.id)}>
-                      <Play className="size-4" />
-                      {active.state === 'BUILDING' ? 'Watching…' : active.state}
-                    </Button>
-                  ) : (
-                    <Button size="sm" onClick={() => setStartTicket(t)}>
-                      <Play className="size-4" /> Start flow
-                    </Button>
-                  )}
-                </div>
-              </div>
-            </div>
-          )
-        })}
+        {visible.length > 0 && (
+          <TicketBoard
+            visible={visible}
+            boardData={board.data ?? []}
+            activeByTicket={activeByTicket}
+            sessionBusy={sessionBusy}
+            onSession={(key) => {
+              setSessionBusy(key)
+              openSession.mutate(key, { onSettled: () => setSessionBusy(null) })
+            }}
+            onStartTicket={setStartTicket}
+            onStartWork={onStart}
+          />
+        )}
       </div>
 
       {startTicket && (
@@ -256,6 +210,227 @@ export function BoardView({
           }}
         />
       )}
+    </div>
+  )
+}
+
+/**
+ * Three drag-and-drop zones: Important (pinned), the sprint list, and a
+ * collapsible "Not right now" shelf. Dropping a card into a zone pins/parks
+ * it; the grip or a double-click-free drag is the only gesture needed.
+ */
+function TicketBoard({
+  visible,
+  boardData,
+  activeByTicket,
+  sessionBusy,
+  onSession,
+  onStartTicket,
+  onStartWork
+}: {
+  visible: Ticket[]
+  boardData: Ticket[]
+  activeByTicket: Map<string, WorkSummary>
+  sessionBusy: string | null
+  onSession: (key: string) => void
+  onStartTicket: (t: Ticket) => void
+  onStartWork: (workId: string) => void
+}): React.JSX.Element {
+  const liveIds = useMemo(() => visible.map((t) => t.key), [visible])
+  const { zones, commit } = useCardOrder('jira', liveIds)
+  const [laterOpen, setLaterOpen] = useState(false)
+  const byKey = useMemo(() => new Map(visible.map((t) => [t.key, t])), [visible])
+
+  const renderCard = (key: string): React.ReactNode => {
+    const t = byKey.get(key)
+    if (!t) return null
+    const zone = zones.important.includes(key) ? 'important' : zones.later.includes(key) ? 'later' : 'main'
+    return (
+      <TicketCard
+        t={t}
+        boardData={boardData}
+        active={activeByTicket.get(t.key)}
+        sessionBusy={sessionBusy === t.key}
+        zone={zone}
+        onSession={() => onSession(t.key)}
+        onStartTicket={() => onStartTicket(t)}
+        onStartWork={onStartWork}
+        onMove={(to) => commit(moveToZone(zones, t.key, to))}
+      />
+    )
+  }
+
+  return (
+    <CardBoard zones={zones} onReorder={commit} renderCard={renderCard}>
+      {zones.important.length > 0 && (
+        <section aria-label="Important tickets" className="space-y-1.5">
+          <h3 className="flex items-center gap-1.5 text-[13px] font-semibold text-amber-600 dark:text-amber-400">
+            <Pin className="size-3.5" /> Important
+          </h3>
+          <CardZone id="important" />
+        </section>
+      )}
+
+      <CardZone
+        id="main"
+        emptyHint={
+          zones.later.length > 0 || zones.important.length > 0
+            ? 'Nothing here — drag a card back, or un-park it below.'
+            : undefined
+        }
+      />
+
+      <section aria-label="Not right now" className="pt-1">
+        <button
+          type="button"
+          onClick={() => setLaterOpen((v) => !v)}
+          aria-expanded={laterOpen}
+          className="flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+        >
+          <ChevronDown className={cn('size-3.5 transition-transform', !laterOpen && '-rotate-90')} />
+          Not right now
+          <Badge variant="secondary" className="text-[10px]">
+            {zones.later.length}
+          </Badge>
+          <span className="ml-auto text-[11px] font-normal text-muted-foreground/70">
+            {laterOpen ? 'Collapse' : 'Expand'}
+          </span>
+        </button>
+        <CardZone
+          id="later"
+          collapsed={!laterOpen}
+          emptyHint="Drop tickets here to get them out of the way."
+          collapsedContent={
+            <div className="col-span-full flex h-7 items-center justify-center rounded border border-dashed border-border/60 text-[10px] text-muted-foreground/60">
+              {zones.later.length ? `${zones.later.length} parked — drop here to add` : 'Drop tickets here to park them'}
+            </div>
+          }
+        />
+      </section>
+    </CardBoard>
+  )
+}
+
+/** Compact ticket card: min-width grid cell, three-zone friendly. */
+function TicketCard({
+  t,
+  boardData,
+  active,
+  sessionBusy,
+  zone,
+  onSession,
+  onStartTicket,
+  onStartWork,
+  onMove
+}: {
+  t: Ticket
+  boardData: Ticket[]
+  active: WorkSummary | undefined
+  sessionBusy: boolean
+  zone: 'important' | 'main' | 'later'
+  onSession: () => void
+  onStartTicket: () => void
+  onStartWork: (workId: string) => void
+  onMove: (to: 'important' | 'main' | 'later') => void
+}): React.JSX.Element {
+  const parentsMissing = t.dependsOn.filter((d) => !boardData.some((x) => x.key === d))
+  return (
+    <div
+      className={cn(
+        'flex h-full flex-col gap-1.5 rounded-lg border p-2.5 pt-2 transition-colors',
+        zone === 'important' && 'border-amber-500/40 bg-amber-500/[0.04]'
+      )}
+    >
+      <div className="flex items-center gap-1.5 pr-5">
+        <a
+          href={t.url}
+          target="_blank"
+          rel="noreferrer"
+          className="font-mono text-[11px] font-medium hover:underline"
+        >
+          {t.key}
+          {t.url && <ExternalLink className="ml-1 inline size-2.5 opacity-60" />}
+        </a>
+        <Badge variant="outline" className={cn('shrink-0 text-[9px]', jiraStatusClasses(t.status, t.statusCategory))}>
+          {t.status}
+        </Badge>
+        {t.storyPoints !== undefined && (
+          <Badge variant="secondary" className="shrink-0 px-1 text-[9px]">
+            {t.storyPoints}p
+          </Badge>
+        )}
+      </div>
+      <p className="line-clamp-2 min-w-0 text-[13px] leading-snug">{t.summary}</p>
+      {t.dependsOn.length > 0 && (
+        <p className="flex items-center gap-1 text-[10px] text-muted-foreground">
+          <Link2 className="size-2.5 shrink-0" /> depends on{' '}
+          {t.dependsOn.map((d) => (
+            <Tooltip key={d}>
+              <TooltipTrigger asChild>
+                <span className="font-mono underline decoration-dotted">{d}</span>
+              </TooltipTrigger>
+              <TooltipContent>
+                {boardData.find((x) => x.key === d)?.summary ??
+                  'Not in your open tickets — pick its branch as base manually'}
+              </TooltipContent>
+            </Tooltip>
+          ))}
+          {parentsMissing.length > 0 && (
+            <span className="text-amber-600 dark:text-amber-500">· parent not on board</span>
+          )}
+        </p>
+      )}
+      <div className="mt-auto flex items-center gap-1 pt-0.5">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              size="xs"
+              variant="ghost"
+              className="text-muted-foreground"
+              title={zone === 'important' ? 'Unpin' : 'Pin to Important'}
+              onClick={() => onMove(zone === 'important' ? 'main' : 'important')}
+            >
+              {zone === 'important' ? <PinOff className="size-3.5" /> : <Pin className="size-3.5" />}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{zone === 'important' ? 'Unpin' : 'Pin to Important'}</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              size="xs"
+              variant="ghost"
+              className="text-muted-foreground"
+              title={zone === 'later' ? 'Back to the list' : 'Not right now'}
+              onClick={() => onMove(zone === 'later' ? 'main' : 'later')}
+            >
+              {zone === 'later' ? <CornerUpLeft className="size-3.5" /> : <Clock4 className="size-3.5" />}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{zone === 'later' ? 'Back to the list' : 'Not right now'}</TooltipContent>
+        </Tooltip>
+        <div className="ml-auto flex items-center gap-1">
+          <Button
+            size="xs"
+            variant="outline"
+            title="Open a plain agent session linked to this ticket (no pipeline)"
+            disabled={sessionBusy}
+            onClick={onSession}
+          >
+            <MessageSquare className="size-3.5" />
+          </Button>
+          {active ? (
+            <Button size="xs" onClick={() => onStartWork(active.id)}>
+              <Play className="size-3.5" />
+              {active.state === 'BUILDING' ? 'Watching…' : active.state}
+            </Button>
+          ) : (
+            <Button size="xs" onClick={onStartTicket}>
+              <Play className="size-3.5" /> Start
+            </Button>
+          )}
+        </div>
+      </div>
     </div>
   )
 }

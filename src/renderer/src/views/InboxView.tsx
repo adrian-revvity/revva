@@ -14,7 +14,9 @@ import {
   ChevronRight,
   List,
   Layers,
-  ArrowLeftRight
+  ArrowLeftRight,
+  Hammer,
+  MessageSquare
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -25,8 +27,9 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Separator } from '@/components/ui/separator'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
+import { workStateLabels } from '@/lib/work-state'
 import { MD_COMPONENTS } from '@/components/message-markdown'
-import type { FinishedRun, InboxField, PendingItem, TriageEntry } from '@shared/types'
+import type { FinishedRun, InboxField, PendingItem, TriageEntry, WorkState } from '@shared/types'
 
 /** Raw FormInfo.fields come across IPC untyped; normalize to InboxField[]. */
 function normalizeFields(raw: unknown): InboxField[] {
@@ -140,6 +143,27 @@ export function InboxView({
 }): React.JSX.Element {
   const qc = useQueryClient()
   const { entries, loading, error, errorDetail, unavailable, pendingError, pendingErrorDetail, retrying, retry } = useTriageState()
+  // App owns the activity subscription; these observers share its live cache.
+  const activity = useQuery({ queryKey: ['session-activity'], queryFn: () => window.revva.session.active(), enabled: false })
+  const service = useQuery({ queryKey: ['service-status'], queryFn: () => window.revva.service.status(), enabled: false })
+  // The sidebar keeps these fresh; we only read its cache for the thinking meter.
+  const works = useQuery({ queryKey: ['works'], queryFn: () => window.revva.work.list(), enabled: false })
+  const chats = useQuery({ queryKey: ['chats'], queryFn: () => window.revva.chat.list(), enabled: false })
+  const activityReady = service.data?.state === 'connected' && !activity.isError && !!activity.data
+  const thinking = useMemo<ThinkingSession[]>(() => {
+    if (!activityReady) return []
+    const active = new Set(activity.data ?? [])
+    const sessions: ThinkingSession[] = []
+    for (const w of works.data ?? []) {
+      if (!w.sessionId || !active.has(w.sessionId)) continue
+      if (w.state === 'ABANDONED' || w.state === 'SHIPPED') continue
+      sessions.push({ kind: 'work', id: w.id, label: w.ticketKey, state: w.state })
+    }
+    for (const c of chats.data ?? []) {
+      if (active.has(c.sessionId)) sessions.push({ kind: 'chat', id: c.sessionId, label: c.title })
+    }
+    return sessions
+  }, [activityReady, activity.data, works.data, chats.data])
   const [focusMode, setFocusMode] = useState(true)
   const [selection, setSelection] = useState<{ key: string; index: number } | null>(null)
   const selectedIndex = selection ? entries.findIndex((entry) => entryKey(entry) === selection.key) : -1
@@ -167,6 +191,11 @@ export function InboxView({
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-5xl space-y-4 px-4 py-6 sm:px-6">
+        {activityReady && (
+          <div className="pointer-events-none sticky top-2 z-10 flex h-0 items-start justify-end pr-1">
+            <ThinkingMeter sessions={thinking} onOpenWork={onOpenWork} onOpenChat={onOpenChat} />
+          </div>
+        )}
         <header className="flex items-start gap-2">
           <div className="min-w-0 flex-1">
             <h2 className="flex items-center gap-2 text-lg font-semibold">
@@ -181,19 +210,6 @@ export function InboxView({
               Questions, permissions, and finished runs you haven’t seen.
             </p>
           </div>
-          {entries.length > 1 && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="outline" size="sm" onClick={() => setFocusMode((f) => !f)}>
-                  {focusMode ? <List className="size-3.5" /> : <Layers className="size-3.5" />}
-                  {focusMode ? 'All' : 'Focus'}
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>
-                {focusMode ? 'Show every card at once' : 'One card at a time'}
-              </TooltipContent>
-            </Tooltip>
-          )}
         </header>
 
         {(error || unavailable || pendingError || retrying) && (
@@ -232,24 +248,51 @@ export function InboxView({
           <p className="py-14 text-center text-sm text-muted-foreground">Nothing waiting on you.</p>
         )}
 
-        {focusMode && current && (
+        {entries.length > 1 && (
           <nav aria-label="Inbox items" className="flex items-center justify-between gap-3">
             <p aria-live="polite" className="text-sm font-medium">
-              {interactionLabel(current)} {index + 1} of {entries.length}
+              {focusMode && current
+                ? `${interactionLabel(current)} ${index + 1} of ${entries.length}`
+                : `${entries.length} waiting`}
             </p>
-            <div className="flex gap-1">
-              <Button variant="outline" size="sm" disabled={index === 0} onClick={() => select(index - 1)}>
-                <ChevronLeft data-icon="inline-start" /> Previous
-              </Button>
-              <Button variant="outline" size="sm" disabled={index === entries.length - 1} onClick={() => select(index + 1)}>
-                Next <ChevronRight data-icon="inline-end" />
-              </Button>
+            <div className="flex items-center gap-1">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="outline" size="sm" onClick={() => setFocusMode((f) => !f)}>
+                    {focusMode ? <List className="size-3.5" /> : <Layers className="size-3.5" />}
+                    {focusMode ? 'All' : 'Focus'}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {focusMode ? 'Show every card at once' : 'One card at a time'}
+                </TooltipContent>
+              </Tooltip>
+              {focusMode && (
+                <>
+                  <Button variant="outline" size="sm" disabled={index === 0} onClick={() => select(index - 1)}>
+                    <ChevronLeft data-icon="inline-start" /> Previous
+                  </Button>
+                  <Button variant="outline" size="sm" disabled={index === entries.length - 1} onClick={() => select(index + 1)}>
+                    Next <ChevronRight data-icon="inline-end" />
+                  </Button>
+                </>
+              )}
             </div>
           </nav>
         )}
         {entries.map((entry, entryIndex) => (
           <div key={entryKey(entry)} hidden={focusMode && entryIndex !== index}>
-            <TriageCard entry={entry} onOpenChat={onOpenChat} onOpenWork={onOpenWork} onMarkRead={markRead} />
+            <TriageCard
+              entry={entry}
+              visible={!focusMode || entryIndex === index}
+              activity={service.data?.state !== 'connected' || activity.isError ? 'Unavailable'
+                : entries.some((other) => other.type === 'pending' && other.item.sessionID === entry.item.sessionID) ? 'Needs you'
+                : !activity.data ? 'Checking…'
+                : activity.data.includes(entry.item.sessionID) ? 'Thinking' : 'Ready'}
+              onOpenChat={onOpenChat}
+              onOpenWork={onOpenWork}
+              onMarkRead={markRead}
+            />
           </div>
         ))}
       </div>
@@ -262,6 +305,93 @@ function interactionLabel(entry: TriageEntry): string {
   return entry.item.kind === 'form' ? 'Question' : 'Permission request'
 }
 
+/** Floating top-right card: live view of the sessions working right now. */
+type ThinkingSession =
+  | { kind: 'work'; id: string; label: string; state: WorkState }
+  | { kind: 'chat'; id: string; label: string }
+
+/** Same hue language as the top-bar work chips: phase reads at a glance. */
+const THINKING_STATE_STYLES: Partial<Record<WorkState, string>> = {
+  BUILDING: 'text-sky-700 dark:text-sky-400',
+  REVIEW: 'text-violet-700 dark:text-violet-400',
+  FIXING: 'text-orange-700 dark:text-orange-400',
+  REWORK: 'text-pink-700 dark:text-pink-400'
+}
+
+const THINKING_LIST_LIMIT = 4
+
+function ThinkingMeter({
+  sessions,
+  onOpenWork,
+  onOpenChat
+}: {
+  sessions: ThinkingSession[]
+  onOpenWork: (workId: string) => void
+  onOpenChat: (sessionId: string) => void
+}): React.JSX.Element {
+  const active = sessions.length > 0
+  const shown = sessions.slice(0, THINKING_LIST_LIMIT)
+  const rest = sessions.length - shown.length
+  return (
+    <div className="group/meter pointer-events-auto w-60 overflow-hidden rounded-xl border bg-background/95 shadow-lg shadow-black/10 backdrop-blur-sm transition-shadow duration-200 group-hover/meter:shadow-xl group-focus-within/meter:shadow-xl dark:shadow-black/40">
+      <div className="flex items-center gap-2.5 px-3 py-2" role="status">
+        {active ? (
+          <span aria-hidden="true" className="flex h-3.5 shrink-0 items-end gap-[3px]">
+            {[0, 1, 2].map((i) => (
+              <span
+                key={i}
+                className="thinking-bar h-full w-[3px] origin-bottom rounded-full bg-sky-500"
+                style={{ animationDelay: `${i * 0.16}s` }}
+              />
+            ))}
+          </span>
+        ) : (
+          <span aria-hidden="true" className="size-2 shrink-0 rounded-full bg-muted-foreground/50" />
+        )}
+        <span className="text-[13px] font-semibold tabular-nums">
+          {active ? (
+            <>{sessions.length} <span className="font-medium text-muted-foreground">thinking</span></>
+          ) : (
+            <span className="font-medium text-muted-foreground">All quiet</span>
+          )}
+        </span>
+      </div>
+      {active && (
+        <nav
+          aria-label="Thinking sessions"
+          className="max-h-0 overflow-hidden border-x border-b border-transparent opacity-0 transition-[max-height,opacity,border-color] duration-200 ease-out group-hover/meter:max-h-64 group-hover/meter:border-border group-hover/meter:opacity-100 group-focus-within/meter:max-h-64 group-focus-within/meter:border-border group-focus-within/meter:opacity-100 motion-reduce:transition-none"
+        >
+          <div className="px-1.5 py-1">
+            {shown.map((s) => (
+              <button
+                key={`${s.kind}:${s.id}`}
+                type="button"
+                onClick={() => (s.kind === 'work' ? onOpenWork(s.id) : onOpenChat(s.id))}
+                className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-xs focus-visible:outline-2 focus-visible:outline-ring hover:bg-accent"
+              >
+                {s.kind === 'work' ? (
+                  <Hammer className={cn('size-3.5 shrink-0 text-muted-foreground', s.state === 'BUILDING' && 'motion-safe:animate-pulse text-sky-500')} />
+                ) : (
+                  <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />
+                )}
+                <span className="min-w-0 flex-1 truncate font-medium">{s.label}</span>
+                {s.kind === 'work' && (
+                  <span className={cn('shrink-0 text-[10px]', THINKING_STATE_STYLES[s.state] ?? 'text-muted-foreground')}>
+                    {workStateLabels[s.state].toLowerCase()}
+                  </span>
+                )}
+              </button>
+            ))}
+            {rest > 0 && (
+              <p className="px-1.5 py-1 text-[10px] text-muted-foreground">+{rest} more</p>
+            )}
+          </div>
+        </nav>
+      )}
+    </div>
+  )
+}
+
 function entryKey(entry: TriageEntry): string {
   return entry.type === 'pending'
     ? `pending:${entry.item.kind}:${entry.item.id}`
@@ -271,11 +401,15 @@ function entryKey(entry: TriageEntry): string {
 /** One card in the feed: a pending question/permission or a finished-unseen run. */
 function TriageCard({
   entry,
+  visible,
+  activity,
   onOpenChat,
   onOpenWork,
   onMarkRead
 }: {
   entry: TriageEntry
+  visible: boolean
+  activity: 'Thinking' | 'Ready' | 'Needs you' | 'Checking…' | 'Unavailable'
   onOpenChat: (sessionId: string) => void
   onOpenWork: (workId: string) => void
   onMarkRead: (entry: TriageEntry) => void
@@ -286,6 +420,8 @@ function TriageCard({
   return (
     <FinishedRunCard
       item={entry.item}
+      visible={visible}
+      activity={activity}
       onOpenChat={onOpenChat}
       onOpenWork={onOpenWork}
       onMarkRead={() => onMarkRead(entry)}
@@ -295,16 +431,35 @@ function TriageCard({
 
 function FinishedRunCard({
   item,
+  visible,
+  activity,
   onOpenChat,
   onOpenWork,
   onMarkRead
 }: {
   item: FinishedRun
+  visible: boolean
+  activity: 'Thinking' | 'Ready' | 'Needs you' | 'Checking…' | 'Unavailable'
   onOpenChat: (sessionId: string) => void
   onOpenWork: (workId: string) => void
   onMarkRead: () => void
 }): React.JSX.Element {
   const [draft, setDraft] = useState('')
+  const message = useQuery({
+    queryKey: ['triage-message', item.source, item.sessionID, item.updatedAt],
+    queryFn: () => item.source === 'chat'
+      ? window.revva.chat.messages(item.sessionID)
+      : window.revva.work.messages(item.sessionID),
+    enabled: visible,
+    staleTime: Infinity,
+    select: (messages) => {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const message = messages[i]
+        if (message?.role === 'assistant' && message.text.trim()) return message.text
+      }
+      return null
+    }
+  })
   const reply = useMutation({
     mutationFn: (text: string) => window.revva.chat.prompt(item.sessionID, text),
     onSuccess: () => {
@@ -337,10 +492,26 @@ function FinishedRunCard({
         </div>
         <div className="flex shrink-0 flex-wrap justify-end gap-1">
           <Badge variant="secondary" className="text-[10px]">{item.source === 'chat' ? 'message ready' : 'work update'}</Badge>
+          {item.source === 'chat' && (
+            <Badge variant="outline" role="status" className={cn('text-[10px]', activity === 'Thinking' && 'border-sky-500/40 text-sky-700 dark:text-sky-400', activity === 'Needs you' && 'border-amber-500/40 text-amber-700 dark:text-amber-400')}>
+              <span aria-hidden="true" className={cn('size-1.5 rounded-full bg-current', activity === 'Thinking' && 'motion-safe:animate-pulse')} />
+              {activity === 'Thinking' ? 'Thinking…' : activity}
+            </Badge>
+          )}
           {item.workState && <Badge variant="outline" className="text-[10px]">{item.workState.toLowerCase()}</Badge>}
         </div>
       </div>
-      {item.preview && <FinishedMessage text={item.preview} />}
+      {message.isLoading && <Skeleton className="mt-4 h-16 w-full" />}
+      {message.isError && (
+        <div role="alert" className="mt-4 flex items-center justify-between gap-2 text-xs text-destructive">
+          <span>Couldn’t load the latest assistant message.</span>
+          <Button type="button" variant="outline" size="sm" onClick={() => void message.refetch()}>Retry</Button>
+        </div>
+      )}
+      {!message.isError && message.data && <FinishedMessage key={item.updatedAt} text={message.data} />}
+      {message.isSuccess && !message.data && (
+        <p className="mt-4 text-xs text-muted-foreground">No assistant message is available in the recent conversation.</p>
+      )}
       {item.source === 'chat' && (
         <form
           className="mt-4 flex flex-col gap-2"

@@ -18,6 +18,7 @@ import {
   DEFAULT_START_PROMPT,
   DEFAULT_TACKLE_PROMPT,
   DEFAULT_PR_REVIEW_PROMPT,
+  DEFAULT_PR_DESCRIPTION_PROMPT,
   PROMPT_PLACEHOLDER_HELP
 } from '@shared/prompts'
 import type { PipelineRole, SettingsKey } from '@shared/types'
@@ -234,7 +235,8 @@ const REVIEW_ROLES: Array<{ role: PipelineRole; label: string; hint: string }> =
   { role: 'testAudit', label: 'Test audit', hint: 'tests around changed code' },
   { role: 'impeccable', label: 'UI review', hint: 'only when UI files change' },
   { role: 'fixer', label: 'Fixer', hint: 'applies consolidated findings' },
-  { role: 'prReview', label: 'PR review', hint: 'GitHub tab review sessions' }
+  { role: 'prReview', label: 'PR review', hint: 'GitHub tab review sessions' },
+  { role: 'prDescription', label: 'PR description', hint: 'writes PR descriptions in the PR menu' }
 ]
 
 function RoleDefaults(): React.JSX.Element {
@@ -276,10 +278,11 @@ function RoleDefaults(): React.JSX.Element {
   )
 }
 
-const PROMPT_FIELDS: Array<{ key: 'prompt.start' | 'prompt.tackle' | 'prompt.review'; label: string; hint: string; fallback: string }> = [
+const PROMPT_FIELDS: Array<{ key: 'prompt.start' | 'prompt.tackle' | 'prompt.review' | 'prompt.description'; label: string; hint: string; fallback: string }> = [
   { key: 'prompt.start', label: 'Start flow (pipeline build)', hint: 'the full worktree→review→ship run', fallback: DEFAULT_START_PROMPT },
   { key: 'prompt.tackle', label: 'Session button (ticket)', hint: 'plain session linked to a Jira ticket', fallback: DEFAULT_TACKLE_PROMPT },
-  { key: 'prompt.review', label: 'Review button (PR)', hint: 'GitHub tab review sessions', fallback: DEFAULT_PR_REVIEW_PROMPT }
+  { key: 'prompt.review', label: 'Review button (PR)', hint: 'GitHub tab review sessions', fallback: DEFAULT_PR_REVIEW_PROMPT },
+  { key: 'prompt.description', label: 'PR description (AI)', hint: 'the PR menu’s "Update PR description with AI"', fallback: DEFAULT_PR_DESCRIPTION_PROMPT }
 ]
 
 function PromptTuning(): React.JSX.Element {
@@ -424,7 +427,8 @@ function JiraSection(): React.JSX.Element {
     setBusy(true)
     setError(null)
     try {
-      await window.revva.jira.connect()
+      if (jira.data?.connected && jira.data.mcpConnected === false) await window.revva.jira.reconnect()
+      else await window.revva.jira.connect()
       void qc.invalidateQueries({ queryKey: ['jira-status'] })
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -433,7 +437,7 @@ function JiraSection(): React.JSX.Element {
     }
   }
 
-  const connected = jira.data?.connected
+  const connected = jira.data?.connected && jira.data.mcpConnected !== false
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between rounded-lg border p-3">
@@ -448,7 +452,9 @@ function JiraSection(): React.JSX.Element {
           <span>
             {connected
               ? 'Connected via Atlassian MCP (OAuth)'
-              : jira.data?.expired
+              : jira.data?.connected && jira.data.mcpConnected === false
+                ? 'MCP connection unavailable — retry'
+                : jira.data?.expired
                 ? 'Token expired — reconnect'
                 : 'Not connected'}
           </span>
@@ -467,7 +473,7 @@ function JiraSection(): React.JSX.Element {
           </Button>
         ) : (
           <Button size="sm" variant="outline" disabled={busy} onClick={() => void connect()}>
-            {busy ? 'Waiting for browser…' : 'Connect'}
+            {busy ? 'Connecting…' : jira.data?.connected && jira.data.mcpConnected === false ? 'Retry' : 'Connect'}
           </Button>
         )}
       </div>

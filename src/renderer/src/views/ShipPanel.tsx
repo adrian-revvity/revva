@@ -19,26 +19,23 @@ import type { ShipCheck, WorkSummary } from '@shared/types'
 const SHIPPABLE_STATES = new Set(['APPROVED', 'WAITING_HUMAN', 'REWORK', 'SHIPPED'])
 const RUNNING_STATES = new Set(['BUILDING', 'REVIEW', 'FIXING'])
 
+/** Why the ship action is unavailable for this work, or undefined when it can run. Shared with the PR menu. */
+export function shipBlockReason(work: WorkSummary): string | undefined {
+  if (RUNNING_STATES.has(work.state)) return 'Shipping waits until the running session finishes.'
+  if (!SHIPPABLE_STATES.has(work.state)) return 'Nothing to ship until the build produces commits.'
+  return undefined
+}
+
 /**
- * Cockpit-header button: Open PR when shipped, Push/PR when the run is at rest
+ * Cockpit-header button, PR-less runs only: Push/PR when the run is at rest
  * (even without green gates — the dialog warns), disabled with a reason while
- * a session is running. Reuses the same gated ShipDialog as the strip.
+ * a session is running. Once a PR exists these actions live in the PR menu,
+ * so this button steps aside.
  */
 export function ShipHeaderButton({ work }: { work: WorkSummary }): React.JSX.Element | null {
   const [open, setOpen] = useState(false)
   if (work.state === 'ABANDONED' || work.state === 'READY') return null
-  if (work.state === 'SHIPPED' && work.prUrl) {
-    return (
-      <Button
-        size="sm"
-        variant="outline"
-        className="h-6 gap-1 px-2 text-[11px]"
-        onClick={() => window.open(work.prUrl, '_blank')}
-      >
-        <ExternalLink className="size-3" /> Open PR
-      </Button>
-    )
-  }
+  if (work.prUrl) return null
   if (RUNNING_STATES.has(work.state)) {
     return (
       <Tooltip>
@@ -117,7 +114,8 @@ export function ShipPanel({ work }: { work: WorkSummary }): React.JSX.Element | 
   )
 }
 
-function ShipDialog({ work, open, onClose }: { work: WorkSummary; open: boolean; onClose: () => void }): React.JSX.Element {
+/** Gated push → PR → Jira dialog; also opened from the PR menu's "Push changes". */
+export function ShipDialog({ work, open, onClose }: { work: WorkSummary; open: boolean; onClose: () => void }): React.JSX.Element {
   const checks = useQuery({
     queryKey: ['ship-checks', work.id],
     queryFn: () => window.revva.work.shipCheck(work.id),

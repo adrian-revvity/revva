@@ -14,6 +14,8 @@ import { promisify } from 'node:util'
 import { BrowserWindow } from 'electron'
 import { openCodeService, describeError } from './opencode/service'
 import { eventBus, type RawEvent } from './opencode/bus'
+import { inboxManager } from './opencode/inbox'
+import { sessionIndex } from './opencode/session-index'
 import { streamBuffer } from './opencode/stream-buffer'
 import { pushToWindows } from './push'
 import { fetchLastAssistantText } from './util'
@@ -94,7 +96,14 @@ interface TrackedSession {
   round: number
   role: ReviewRole | 'fixer'
   reviewId: number
-  timer: NodeJS.Timeout
+  timer?: NodeJS.Timeout
+  remainingMs: number
+  deadline: number
+}
+
+interface ReviewScope {
+  base: string
+  uiFiles: string[]
 }
 
 /** Attempts are append-only; only the newest result for each role gates the round. */
@@ -116,6 +125,7 @@ class ReviewManager {
     if (this.wired) return
     this.wired = true
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
+    inboxManager.on('changed', () => this.syncWatchdogs())
     // Sessions cannot survive an app restart: mark anything still 'running' as errored.
     const stale = getDb().prepare("SELECT * FROM review WHERE status IN ('pending','running')").all() as ReviewDbRow[]
     for (const r of stale) {
@@ -144,7 +154,7 @@ class ReviewManager {
   /** Kick off reviewer fan-out for a round. Called after a build settles or on demand. */
   async startRound(workId: string, round: number, newCycle = false): Promise<void> {
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(workId) as
-      | { id: string; ticket_key: string; branch: string; worktree_dir: string; mode: string; review_sel: string | null }
+      | { id: string; ticket_key: string; branch: string; worktree_dir: string; parent_work_id: string | null; mode: string; review_sel: string | null }
       | undefined
     if (!work) throw new Error('Work not found.')
     if (this.isBusyReviewing(workId)) throw new Error('A review round is already in flight for this work.')
@@ -161,14 +171,15 @@ class ReviewManager {
       if (status.stdout.trim()) throw new Error('Commit all worktree changes before starting review.')
       const head = (await exec('git', ['-C', work.worktree_dir, 'rev-parse', 'HEAD'])).stdout.trim()
       if (!head) throw new Error('Could not determine the commit to review.')
-      getDb().prepare('UPDATE work SET review_head = ? WHERE id = ?').run(head, workId)
+      const scope = await this.reviewScope(work)
+      getDb().prepare('UPDATE work SET review_head = ?, review_base = ? WHERE id = ?').run(head, scope.base, workId)
 
       const perRun = (work.review_sel ? JSON.parse(work.review_sel) : undefined) as Record<
         string,
         { agentID?: string; model?: ModelRef } | undefined
       > | undefined
       const skills = new Set((await listSkills().catch(() => [])).map((s) => s.id))
-      const uiChanged = await this.uiFilesChanged(work.worktree_dir)
+      const uiChanged = scope.uiFiles.length > 0
 
       const plan: Array<{ role: ReviewRole; skipReason?: string; error?: string }> = [
         { role: 'sol' },
@@ -206,7 +217,7 @@ class ReviewManager {
 
       // Fan out concurrently — one OpenCode session per reviewer.
       await Promise.allSettled(
-        live.map(({ reviewId, role, sel }) => this.runReviewer(work, round, reviewId, role, sel, skills))
+        live.map(({ reviewId, role, sel }) => this.runReviewer(work, round, reviewId, role, sel, skills, scope))
       )
       this.push(workId, round)
       // Sessions that failed to even start settle the round immediately.
@@ -222,7 +233,7 @@ class ReviewManager {
   /** Retry one role without invalidating other reviewers' results for the same commit. */
   async retryReview(workId: string, reviewId: number): Promise<void> {
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(workId) as
-      | { id: string; ticket_key: string; branch: string; worktree_dir: string; state: string; review_head: string | null }
+      | { id: string; ticket_key: string; branch: string; worktree_dir: string; state: string; review_head: string | null; review_base: string | null }
       | undefined
     if (!work) throw new Error('Work not found.')
     if (work.state !== 'WAITING_HUMAN') throw new Error('Individual retries are available when the ticket needs attention.')
@@ -245,6 +256,8 @@ class ReviewManager {
       if (!work.review_head || head.stdout.trim() !== work.review_head || status.stdout.trim()) {
         throw new Error('The worktree changed since this review. Commit any changes and use Re-run review to review the whole team again.')
       }
+      if (!work.review_base) throw new Error('The base for this review was not recorded. Use Re-run review to review the whole team against the same base.')
+      const scope = await this.scopeFromBase(work.worktree_dir, work.review_base)
       const changes = rows.filter((r) => r.role !== 'fixer' && r.status === 'changes')
       if (row.role === 'fixer') {
         if (!changes.length || rows.some((r) => r.role !== 'fixer' && r.status === 'error')) {
@@ -267,7 +280,7 @@ class ReviewManager {
       workManager.setReviewState(workId, 'REVIEW')
       this.audit(workId, round, 'reviewer-retried', row.role)
       this.push(workId, round)
-      await this.runReviewer(work, round, Number(result.lastInsertRowid), row.role as ReviewRole, { agentID: row.agentID, model: row.model }, skills)
+      await this.runReviewer(work, round, Number(result.lastInsertRowid), row.role as ReviewRole, { agentID: row.agentID, model: row.model }, skills, scope)
       this.push(workId, round)
     } finally {
       this.starting.delete(workId)
@@ -281,7 +294,8 @@ class ReviewManager {
     reviewId: number,
     role: ReviewRole,
     sel: { agentID?: string; model?: ModelRef },
-    skills: Set<string>
+    skills: Set<string>,
+    scope: ReviewScope
   ): Promise<void> {
     try {
       const api = openCodeService.api
@@ -293,17 +307,15 @@ class ReviewManager {
         metadata: { revva: { kind: 'review', workId: work.id, round, role } }
       })
       this.update(reviewId, 'running', undefined, undefined, session.id)
-      const timer = setTimeout(() => {
-        if (this.sessions.has(session.id)) void this.settle(session.id, 'error', undefined, `reviewer timed out after ${SESSION_TIMEOUT_MS / 60000} min. Inspect the reviewer transcript for a stalled tool, then retry.`)
-        void api.session.interrupt({ sessionID: session.id }).catch(() => undefined)
-      }, SESSION_TIMEOUT_MS)
-      this.sessions.set(session.id, { workId: work.id, round, role, reviewId, timer })
-      await api.session.prompt({ sessionID: session.id, text: reviewerPrompt(role, work, round, skills) })
+      this.trackSession(session.id, { workId: work.id, round, role, reviewId, remainingMs: SESSION_TIMEOUT_MS, deadline: 0 })
+      await api.session.prompt({ sessionID: session.id, text: reviewerPrompt(role, work, round, skills, scope) })
     } catch (err) {
       for (const [sessionId, tracked] of this.sessions) {
         if (tracked.reviewId === reviewId) {
           clearTimeout(tracked.timer)
           this.sessions.delete(sessionId)
+          sessionIndex.forget(sessionId)
+          inboxManager.forgetSession(sessionId)
           void openCodeService.api.session.interrupt({ sessionID: sessionId }).catch(() => undefined)
         }
       }
@@ -328,8 +340,40 @@ class ReviewManager {
       if (t.workId !== workId) continue
       clearTimeout(t.timer)
       this.sessions.delete(sessionId)
+      sessionIndex.forget(sessionId)
+      inboxManager.forgetSession(sessionId)
       await openCodeService.api.session.interrupt({ sessionID: sessionId }).catch(() => undefined)
       this.update(t.reviewId, 'error', undefined, 'cancelled')
+    }
+  }
+
+  private trackSession(sessionId: string, tracked: TrackedSession): void {
+    this.sessions.set(sessionId, tracked)
+    sessionIndex.register(sessionId, 'review')
+    this.syncWatchdogs()
+  }
+
+  /** Human response time does not count against the execution watchdog. */
+  private syncWatchdogs(): void {
+    const waiting = new Set(inboxManager.list().map((item) => item.sessionID))
+    for (const [sessionId, tracked] of this.sessions) {
+      if (this.settling.has(sessionId)) continue
+      if (waiting.has(sessionId)) {
+        if (tracked.timer) {
+          clearTimeout(tracked.timer)
+          tracked.timer = undefined
+          tracked.remainingMs = Math.max(1, tracked.deadline - Date.now())
+        }
+      } else if (!tracked.timer) {
+        tracked.deadline = Date.now() + tracked.remainingMs
+        tracked.timer = setTimeout(() => {
+          tracked.timer = undefined
+          if (this.sessions.get(sessionId) !== tracked) return
+          const message = tracked.role === 'fixer' ? 'fixer timed out' : `reviewer timed out after ${SESSION_TIMEOUT_MS / 60000} min. Inspect the reviewer transcript for a stalled tool, then retry.`
+          void this.settle(sessionId, 'error', undefined, message)
+          void openCodeService.api.session.interrupt({ sessionID: sessionId }).catch(() => undefined)
+        }, tracked.remainingMs)
+      }
     }
   }
 
@@ -398,6 +442,8 @@ class ReviewManager {
     }
     this.update(t.reviewId, status, text, error)
     this.sessions.delete(sessionId)
+    sessionIndex.forget(sessionId)
+    inboxManager.forgetSession(sessionId)
     this.settling.delete(sessionId)
     this.push(t.workId, t.round)
 
@@ -514,13 +560,7 @@ class ReviewManager {
         metadata: { revva: { kind: 'review', workId, round, role: 'fixer' } }
       })
       this.update(reviewId, 'running', undefined, undefined, session.id)
-      const timer = setTimeout(() => {
-        if (this.sessions.has(session.id)) {
-          void this.settle(session.id, 'error', undefined, 'fixer timed out')
-          void api.session.interrupt({ sessionID: session.id }).catch(() => undefined)
-        }
-      }, SESSION_TIMEOUT_MS)
-      this.sessions.set(session.id, { workId, round, role: 'fixer', reviewId, timer })
+      this.trackSession(session.id, { workId, round, role: 'fixer', reviewId, remainingMs: SESSION_TIMEOUT_MS, deadline: 0 })
       this.starting.delete(workId)
       await api.session.prompt({ sessionID: session.id, text: fixerPrompt(work, round, changes) })
     } catch (err) {
@@ -528,6 +568,8 @@ class ReviewManager {
         if (tracked.reviewId === reviewId) {
           clearTimeout(tracked.timer)
           this.sessions.delete(sessionId)
+          sessionIndex.forget(sessionId)
+          inboxManager.forgetSession(sessionId)
           void openCodeService.api.session.interrupt({ sessionID: sessionId }).catch(() => undefined)
         }
       }
@@ -541,28 +583,46 @@ class ReviewManager {
 
   /* ---------- helpers ---------- */
 
-  /** True when the branch touches UI-ish files (drives whether impeccable runs). */
-  private async uiFilesChanged(worktreeDir: string): Promise<boolean> {
-    let files = ''
-    try {
-      const bases = ['origin/main', 'main', 'origin/master', 'master']
-      let base = ''
-      for (const b of bases) {
-        try {
-          await exec('git', ['-C', worktreeDir, 'merge-base', 'HEAD', b])
-          base = b
+  /** Pin one base for the whole round, including individual retries. */
+  private async reviewScope(work: { branch: string; worktree_dir: string; parent_work_id: string | null }): Promise<ReviewScope> {
+    const dir = work.worktree_dir
+    const parent = work.parent_work_id
+      ? getDb().prepare('SELECT branch FROM work WHERE id = ?').get(work.parent_work_id) as { branch: string } | undefined
+      : undefined
+    if (work.parent_work_id && !parent) throw new Error('The stacked parent is missing; cannot determine the review base.')
+    const configured = await exec('git', ['-C', dir, 'config', '--get', `branch.${work.branch}.base`]).then((r) => r.stdout.trim()).catch(() => '')
+    let ref = parent?.branch || configured
+    if (!ref) {
+      // Older service-created worktrees did not record their base. The initial
+      // reflog entry is evidence of the actual branch creation point, when present.
+      const log = await exec('git', ['-C', dir, 'reflog', 'show', '--format=%H%x09%gs', `refs/heads/${work.branch}`]).then((r) => r.stdout).catch(() => '')
+      const first = log.split('\n').filter(Boolean).at(-1)?.split('\t')
+      if (first?.[0] && first[1]?.startsWith('branch: Created from ')) ref = first[0]
+    }
+    if (!ref) {
+      const origin = await exec('git', ['-C', dir, 'symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']).then((r) => r.stdout.trim()).catch(() => '')
+      for (const candidate of [origin, 'origin/main', 'main', 'origin/master', 'master'].filter(Boolean)) {
+        if (await exec('git', ['-C', dir, 'merge-base', 'HEAD', candidate]).then(() => true).catch(() => false)) {
+          ref = candidate
           break
-        } catch {
-          /* try next */
         }
       }
-      files = base
-        ? (await exec('git', ['-C', worktreeDir, 'diff', '--name-only', `${base}...HEAD`])).stdout
-        : (await exec('git', ['-C', worktreeDir, 'show', '--name-only', '--pretty=format:', 'HEAD'])).stdout
-    } catch (err) {
-      throw new Error(`Could not determine whether UI files changed: ${describeError(err)}`)
     }
-    return files.split('\n').some((file) => /\.(tsx|jsx|vue|svelte|css|scss|less|html)$/i.test(file.trim()))
+    if (!ref) throw new Error('Could not determine a review base for this branch.')
+    try {
+      const base = (await exec('git', ['-C', dir, 'merge-base', 'HEAD', ref])).stdout.trim()
+      if (!base) throw new Error('Empty merge base.')
+      return await this.scopeFromBase(dir, base)
+    } catch (err) {
+      throw new Error(`Could not resolve review base ${ref}: ${describeError(err)}`)
+    }
+  }
+
+  private async scopeFromBase(dir: string, base: string): Promise<ReviewScope> {
+    if (!/^[0-9a-f]{40,64}$/i.test(base)) throw new Error('Invalid recorded review base.')
+    await exec('git', ['-C', dir, 'merge-base', '--is-ancestor', base, 'HEAD'])
+    const files = (await exec('git', ['-C', dir, 'diff', '--name-only', '-z', base, 'HEAD', '--'])).stdout.split('\0').filter(Boolean)
+    return { base, uiFiles: files.filter((file) => /\.(tsx|jsx|vue|svelte|css|scss|less|html)$/i.test(file)) }
   }
 
   private update(
@@ -600,11 +660,12 @@ function reviewerPrompt(
   role: ReviewRole,
   work: { ticket_key: string; branch: string; worktree_dir: string },
   round: number,
-  skills: Set<string>
+  skills: Set<string>,
+  scope: ReviewScope
 ): string {
   const common = [
     `You are Revva's ${role} reviewer for ticket ${work.ticket_key}, round ${round}.`,
-    `Repository worktree: ${work.worktree_dir} (branch ${work.branch}). Review ONLY the changes this branch introduces vs its base.`,
+    `Repository worktree: ${work.worktree_dir} (branch ${work.branch}). Review ONLY the changes from base commit ${scope.base} to HEAD (git diff ${scope.base} HEAD).`,
     '',
     'STRICT READ-ONLY: do not edit or create files, do not commit, do not push, do not start subagents or other agents.',
     ''
@@ -612,7 +673,7 @@ function reviewerPrompt(
   const roleBody: Record<ReviewRole, string> = {
     sol: `${skills.has('sol-loop') ? 'Apply the sol-loop review protocol (use the sol-loop skill).' : 'Apply an adversarial senior-engineer review protocol.'}\nFor each finding give: severity (blocker / major / minor), file:line, why it matters, and a concrete fix. Judge correctness, edge cases, and fit with the ticket's intent.`,
     testAudit: `${skills.has('test-audit') ? 'Apply the test-audit skill to the changed code and tests.' : 'Audit the tests around the changed code as a strict test reviewer.'}\nFlag: untested acceptance criteria, implementation-coupled or duplicative tests, tests that cannot fail. Missing meaningful coverage for changed behavior is a major.`,
-    impeccable: 'Apply the impeccable skill to the UI changes on this branch: hierarchy, spacing, typography, states, responsiveness, and copy. Flag anything that would embarrass the author in a design review.'
+    impeccable: `Apply the impeccable skill to the UI changes on this branch: hierarchy, spacing, typography, states, responsiveness, and copy. Flag anything that would embarrass the author in a design review. Changed UI files: ${JSON.stringify(scope.uiFiles)}. Use these paths to select the relevant app(s) and target Impeccable context; if the correct scope remains ambiguous, ask the user.`
   }
   const verdict = `blockers or majors ⇒ CHANGES; minors-only or clean ⇒ APPROVED.`
   return [

@@ -20,6 +20,16 @@ export const serviceStatusSchema = z.object({
 })
 export type ServiceStatus = z.infer<typeof serviceStatusSchema>
 
+export interface McpStatus {
+  location: string
+  servers: Array<{
+    name: string
+    title?: string
+    status: 'connected' | 'pending' | 'disabled' | 'failed' | 'needs_auth'
+    error?: string
+  }>
+}
+
 /* ---------- Inventory ---------- */
 
 export const agentInfoSchema = z.object({
@@ -68,9 +78,14 @@ export const settingsKeySchema = z.enum([
   'jira.siteUrl',
   'jira.commentPollSecs',
   'model.favorites',
+  'chat.lastSelection',
   'prompt.start',
   'prompt.tackle',
-  'prompt.review'
+  'prompt.review',
+  'prompt.description',
+  'watchdog.staleSecs',
+  'cards.pinnedOrder',
+  'keepAwake.enabled'
 ])
 export type SettingsKey = z.infer<typeof settingsKeySchema>
 
@@ -234,6 +249,7 @@ export type Ticket = z.infer<typeof ticketSchema>
 export const jiraStatusSchema = z.object({
   connected: z.boolean(),
   expired: z.boolean(),
+  mcpConnected: z.boolean().optional(),
   expiresAt: z.number().optional(),
   capabilities: z.record(z.string(), z.string().nullish()).optional()
 })
@@ -268,11 +284,12 @@ export const roleLabels: Record<PipelineRole, string> = {
   testAudit: 'Test audit',
   impeccable: 'UI review',
   fixer: 'Fixer',
-  prReview: 'PR review'
+  prReview: 'PR review',
+  prDescription: 'PR description'
 }
 
 /** Pipeline/task roles that take an agent/model selection. */
-export const pipelineRoleSchema = z.enum(['build', 'sol', 'testAudit', 'impeccable', 'fixer', 'prReview'])
+export const pipelineRoleSchema = z.enum(['build', 'sol', 'testAudit', 'impeccable', 'fixer', 'prReview', 'prDescription'])
 export type PipelineRole = z.infer<typeof pipelineRoleSchema>
 
 export const roleSelSchema = z.object({
@@ -406,7 +423,14 @@ export const pullRequestSchema = z.object({
   /** Became CONFLICTING since the user last looked. */
   hasNewConflicts: z.boolean().optional(),
   /** Review decision became APPROVED since the user last looked. */
-  hasNewApproval: z.boolean().optional()
+  hasNewApproval: z.boolean().optional(),
+  /** Enriched head/base refs. Stacked PRs have a base that is another branch. */
+  headRefName: z.string().optional(),
+  baseRefName: z.string().optional(),
+  /** Repository default branch (enriched) — base !== this means the PR stacks on something. */
+  defaultBranch: z.string().optional(),
+  /** Open review threads the user still has to answer (enriched). */
+  unresolvedThreads: z.number().optional()
 })
 export type PullRequest = z.infer<typeof pullRequestSchema>
 
@@ -423,13 +447,48 @@ export const prAlertSchema = z.object({
 })
 export type PrAlert = z.infer<typeof prAlertSchema>
 
-export const prDetailSchema = pullRequestSchema.extend({
-  headRefName: z.string(),
+export const prDetailSchema = pullRequestSchema.extend({  headRefName: z.string(),
   baseRefName: z.string(),
   reviewDecision: z.string().optional(),
   body: z.string().optional()
 })
 export type PrDetail = z.infer<typeof prDetailSchema>
+
+/** One layer of a `gh stack` stack as reported by `gh stack view --json`. */
+export const prStackBranchSchema = z.object({
+  name: z.string(),
+  isCurrent: z.boolean().optional(),
+  isMerged: z.boolean().optional(),
+  needsRebase: z.boolean().optional(),
+  pr: z.object({ number: z.number(), url: z.string(), state: z.string() }).optional()
+})
+export type PrStackBranch = z.infer<typeof prStackBranchSchema>
+
+/** A stack containing the PR, discovered via local checkouts (`gh stack view --json`). */
+export const prStackSchema = z.object({
+  /** The checkout the stack was read from. */
+  directory: z.string(),
+  trunk: z.string().optional(),
+  currentBranch: z.string().optional(),
+  branches: z.array(prStackBranchSchema)
+})
+export type PrStack = z.infer<typeof prStackSchema>
+
+/** An AI-written PR description awaiting the user's review in the dialog. */
+export interface PrDescriptionDraft {
+  /** The body as it is on GitHub right now. */
+  original: string
+  /** Full new body: AI section inside Revva markers, user text preserved. */
+  proposed: string
+  /** Head sha the draft was built from (stale-save guard). */
+  head: string
+  /** 'ai' wrote it; 'template' fell back to the commit list with the reason in `note`. */
+  source: 'ai' | 'template'
+  note?: string
+  /** `provider/model` when a role default chose one. */
+  model?: string
+  ticketKey?: string
+}
 
 /** One-click task sessions (board "session" button, GitHub "Review"). */
 export const taskSessionInputSchema = z.discriminatedUnion('kind', [
@@ -553,8 +612,26 @@ export interface ScriptRunRow {
 
 /* ---------- Events pushed main → renderer ---------- */
 
+/** Stale-run watchdog entry: a session Revva believes is running but has gone quiet. */
+export const staleSessionSchema = z.object({
+  sessionId: z.string(),
+  kind: z.enum(['chat', 'work', 'review']),
+  /** Work ticket or chat title — what the sidebar calls it. */
+  owner: z.string(),
+  directory: z.string(),
+  /** Epoch ms of the last progress signal. */
+  lastBeat: z.number(),
+  /** How long it has been quiet, in ms. */
+  silentMs: z.number(),
+  workId: z.string().optional(),
+  wakeCount: z.number(),
+  lastWakeError: z.string().optional()
+})
+export type StaleSession = z.infer<typeof staleSessionSchema>
+
 export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('service'), status: serviceStatusSchema }),
+  z.object({ kind: z.literal('mcp.changed') }),
   z.object({ kind: z.literal('chat.delta'), sessionId: z.string(), messageId: z.string(), text: z.string() }),
   z.object({ kind: z.literal('chat.message'), sessionId: z.string(), message: chatMessageSchema }),
   z.object({ kind: z.literal('chat.idle'), sessionId: z.string() }),
@@ -564,7 +641,18 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   /** Queue contents or the session's selected model changed — renderer refetches. */
   z.object({ kind: z.literal('session.queue'), sessionId: z.string() }),
   z.object({ kind: z.literal('session.model'), sessionId: z.string() }),
+  z.object({ kind: z.literal('session.agent'), sessionId: z.string() }),
   z.object({ kind: z.literal('session.activity'), sessionId: z.string(), running: z.boolean() }),
+  /** Estimated streamed output rate; pauses remain in the wall-clock window. */
+  z.object({
+    kind: z.literal('session.throughput'),
+    sessionId: z.string(),
+    tokensPerSecond: z.number(),
+    windowTokens: z.number(),
+    elapsedMs: z.number(),
+    msSinceOutput: z.number().nullable(),
+    running: z.boolean()
+  }),
   z.object({ kind: z.literal('work.updated'), workId: z.string(), state: workStateSchema }),
   z.object({ kind: z.literal('work.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
   z.object({ kind: z.literal('inbox'), items: z.array(pendingItemSchema) }),
@@ -578,7 +666,9 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   /** New Jira comments pending action (M6). */
   z.object({ kind: z.literal('comments'), items: z.array(jiraCommentSchema) }),
   z.object({ kind: z.literal('script.output'), scriptId: z.string(), chunk: z.string() }),
-  z.object({ kind: z.literal('script.status'), status: z.array(scriptStatusSchema) })
+  z.object({ kind: z.literal('script.status'), status: z.array(scriptStatusSchema) }),
+  /** Stale-run watchdog: sessions marked running that have gone quiet. */
+  z.object({ kind: z.literal('session.stale'), items: z.array(staleSessionSchema) })
 ])
 export type PushEvent = z.infer<typeof pushEventSchema>
 
@@ -589,6 +679,10 @@ export interface RevvaApi {
     status(): Promise<ServiceStatus>
     retry(): Promise<ServiceStatus>
   }
+  mcp: {
+    list(directory?: string): Promise<McpStatus>
+    reconnect(server: string, directory?: string): Promise<void>
+  }
   inventory: {
     agents(): Promise<AgentInfo[]>
     models(): Promise<ModelInfo[]>
@@ -597,6 +691,11 @@ export interface RevvaApi {
   settings: {
     get(key: SettingsKey): Promise<unknown>
     set(key: SettingsKey, value: unknown): Promise<void>
+  }
+  keepAwake: {
+    /** Whether the display/system sleep is currently being held off (caffeinate equivalent). */
+    get(): Promise<boolean>
+    set(enabled: boolean): Promise<boolean>
   }
   workspace: {
     list(): Promise<Workspace[]>
@@ -621,12 +720,19 @@ export interface RevvaApi {
     prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs): Promise<void>
     interrupt(sessionId: string): Promise<void>
     rename(sessionId: string, title: string): Promise<void>
+    setTicket(sessionId: string, ticketKey: string | null): Promise<void>
     /** Clears the unread dot after the user has looked at the chat. */
     markSeen(sessionId: string): Promise<void>
     remove(sessionId: string): Promise<void>
   }
   session: {
     model(sessionId: string): Promise<(ModelRef & { variant?: string }) | null>
+    /** Switch the model for subsequent provider turns (live, mid-conversation). */
+    setModel(sessionId: string, model: ModelRef): Promise<void>
+    /** Current agent of the session (null = service default). */
+    agent(sessionId: string): Promise<string | null>
+    /** Switch the agent for subsequent provider turns (live, mid-conversation). */
+    setAgent(sessionId: string, agentID: string): Promise<void>
     copyId(sessionId: string): Promise<void>
     contextUsage(sessionId: string): Promise<{ tokens: number; limit?: number; providerID: string; modelID: string } | null>
     active(): Promise<string[]>
@@ -643,6 +749,7 @@ export interface RevvaApi {
   jira: {
     status(): Promise<JiraStatus>
     connect(): Promise<{ connected: boolean; expired: boolean; expiresAt?: number }>
+    reconnect(): Promise<void>
     disconnect(): Promise<{ connected: boolean; expired: boolean; expiresAt?: number }>
     board(): Promise<Ticket[]>
   }
@@ -679,6 +786,10 @@ export interface RevvaApi {
     list(scope?: 'mine' | 'review'): Promise<PullRequest[]>
     /** Spin up a PR-review agent session (worktree checked out in the background). */
     review(prUrl: string): Promise<TaskSessionResult>
+    /** New chat linked to the PR (+ its ticket), checked out at the PR's branch; opens directly. */
+    chat(prUrl: string): Promise<TaskSessionResult>
+    /** Start a writable chat in an isolated worktree to resolve PR conflicts. */
+    solveConflicts(prUrl: string): Promise<TaskSessionResult>
     /** Clear the "new comment/conflict/approval" flags for a PR. */
     markSeen(prUrl: string): Promise<void>
     /** New comments/conflicts/approvals across both scopes (poller-maintained). */
@@ -689,6 +800,18 @@ export interface RevvaApi {
     merge(prUrl: string, method: PrMergeMethod): Promise<void>
     /** Rebase the PR head onto its base and force-with-lease push the update. */
     rebase(prUrl: string): Promise<void>
+    /** Current state of one PR (conflicts, review decision, mergeability) for the header's PR menu. */
+    detail(prUrl: string): Promise<PrDetail>
+    /** Push a conversation's worktree HEAD to the PR head branch (never force). */
+    push(prUrl: string, directory: string): Promise<void>
+    /** The gh-stack stack containing this PR (from local checkouts), or null when unstacked. */
+    stack(prUrl: string, directory?: string): Promise<PrStack | null>
+    /** `gh stack rebase` in the checkout tracking the stack; aborts cleanly on conflict. */
+    stackRebase(prUrl: string, directory: string): Promise<string>
+    /** AI-write the PR's description section (user text outside Revva's markers is kept). */
+    describe(prUrl: string, instructions?: string): Promise<PrDescriptionDraft>
+    /** Save a reviewed draft; fails when the PR moved since the draft was made. */
+    describeSave(prUrl: string, original: string, head: string, body: string): Promise<void>
   }
   task: {
     /** Ad-hoc session linked to a ticket (no pipeline), in that ticket's repo or a chosen folder. */

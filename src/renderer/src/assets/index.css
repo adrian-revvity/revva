@@ -126,3 +126,23 @@
     -webkit-app-region: no-drag;
   }
 }
+
+/* Equalizer glyph in the Inbox thinking meter: three bars out of phase. */
+@keyframes thinking-bar {
+  0%,
+  100% {
+    transform: scaleY(0.3);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+.thinking-bar {
+  animation: thinking-bar 1.1s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .thinking-bar {
+    animation: none;
+    transform: scaleY(0.75);
+  }
+}

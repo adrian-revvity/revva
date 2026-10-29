@@ -2,6 +2,7 @@ import { app, shell, BrowserWindow } from 'electron'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { registerIpc } from './ipc'
+import { keepAwake } from './keep-awake'
 import { openCodeService } from './opencode/service'
 import { eventBus } from './opencode/bus'
 import { chatManager } from './opencode/chats'
@@ -14,6 +15,7 @@ import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
 import { commentWatcher } from './jira/watch'
 import { sessionIndex } from './opencode/session-index'
+import { throughputMeter } from './opencode/throughput'
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -53,10 +55,12 @@ app.whenReady().then(() => {
     app.dock?.setIcon(join(app.getAppPath(), 'build/icon.png'))
   }
   registerIpc()
+  keepAwake.restore()
   createWindow()
 
   eventBus.start()
   chatManager.wire()
+  throughputMeter.wire()
   workManager.wire()
   inboxManager.wire()
   reviewManager.wire()

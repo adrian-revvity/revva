@@ -60,9 +60,21 @@ export class JiraMcp {
       requestInit: { headers: { Authorization: `Bearer ${token}` } }
     })
     const client = new Client({ name: 'revva', version: '0.0.1' })
-    await client.connect(transport)
-    const listed = await client.listTools()
+    let listed: Awaited<ReturnType<Client['listTools']>>
+    try {
+      await client.connect(transport)
+      listed = await client.listTools()
+    } catch (err) {
+      await client.close().catch(() => undefined)
+      throw err
+    }
     this.client = client
+    client.onclose = () => {
+      if (this.client !== client) return
+      this.client = undefined
+      this.capMap.clear()
+      this.cloudId = undefined
+    }
     this.tools = listed.tools.map((t) => ({
       name: t.name,
       description: t.description,

@@ -13,9 +13,11 @@ import { streamBuffer } from './stream-buffer'
 import { getDb } from '../db'
 import { sessionIndex } from './session-index'
 import { parsePrRef, repoFromGitRemote, resolvePrRef } from '@shared/pr-ref'
+import { ticketKeyFromText } from '@shared/ticket-key'
 import { IPC, type ChatCreateInput, type ChatMessage, type ChatSummary, type PromptImage, type PromptRefs, type PushEvent, type QueuedMessage } from '@shared/types'
 import { fileAttachments, skillAttachments } from './prompt-refs'
 import { pushToWindows } from '../push'
+import { notifyInbound } from '../notify'
 import { isConflict, promptImageFiles } from '../util'
 
 const exec = promisify(execFile)
@@ -199,8 +201,8 @@ class ChatManager {
         const dir = typeof s.location?.directory === 'string' ? s.location.directory : ''
         if (!dir) continue
         db.prepare(
-          `INSERT OR IGNORE INTO chat(session_id, title, directory, agent_id, provider_id, model_id, created_at, updated_at)
-           VALUES(?,?,?,?,?,?,?,?)`
+          `INSERT OR IGNORE INTO chat(session_id, title, directory, agent_id, provider_id, model_id, ticket_key, pr_url, created_at, updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?)`
         ).run(
           s.id,
           s.title ?? 'Recovered chat',
@@ -208,6 +210,8 @@ class ChatManager {
           s.agent ?? null,
           s.model?.providerID ?? null,
           s.model?.id ?? null,
+          typeof revva.ticketKey === 'string' ? revva.ticketKey : null,
+          typeof revva.prUrl === 'string' ? revva.prUrl : null,
           s.time?.created ?? Date.now(),
           s.time?.updated ?? Date.now()
         )
@@ -216,6 +220,26 @@ class ChatManager {
     } catch (err) {
       console.warn('[chat] reconcile failed:', describeError(err))
     }
+  }
+
+  /** Move a conversation between ticket groups without changing its transcript. */
+  async setTicket(sessionId: string, ticketKey: string | null): Promise<void> {
+    const row = getDb().prepare('SELECT session_id FROM chat WHERE session_id = ?').get(sessionId)
+    if (!row) throw new Error('Chat not found.')
+    if (ticketKey !== null) {
+      // Accept existing groups or a manually typed key; normalize (upper-case, no leading zeros).
+      // Bare numbers default to the Jira project in use, e.g. "129634" → CLN-129634.
+      const trimmed = ticketKey.trim()
+      const normalized = /^\d+$/.test(trimmed) ? `CLN-${trimmed.replace(/^0+(?=\d)/, '')}` : ticketKeyFromText(trimmed)
+      if (!normalized) throw new Error('Enter a ticket number like CLN-1234.')
+      ticketKey = normalized
+    }
+    const api = openCodeService.api
+    const session = await api.session.get({ sessionID: sessionId })
+    const metadata = (session.metadata ?? {}) as Record<string, unknown>
+    const revva = (metadata.revva ?? {}) as Record<string, unknown>
+    await api.session.update({ sessionID: sessionId, metadata: { ...metadata, revva: { ...revva, ticketKey } } })
+    getDb().prepare('UPDATE chat SET ticket_key = ? WHERE session_id = ?').run(ticketKey, sessionId)
   }
 
   async messages(sessionId: string): Promise<ChatMessage[]> {
@@ -377,9 +401,20 @@ class ChatManager {
         // never races a missing tail (ordering: last text, then idle).
         streamBuffer.flush(sessionId)
         pushToWindows({ kind: 'chat.idle', sessionId })
+        // New Inbox message → laptop-level notification (deduped across the event burst).
+        this.notifyFinished(sessionId)
         break
       }
     }
+  }
+
+  /** OS notification for the finished-unseen card this completion just raised. */
+  private notifyFinished(sessionId: string): void {
+    const row = getDb()
+      .prepare('SELECT title, directory FROM chat WHERE session_id = ?')
+      .get(sessionId) as { title: string; directory: string } | undefined
+    if (!row) return
+    notifyInbound(sessionId, 'Message ready', `${row.title}\n${row.directory}`)
   }
 }
 

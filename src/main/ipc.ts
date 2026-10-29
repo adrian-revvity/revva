@@ -5,7 +5,9 @@ import { app, ipcMain, dialog, shell, clipboard, BrowserWindow } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { IPC, settingsKeySchema, chatCreateInputSchema, type Workspace } from '@shared/types'
+import { z } from 'zod'
+import { IPC, settingsKeySchema, chatCreateInputSchema, modelRefSchema, type Workspace } from '@shared/types'
+import { keepAwake } from './keep-awake'
 import { openCodeService } from './opencode/service'
 import { chatManager } from './opencode/chats'
 import { inboxManager } from './opencode/inbox'
@@ -21,6 +23,7 @@ import { reviewManager } from './review'
 import { shipManager } from './ship'
 import { scriptManager } from './scripts'
 import { githubManager } from './github'
+import { prDescriptionWriter } from './pr-description'
 import { startTicketSession } from './tasks'
 import { discoverRepositories } from './repositories'
 import { parsePrRef } from '@shared/pr-ref'
@@ -71,6 +74,31 @@ export function registerIpc(): void {
     return status
   })
 
+  /* ---------- OpenCode MCP connections ---------- */
+  ipcMain.handle(IPC.mcpList, async (_e, directory: unknown) => {
+    if (directory !== undefined && (typeof directory !== 'string' || !directory.trim())) throw new Error('Invalid MCP location.')
+    const result = await openCodeService.api.mcp.list(directory ? { location: { directory: directory as string } } : {})
+    return {
+      location: result.location.directory,
+      servers: result.data.map((server) => ({
+        name: server.name,
+        title: server.title,
+        status: server.status.status,
+        error: 'error' in server.status ? server.status.error : undefined
+      }))
+    }
+  })
+  ipcMain.handle(IPC.mcpReconnect, async (_e, server: unknown, directory: unknown) => {
+    if (typeof server !== 'string' || !server.trim()) throw new Error('Invalid MCP server.')
+    if (directory !== undefined && (typeof directory !== 'string' || !directory.trim())) throw new Error('Invalid MCP location.')
+    const location = directory ? { directory: directory as string } : undefined
+    const current = await openCodeService.api.mcp.list(location ? { location } : {})
+    const match = current.data.find((item) => item.name === server)
+    if (!match) throw new Error('MCP server is no longer available in this location.')
+    if (match.status.status !== 'failed') throw new Error('Only failed MCP connections can be retried here. Refresh status first.')
+    await openCodeService.api.mcp.connect({ server, location: { directory: current.location.directory } })
+  })
+
   /* ---------- inventory ---------- */
   ipcMain.handle(IPC.inventoryAgents, () => listAgents())
   ipcMain.handle(IPC.inventoryModels, () => listModels())
@@ -85,6 +113,10 @@ export function registerIpc(): void {
     settingsKeySchema.parse(key)
     settingSet(key, value)
   })
+
+  /* ---------- keep awake (caffeinate equivalent) ---------- */
+  ipcMain.handle(IPC.keepAwakeGet, () => keepAwake.enabled)
+  ipcMain.handle(IPC.keepAwakeSet, (_e, enabled: unknown) => keepAwake.set(enabled === true))
 
   /* ---------- workspaces (folders revva may target) ---------- */
   ipcMain.handle(IPC.workspaceList, () => {
@@ -165,10 +197,31 @@ export function registerIpc(): void {
     triageManager.push()
   })
   ipcMain.handle(IPC.chatRename, (_e, sessionId: string, title: string) => chatManager.rename(String(sessionId), String(title)))
+  ipcMain.handle(IPC.chatSetTicket, (_e, sessionId: string, ticketKey: unknown) => {
+    if (ticketKey !== null && typeof ticketKey !== 'string') throw new Error('Invalid ticket key.')
+    return chatManager.setTicket(String(sessionId), ticketKey)
+  })
   ipcMain.handle(IPC.chatDelete, (_e, sessionId: string) => chatManager.remove(String(sessionId)))
   ipcMain.handle(IPC.sessionModel, async (_e, sessionId: string) => {
     const session = await openCodeService.api.session.get({ sessionID: String(sessionId) })
     return session.model ?? null
+  })
+  // Mid-conversation switches: OpenCode applies them to subsequent provider turns.
+  // 'session.model.selected' / 'session.agent.selected' push the refresh; we also
+  // keep the local index row honest so lists and /new inherit the new choice.
+  ipcMain.handle(IPC.sessionSetModel, async (_e, sessionId: string, model: unknown) => {
+    const ref = modelRefSchema.parse(model)
+    await openCodeService.api.session.switchModel({ sessionID: String(sessionId), model: ref })
+    getDb().prepare('UPDATE chat SET provider_id = ?, model_id = ? WHERE session_id = ?').run(ref.providerID, ref.id, String(sessionId))
+  })
+  ipcMain.handle(IPC.sessionAgent, async (_e, sessionId: string) => {
+    const session = await openCodeService.api.session.get({ sessionID: String(sessionId) })
+    return session.agent ?? null
+  })
+  ipcMain.handle(IPC.sessionSetAgent, async (_e, sessionId: string, agentID: unknown) => {
+    const agent = z.string().min(1).max(200).parse(agentID)
+    await openCodeService.api.session.switchAgent({ sessionID: String(sessionId), agent })
+    getDb().prepare('UPDATE chat SET agent_id = ? WHERE session_id = ?').run(agent, String(sessionId))
   })
   ipcMain.handle(IPC.sessionCopyId, (_e, sessionId: unknown) => {
     if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 500) throw new Error('Invalid session ID.')
@@ -211,12 +264,19 @@ export function registerIpc(): void {
   /* ---------- jira ---------- */
   ipcMain.handle(IPC.jiraStatus, () => ({
     ...jiraAuth.status(),
+    mcpConnected: jiraMcp.connected,
     capabilities: jiraMcp.connected ? jiraMcp.capabilities() : undefined
   }))
   ipcMain.handle(IPC.jiraConnect, async () => {
     await jiraAuth.connect()
-    await jiraMcp.connect()
+    await jiraMcp.reconnect()
     return jiraAuth.status()
+  })
+  ipcMain.handle(IPC.jiraReconnect, async () => {
+    if (jiraMcp.connected) return
+    const auth = jiraAuth.status()
+    if (!auth.connected && !auth.expired) throw new Error('Jira is not configured. Sign in first.')
+    await jiraMcp.connect()
   })
   ipcMain.handle(IPC.jiraDisconnect, async () => {
     await jiraMcp.disconnect()
@@ -277,6 +337,16 @@ export function registerIpc(): void {
     if (!parsed?.url) throw new Error('Pass a full PR URL or owner/repo#123 (bare numbers are ambiguous across projects).')
     return githubManager.startReview(parsed.url)
   })
+  ipcMain.handle(IPC.githubChat, (_e, ref: string) => {
+    const parsed = parsePrRef(String(ref))
+    if (!parsed?.url) throw new Error('Pass a full PR URL.')
+    return githubManager.startChat(parsed.url)
+  })
+  ipcMain.handle(IPC.githubSolveConflicts, (_e, ref: string) => {
+    const parsed = parsePrRef(String(ref))
+    if (!parsed?.url) throw new Error('Pass a full PR URL.')
+    return githubManager.solveConflicts(parsed.url)
+  })
   ipcMain.handle(IPC.githubSeen, (_e, prUrl: string) => githubManager.markSeen(String(prUrl)))
   ipcMain.handle(IPC.githubAlerts, () => githubManager.alerts())
   ipcMain.handle(IPC.githubAlertsSeen, (_e, urls?: unknown) =>
@@ -291,6 +361,44 @@ export function registerIpc(): void {
     const parsed = parsePrRef(String(ref))
     if (!parsed?.url) throw new Error('Pass a full PR URL or owner/repo#123 (bare numbers are ambiguous across projects).')
     return githubManager.rebase(parsed.url)
+  })
+  ipcMain.handle(IPC.githubPrDetail, (_e, ref: unknown) => {
+    const parsed = parsePrRef(String(ref))
+    if (!parsed?.url) throw new Error('Pass a full PR URL or owner/repo#123 (bare numbers are ambiguous across projects).')
+    return githubManager.detail(parsed.url)
+  })
+  ipcMain.handle(IPC.githubPush, (_e, ref: unknown, directory: unknown) => {
+    const parsed = parsePrRef(String(ref))
+    if (!parsed?.url) throw new Error('Pass a full PR URL or owner/repo#123 (bare numbers are ambiguous across projects).')
+    if (typeof directory !== 'string' || !directory) throw new Error('No conversation directory to push from.')
+    return githubManager.push(parsed.url, directory)
+  })
+  ipcMain.handle(IPC.githubStack, async (_e, ref: unknown, directory?: unknown) => {
+    const parsed = parsePrRef(String(ref))
+    if (!parsed?.url) throw new Error('Pass a full PR URL or owner/repo#123 (bare numbers are ambiguous across projects).')
+    // Detection is best-effort (no stack, or no extension, is a null, not an error).
+    try {
+      return await githubManager.stackForPr(parsed.url, typeof directory === 'string' ? directory : undefined)
+    } catch {
+      return null
+    }
+  })
+  ipcMain.handle(IPC.githubStackRebase, (_e, ref: unknown, directory: unknown) => {
+    const parsed = parsePrRef(String(ref))
+    if (!parsed?.url) throw new Error('Pass a full PR URL or owner/repo#123 (bare numbers are ambiguous across projects).')
+    if (typeof directory !== 'string' || !directory) throw new Error('No checkout to rebase the stack in.')
+    return githubManager.rebaseStack(parsed.url, directory)
+  })
+  ipcMain.handle(IPC.githubDescribe, (_e, ref: unknown, instructions?: unknown) => {
+    const parsed = parsePrRef(String(ref))
+    if (!parsed?.url) throw new Error('Pass a full PR URL or owner/repo#123 (bare numbers are ambiguous across projects).')
+    return prDescriptionWriter.describe(parsed.url, typeof instructions === 'string' && instructions.trim() ? instructions : undefined)
+  })
+  ipcMain.handle(IPC.githubDescribeSave, (_e, ref: unknown, original: unknown, head: unknown, body: unknown) => {
+    const parsed = parsePrRef(String(ref))
+    if (!parsed?.url) throw new Error('Pass a full PR URL or owner/repo#123 (bare numbers are ambiguous across projects).')
+    if (typeof original !== 'string' || typeof head !== 'string' || typeof body !== 'string') throw new Error('Invalid PR description.')
+    return prDescriptionWriter.save(parsed.url, original, head, body)
   })
   ipcMain.handle(IPC.taskTicketSession, (_e, input: unknown) => {
     const parsed = taskSessionInputSchema.parse({ ...((input ?? {}) as object), kind: 'ticket' })

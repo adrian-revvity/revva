@@ -7,6 +7,10 @@ const api: RevvaApi = {
     status: () => ipcRenderer.invoke(IPC.serviceStatus),
     retry: () => ipcRenderer.invoke(IPC.serviceRetry)
   },
+  mcp: {
+    list: (directory) => ipcRenderer.invoke(IPC.mcpList, directory),
+    reconnect: (server, directory) => ipcRenderer.invoke(IPC.mcpReconnect, server, directory)
+  },
   inventory: {
     agents: () => ipcRenderer.invoke(IPC.inventoryAgents),
     models: () => ipcRenderer.invoke(IPC.inventoryModels),
@@ -15,6 +19,10 @@ const api: RevvaApi = {
   settings: {
     get: (key) => ipcRenderer.invoke(IPC.settingsGet, key),
     set: (key, value) => ipcRenderer.invoke(IPC.settingsSet, key, value)
+  },
+  keepAwake: {
+    get: () => ipcRenderer.invoke(IPC.keepAwakeGet),
+    set: (enabled) => ipcRenderer.invoke(IPC.keepAwakeSet, enabled)
   },
   workspace: {
     list: () => ipcRenderer.invoke(IPC.workspaceList),
@@ -36,11 +44,15 @@ const api: RevvaApi = {
     prompt: (sessionId, text, images, queued, refs) => ipcRenderer.invoke(IPC.chatPrompt, sessionId, text, images, queued, refs),
     interrupt: (sessionId) => ipcRenderer.invoke(IPC.chatInterrupt, sessionId),
     rename: (sessionId, title) => ipcRenderer.invoke(IPC.chatRename, sessionId, title),
+    setTicket: (sessionId, ticketKey) => ipcRenderer.invoke(IPC.chatSetTicket, sessionId, ticketKey),
     markSeen: (sessionId) => ipcRenderer.invoke(IPC.chatSeen, sessionId),
     remove: (sessionId) => ipcRenderer.invoke(IPC.chatDelete, sessionId)
   },
   session: {
     model: (sessionId) => ipcRenderer.invoke(IPC.sessionModel, sessionId),
+    setModel: (sessionId, model) => ipcRenderer.invoke(IPC.sessionSetModel, sessionId, model),
+    agent: (sessionId) => ipcRenderer.invoke(IPC.sessionAgent, sessionId),
+    setAgent: (sessionId, agentID) => ipcRenderer.invoke(IPC.sessionSetAgent, sessionId, agentID),
     copyId: (sessionId) => ipcRenderer.invoke(IPC.sessionCopyId, sessionId),
     contextUsage: (sessionId) => ipcRenderer.invoke(IPC.sessionContextUsage, sessionId),
     active: () => ipcRenderer.invoke(IPC.sessionActive),
@@ -54,6 +66,7 @@ const api: RevvaApi = {
   jira: {
     status: () => ipcRenderer.invoke(IPC.jiraStatus),
     connect: () => ipcRenderer.invoke(IPC.jiraConnect),
+    reconnect: () => ipcRenderer.invoke(IPC.jiraReconnect),
     disconnect: () => ipcRenderer.invoke(IPC.jiraDisconnect),
     board: () => ipcRenderer.invoke(IPC.boardFetch)
   },
@@ -81,11 +94,19 @@ const api: RevvaApi = {
   github: {
     list: (scope) => ipcRenderer.invoke(IPC.githubList, scope),
     review: (prUrl) => ipcRenderer.invoke(IPC.githubReview, prUrl),
+    chat: (prUrl) => ipcRenderer.invoke(IPC.githubChat, prUrl),
+    solveConflicts: (prUrl) => ipcRenderer.invoke(IPC.githubSolveConflicts, prUrl),
     markSeen: (prUrl) => ipcRenderer.invoke(IPC.githubSeen, prUrl),
     alerts: () => ipcRenderer.invoke(IPC.githubAlerts),
     markAlertsSeen: (urls) => ipcRenderer.invoke(IPC.githubAlertsSeen, urls),
     merge: (prUrl, method) => ipcRenderer.invoke(IPC.githubMerge, prUrl, method),
-    rebase: (prUrl) => ipcRenderer.invoke(IPC.githubRebase, prUrl)
+    rebase: (prUrl) => ipcRenderer.invoke(IPC.githubRebase, prUrl),
+    detail: (prUrl) => ipcRenderer.invoke(IPC.githubPrDetail, prUrl),
+    push: (prUrl, directory) => ipcRenderer.invoke(IPC.githubPush, prUrl, directory),
+    stack: (prUrl, directory) => ipcRenderer.invoke(IPC.githubStack, prUrl, directory),
+    stackRebase: (prUrl, directory) => ipcRenderer.invoke(IPC.githubStackRebase, prUrl, directory),
+    describe: (prUrl, instructions) => ipcRenderer.invoke(IPC.githubDescribe, prUrl, instructions),
+    describeSave: (prUrl, original, head, body) => ipcRenderer.invoke(IPC.githubDescribeSave, prUrl, original, head, body)
   },
   task: {
     ticketSession: (input) => ipcRenderer.invoke(IPC.taskTicketSession, input)
