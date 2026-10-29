@@ -42,6 +42,14 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 - **Windows builds** — every release now also ships a Windows x64 NSIS installer + ZIP, built on a `windows-latest` CI runner alongside the macOS DMG/ZIP. Jira OAuth (Windows Credential store), chats, pipelines and GitHub work there; the Scripts tab runs PowerShell instead of zsh, and `opencode`/`git`/`gh` must be on `PATH`. Builds are unsigned (SmartScreen: More info → Run anyway).
 
+### Changed
+
+- Idle background polling removed: service status, session activity, model and queue strips, and script status are now driven purely by the push events main already sends (plus a 60s safety heartbeat and refetch-on-focus). The app does essentially no IPC work while you are not touching it.
+- Streaming transcripts are linear now: text is accumulated once in the main process and pushed at ~20 Hz instead of per token; completed rows are memoized and markdown renders once when a message finishes; auto-scroll no longer fights you when you scroll up mid-stream.
+- Inbox items keep their original waiting order and their "PROJ-123 / chat title" label across OpenCode reconnects (re-sync is also parallel now — ~10× faster with many sessions).
+- Jira comment checking defaults to every 5 minutes (as documented) instead of every 60 seconds; tune with the hidden `jira.commentPollSecs` setting. Polls also can no longer overlap each other.
+- SQLite schema now lives in one versioned migration list (`src/main/db/index.ts`); the ten scattered lazy `ensureSchema()` sites are gone. Existing databases upgrade in place.
+
 ## [0.1.0] - 2026-10-28
 
 The "cockpit" release: Revva now opens on a Dashboard that summarizes everything it is watching, chat reads like it should, and the app ships as a downloadable installer.

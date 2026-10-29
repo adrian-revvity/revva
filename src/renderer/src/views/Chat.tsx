@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useMemo, memo, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowUp, Check, ChevronRight, Copy, ImageIcon, Square, X } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
@@ -167,8 +167,7 @@ export function TranscriptView({
   })
   const model = useQuery({
     queryKey: ['session-model', sessionId],
-    queryFn: () => window.revva.session.model(sessionId),
-    refetchInterval: 10_000
+    queryFn: () => window.revva.session.model(sessionId)
   })
   const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models() })
   const modelLabel = model.data
@@ -179,8 +178,7 @@ export function TranscriptView({
     : modelLabel
   const queue = useQuery({
     queryKey: ['session-queue', sessionId],
-    queryFn: () => window.revva.session.queue(sessionId),
-    refetchInterval: 15_000
+    queryFn: () => window.revva.session.queue(sessionId)
   })
   // Keep drafts in the renderer cache when a transcript unmounts or changes sessions.
   const draftKey = ['session-draft', sessionId] as const
@@ -293,7 +291,8 @@ export function TranscriptView({
     )
   }, [sessionId, drive, qc])
 
-  // Inbox/queue and model selection change from outside this window too (TUI, other clients).
+  // Main pushes queue/model changes for every session (bus forwards all sessions, so
+  // the TUI and other clients are covered); these pushes are the update channel.
   useEffect(() => {
     return window.revva.events.on((event) => {
       if (event.kind === 'session.queue' && event.sessionId === sessionId) {
@@ -308,18 +307,31 @@ export function TranscriptView({
     })
   }, [sessionId, qc])
 
+  // Stick-to-bottom: jump instantly (smooth animations restart per token and
+  // fight the user), and only while the user is already at the bottom.
+  const scrollWrapRef = useRef<HTMLDivElement>(null)
+  const stick = useRef(true)
+  useEffect(() => {
+    const viewport = scrollWrapRef.current?.querySelector<HTMLElement>('[data-slot=scroll-area-viewport]')
+    if (!viewport) return
+    const onScroll = (): void => {
+      stick.current = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 80
+    }
+    viewport.addEventListener('scroll', onScroll, { passive: true })
+    return () => viewport.removeEventListener('scroll', onScroll)
+  }, [])
+  // Switching chats: re-anchor at the bottom, then jump once messages arrive.
   useLayoutEffect(() => {
     positionedSessionRef.current = null
+    stick.current = true
   }, [sessionId])
-
   useLayoutEffect(() => {
     if (!messages.data || positionedSessionRef.current === sessionId) return
     bottomRef.current?.scrollIntoView({ behavior: 'instant', block: 'end' })
     positionedSessionRef.current = sessionId
   }, [sessionId, messages.data])
-
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    if (stick.current) bottomRef.current?.scrollIntoView({ block: 'end' })
   }, [messages.data, streamingText])
 
   const addImages = async (files: File[]): Promise<void> => {
@@ -431,7 +443,7 @@ export function TranscriptView({
           </>
         )}
       </div>
-      <div className="relative flex min-h-0 flex-1 flex-col">
+      <div ref={scrollWrapRef} className="relative flex min-h-0 flex-1 flex-col">
         <ScrollArea className="min-h-0 flex-1">
           <div className="mx-auto flex max-w-3xl flex-col gap-4 px-6 py-5">
             {messages.isLoading && <Skeleton className="h-16 w-full" />}
@@ -733,7 +745,7 @@ function AssistantTurn({
   )
 }
 
-export function MessageRow({ message, streaming }: { message: ChatMessage; streaming?: boolean }): React.JSX.Element {
+export const MessageRow = memo(function MessageRow({ message, streaming }: { message: ChatMessage; streaming?: boolean }): React.JSX.Element {
   const isUser = message.role === 'user'
   const empty = message.text === ''
   const images = message.images ?? []
@@ -775,9 +787,16 @@ export function MessageRow({ message, streaming }: { message: ChatMessage; strea
             {!empty && (
               <>
                 {tools.length > 0 && <div className="mt-1" />}
-                <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
-                  {message.text}
-                </ReactMarkdown>
+                {streaming ? (
+                  // Plain text while streaming: re-parsing ReactMarkdown over the
+                  // growing text on every push is the quadratic cost; markdown
+                  // runs once when the completed row swaps in after the refetch.
+                  <p className="whitespace-pre-wrap">{message.text}</p>
+                ) : (
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+                    {message.text}
+                  </ReactMarkdown>
+                )}
               </>
             )}
             {streaming && <span className="animate-pulse">▍</span>}
@@ -786,7 +805,7 @@ export function MessageRow({ message, streaming }: { message: ChatMessage; strea
       </div>
     </div>
   )
-}
+})
 
 /** Faded collapsible for the model's reasoning text. */
 function ThinkingBlock({ text }: { text: string }): React.JSX.Element {

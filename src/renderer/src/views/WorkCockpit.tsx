@@ -56,10 +56,7 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
     }
   }, [qc, work.id])
 
-  // work.delta carries per-token increments; accumulate per message for the shared transcript.
   const drive = useMemo<TranscriptDrive>(() => {
-    let buffer = ''
-    let currentMessage = ''
     return {
       queryKey: ['work-messages'],
       load: (id) => window.revva.work.messages(id),
@@ -67,19 +64,11 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
       interrupt: (id) => window.revva.work.interrupt(id),
       subscribe: (_id, onDelta, onDone) =>
         window.revva.events.on((event: PushEvent) => {
+          // work.delta carries accumulated text (main buffers per message).
           if (event.kind === 'work.delta' && event.workId === work.id) {
-            if (event.messageId !== currentMessage) {
-              currentMessage = event.messageId
-              buffer = ''
-            }
-            buffer += event.text
-            onDelta(buffer)
+            onDelta(event.text)
           } else if (event.kind === 'work.updated' && event.workId === work.id) {
-            if (event.state !== 'BUILDING' && event.state !== 'REWORK') {
-              buffer = ''
-              currentMessage = ''
-              onDone()
-            }
+            if (event.state !== 'BUILDING' && event.state !== 'REWORK') onDone()
           }
         })
     }

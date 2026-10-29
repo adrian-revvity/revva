@@ -9,24 +9,20 @@ import { promisify } from 'node:util'
 import { BrowserWindow } from 'electron'
 import { openCodeService, describeError } from './service'
 import { eventBus, type RawEvent } from './bus'
+import { streamBuffer } from './stream-buffer'
 import { getDb } from '../db'
+import { sessionIndex } from './session-index'
 import { parsePrRef, repoFromGitRemote, resolvePrRef } from '@shared/pr-ref'
 import { IPC, type ChatCreateInput, type ChatMessage, type ChatSummary, type PromptImage, type PromptRefs, type PushEvent, type QueuedMessage } from '@shared/types'
 import { fileAttachments, skillAttachments } from './prompt-refs'
+import { pushToWindows } from '../push'
+import { isConflict, promptImageFiles } from '../util'
 
 const exec = promisify(execFile)
 
 /** Placeholder title for chats the user did not name; replaced by OpenCode's
  *  auto-generated title (from the first message) via `session.renamed`. */
 const AUTO_TITLE = 'New chat'
-
-/** The SDK error for "session busy" / conflicts carries status 409. */
-function isConflict(err: unknown): boolean {
-  const e = err as { status?: unknown; name?: unknown; message?: unknown }
-  if (e?.status === 409) return true
-  const msg = String(e?.message ?? err ?? '')
-  return msg.includes('409') || /conflict|busy|already running/i.test(msg)
-}
 
 /** Pull a compact, human-meaningful summary out of one OpenCode tool part. */
 function summarizeToolPart(p: Record<string, unknown>): NonNullable<ChatMessage['tools']>[number] {
@@ -119,17 +115,6 @@ interface ChatRow {
   seen_at: number | null
 }
 
-function ensureSchema(): void {
-  const cols = getDb().prepare('PRAGMA table_info(chat)').all() as Array<{ name: string }>
-  if (!cols.some((c) => c.name === 'ticket_key')) getDb().exec('ALTER TABLE chat ADD COLUMN ticket_key TEXT')
-  if (!cols.some((c) => c.name === 'pr_url')) getDb().exec('ALTER TABLE chat ADD COLUMN pr_url TEXT')
-  if (!cols.some((c) => c.name === 'seen_at')) {
-    getDb().exec('ALTER TABLE chat ADD COLUMN seen_at INTEGER')
-    // Existing chats were last seen "now", otherwise every row dots up after upgrading.
-    getDb().exec('UPDATE chat SET seen_at = updated_at WHERE seen_at IS NULL')
-  }
-}
-
 function rowToSummary(row: ChatRow): ChatSummary {
   return {
     sessionId: row.session_id,
@@ -146,22 +131,16 @@ function rowToSummary(row: ChatRow): ChatSummary {
   }
 }
 
-function send(event: PushEvent): void {
-  for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IPC.eventPush, event)
-}
-
 class ChatManager {
   private wired = false
   /** messageID → accumulated streamed text, for live transcript updates. */
-  private streaming = new Map<string, { sessionId: string; text: string }>()
 
   wire(): void {
     if (this.wired) return
     this.wired = true
-    ensureSchema()
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
     // SSE is live-only: after a reconnect the renderer refetches via its queries.
-    eventBus.on('stream:reconnect', () => send({ kind: 'chat.idle', sessionId: '*' }))
+    eventBus.on('stream:reconnect', () => pushToWindows({ kind: 'chat.idle', sessionId: '*' }))
   }
 
   list(): ChatSummary[] {
@@ -172,7 +151,6 @@ class ChatManager {
   }
 
   async create(input: ChatCreateInput): Promise<ChatSummary> {
-    ensureSchema()
     const prUrl = await resolvePrLink(input.prUrl, input.directory)
     const api = openCodeService.api
     // Only force a title on the session when the user typed one — otherwise
@@ -193,6 +171,7 @@ class ChatManager {
          VALUES(?,?,?,?,?,?,?,?,?,?)`
       )
       .run(session.id, title, input.directory, input.agentID ?? null, input.model?.providerID ?? null, input.model?.id ?? null, input.ticketKey ?? null, prUrl ?? null, now, now)
+    sessionIndex.register(session.id, 'chat')
     return {
       sessionId: session.id,
       title,
@@ -232,6 +211,7 @@ class ChatManager {
           s.time?.created ?? Date.now(),
           s.time?.updated ?? Date.now()
         )
+        sessionIndex.register(s.id, 'chat')
       }
     } catch (err) {
       console.warn('[chat] reconcile failed:', describeError(err))
@@ -302,13 +282,7 @@ class ChatManager {
     const api = openCodeService.api
     getDb().prepare('UPDATE chat SET updated_at = ? WHERE session_id = ?').run(Date.now(), sessionId)
     const dir = this.directoryOf(sessionId)
-    const files = [
-      ...images.map((img) => {
-        const base64 = img.data.startsWith('data:') ? img.data.slice(img.data.indexOf(',') + 1) : img.data
-        return { uri: `data:${img.mime};base64,${base64}`, name: img.name }
-      }),
-      ...(refs && dir ? fileAttachments(refs, dir) : [])
-    ]
+    const files = [...promptImageFiles(images), ...(refs && dir ? fileAttachments(refs, dir) : [])]
     const skills = refs ? skillAttachments(refs) : []
     const payload = {
       sessionID: sessionId,
@@ -343,6 +317,7 @@ class ChatManager {
       // already gone remotely — fine, remove local index anyway
     }
     getDb().prepare('DELETE FROM chat WHERE session_id = ?').run(sessionId)
+    sessionIndex.forget(sessionId)
   }
 
   private touch(sessionId: string): void {
@@ -361,15 +336,11 @@ class ChatManager {
     return row?.directory ?? ''
   }
 
-  private isChat(sessionId: string): boolean {
-    return getDb().prepare('SELECT 1 FROM chat WHERE session_id = ?').get(sessionId) !== undefined
-  }
-
   private onEvent(e: RawEvent): void {
     const data = (e.data ?? {}) as Record<string, unknown>
     const sessionId = data.sessionID
     if (typeof sessionId !== 'string') return
-    if (!this.isChat(sessionId)) return
+    if (sessionIndex.kindOf(sessionId) !== 'chat') return
     switch (e.type) {
       case 'session.renamed': {
         // OpenCode auto-titles a session from its first message. Adopt that
@@ -379,19 +350,20 @@ class ChatManager {
         const row = getDb().prepare('SELECT title FROM chat WHERE session_id = ?').get(sessionId) as { title: string } | undefined
         if (!row || row.title !== AUTO_TITLE) break
         getDb().prepare('UPDATE chat SET title = ? WHERE session_id = ?').run(title.slice(0, 100), sessionId)
-        send({ kind: 'chat.renamed', sessionId, title: title.slice(0, 100) })
+        pushToWindows({ kind: 'chat.renamed', sessionId, title: title.slice(0, 100) })
         break
       }
       case 'session.text.delta': {
-        const msgId = String(data.assistantMessageID ?? '')
-        const entry = this.streaming.get(msgId) ?? { sessionId, text: '' }
-        entry.text += typeof data.delta === 'string' ? data.delta : ''
-        this.streaming.set(msgId, entry)
-        send({ kind: 'chat.delta', sessionId, messageId: msgId, text: entry.text })
+        streamBuffer.push({
+          kind: 'chat.delta',
+          sessionId,
+          messageId: String(data.assistantMessageID ?? ''),
+          text: typeof data.delta === 'string' ? data.delta : ''
+        })
         break
       }
       case 'session.tool.called': {
-        send({ kind: 'chat.tool', sessionId, tool: String(data.name ?? data.tool ?? 'tool'), state: 'called' })
+        pushToWindows({ kind: 'chat.tool', sessionId, tool: String(data.name ?? data.tool ?? 'tool'), state: 'called' })
         break
       }
       case 'session.execution.succeeded':
@@ -401,8 +373,10 @@ class ChatManager {
         // Primary completion signal for API-driven sessions is session.execution.*;
         // session.idle may also fire but must not be required.
         this.touch(sessionId)
-        this.streaming.clear()
-        send({ kind: 'chat.idle', sessionId })
+        // Flush accumulated text before idle so the renderer's final refetch
+        // never races a missing tail (ordering: last text, then idle).
+        streamBuffer.flush(sessionId)
+        pushToWindows({ kind: 'chat.idle', sessionId })
         break
       }
     }

@@ -26,8 +26,7 @@ export function ScriptsView(): React.JSX.Element {
   const scripts = useQuery({ queryKey: ['scripts'], queryFn: () => window.revva.scripts.list() })
   const status = useQuery({
     queryKey: ['script-status'],
-    queryFn: () => window.revva.scripts.status(),
-    refetchInterval: 10_000
+    queryFn: () => window.revva.scripts.status()
   })
   const needs = useQuery({
     queryKey: ['script-provider-needs'],

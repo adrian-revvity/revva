@@ -52,6 +52,83 @@ function migrate(db: Database.Database): void {
       PRAGMA user_version = 1;
     `)
   }
+  if (version < 2) {
+    // v2: every table the pipeline/review/scripts/jira modules previously created
+    // lazily in their own ensureSchema(). Forward-only and idempotent: databases
+    // that already have some of these tables (or columns) skip the no-ops.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS work (
+        id TEXT PRIMARY KEY, ticket_key TEXT NOT NULL, workspace_id TEXT, repo_dir TEXT NOT NULL,
+        branch TEXT NOT NULL, worktree_dir TEXT NOT NULL, parent_work_id TEXT,
+        mode TEXT NOT NULL, state TEXT NOT NULL, session_id TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS review (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_id TEXT NOT NULL, round INTEGER NOT NULL, role TEXT NOT NULL,
+        session_id TEXT, status TEXT NOT NULL, findings TEXT NOT NULL DEFAULT '',
+        error TEXT, agent_id TEXT, provider_id TEXT, model_id TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_review_work ON review(work_id, round);
+      CREATE TABLE IF NOT EXISTS auto_decision (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_id TEXT NOT NULL, round INTEGER, kind TEXT NOT NULL,
+        detail TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS inbox_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL, kind TEXT NOT NULL, ref_id TEXT NOT NULL,
+        answer TEXT, answered_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS script (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, command TEXT NOT NULL,
+        cwd TEXT, interactive INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS script_run (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, script_id TEXT NOT NULL,
+        started_at INTEGER NOT NULL, ended_at INTEGER, exit_code INTEGER, output_tail TEXT
+      );
+      CREATE TABLE IF NOT EXISTS jira_comment (
+        work_id TEXT NOT NULL, ticket_key TEXT NOT NULL, comment_id TEXT NOT NULL,
+        author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL,
+        seen_at INTEGER NOT NULL, tackled_at INTEGER,
+        PRIMARY KEY (work_id, comment_id)
+      );
+      CREATE TABLE IF NOT EXISTS ticket (
+        key TEXT PRIMARY KEY, jira_id TEXT, summary TEXT, status TEXT, status_category TEXT,
+        points REAL, depends_on TEXT, raw TEXT, synced_at INTEGER
+      );
+    `)
+    addColumnIfMissing(db, 'chat', 'ticket_key', 'TEXT')
+    addColumnIfMissing(db, 'chat', 'pr_url', 'TEXT')
+    if (addColumnIfMissing(db, 'chat', 'seen_at', 'INTEGER')) {
+      // Existing chats were last seen "now", otherwise every row dots up after upgrading.
+      db.exec('UPDATE chat SET seen_at = updated_at WHERE seen_at IS NULL')
+    }
+    addColumnIfMissing(db, 'work', 'review_sel', 'TEXT')
+    addColumnIfMissing(db, 'work', 'ship_on_approve', 'INTEGER')
+    addColumnIfMissing(db, 'work', 'pr_url', 'TEXT')
+    db.exec('PRAGMA user_version = 2;')
+  }
+  if (version < 3) {
+    // Columns the pipeline gained after v2 shipped (blocker/review cycle, unread dots).
+    addColumnIfMissing(db, 'work', 'blocker', 'TEXT')
+    addColumnIfMissing(db, 'work', 'review_cycle_start', 'INTEGER')
+    addColumnIfMissing(db, 'work', 'review_head', 'TEXT')
+    if (addColumnIfMissing(db, 'work', 'seen_at', 'INTEGER')) {
+      // Existing works count as "last seen now", so upgrading doesn't flood the inbox.
+      db.exec('UPDATE work SET seen_at = updated_at WHERE seen_at IS NULL')
+    }
+    db.exec('PRAGMA user_version = 3;')
+  }
+}
+
+function addColumnIfMissing(db: Database.Database, table: string, column: string, decl: string): boolean {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+  if (cols.some((c) => c.name === column)) return false
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`)
+  return true
 }
 
 /* ---------- settings ---------- */

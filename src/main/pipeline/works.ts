@@ -17,6 +17,10 @@ import { openCodeService, describeError } from '../opencode/service'
 import { eventBus, type RawEvent } from '../opencode/bus'
 import { getTicket } from '../jira/board'
 import { getDb, settingGet } from '../db'
+import { sessionIndex } from '../opencode/session-index'
+import { streamBuffer } from '../opencode/stream-buffer'
+import { pushToWindows } from '../push'
+import { collectAdfText, isConflict, promptImageFiles } from '../util'
 import { reviewManager } from '../review'
 import { shipManager } from '../ship'
 import { renderPrompt, DEFAULT_START_PROMPT } from '@shared/prompts'
@@ -45,40 +49,6 @@ interface WorkRow {
   updated_at: number
 }
 
-function ensureSchema(): void {
-  getDb().exec(`CREATE TABLE IF NOT EXISTS work (
-    id TEXT PRIMARY KEY, ticket_key TEXT NOT NULL, workspace_id TEXT, repo_dir TEXT NOT NULL,
-    branch TEXT NOT NULL, worktree_dir TEXT NOT NULL, parent_work_id TEXT,
-    mode TEXT NOT NULL, state TEXT NOT NULL, session_id TEXT,
-    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-  );`)
-  // Forward-only column additions (M4).
-  const cols = getDb().prepare('PRAGMA table_info(work)').all() as Array<{ name: string }>
-  if (!cols.some((c) => c.name === 'review_sel')) {
-    getDb().exec('ALTER TABLE work ADD COLUMN review_sel TEXT')
-  }
-  if (!cols.some((c) => c.name === 'ship_on_approve')) {
-    getDb().exec('ALTER TABLE work ADD COLUMN ship_on_approve INTEGER')
-  }
-  if (!cols.some((c) => c.name === 'pr_url')) {
-    getDb().exec('ALTER TABLE work ADD COLUMN pr_url TEXT')
-  }
-  if (!cols.some((c) => c.name === 'blocker')) {
-    getDb().exec('ALTER TABLE work ADD COLUMN blocker TEXT')
-  }
-  if (!cols.some((c) => c.name === 'review_cycle_start')) {
-    getDb().exec('ALTER TABLE work ADD COLUMN review_cycle_start INTEGER')
-  }
-  if (!cols.some((c) => c.name === 'review_head')) {
-    getDb().exec('ALTER TABLE work ADD COLUMN review_head TEXT')
-  }
-  if (!cols.some((c) => c.name === 'seen_at')) {
-    getDb().exec('ALTER TABLE work ADD COLUMN seen_at INTEGER')
-    // Existing works count as "last seen now", so upgrading doesn't flood the inbox.
-    getDb().exec('UPDATE work SET seen_at = updated_at WHERE seen_at IS NULL')
-  }
-}
-
 function slugBranch(key: string): string {
   return `revva/${key.toLowerCase()}`
 }
@@ -92,12 +62,10 @@ class WorkManager {
   wire(): void {
     if (this.wired) return
     this.wired = true
-    ensureSchema()
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
   }
 
   list(): WorkSummary[] {
-    ensureSchema()
     const rows = getDb().prepare('SELECT * FROM work ORDER BY updated_at DESC').all() as WorkRow[]
     return rows.map((r) => this.toSummary(r))
   }
@@ -126,7 +94,6 @@ class WorkManager {
 
   async start(input: StartWorkInput): Promise<WorkSummary> {
     if (!openCodeService.connected) throw new Error('Connect OpenCode first.')
-    ensureSchema()
 
     const ticket = await getTicket(input.ticketKey)
     if (!ticket) throw new Error(`Ticket ${input.ticketKey} not found. Refresh the board first.`)
@@ -181,6 +148,7 @@ class WorkManager {
       metadata: { revva: { kind: 'work', workId: id, ticketKey: ticket.key, phase: 'build', mode: input.mode } }
     })
     getDb().prepare('UPDATE work SET session_id = ? WHERE id = ?').run(session.id, id)
+    sessionIndex.register(session.id, 'work')
 
     const prompt = await this.buildPrompt(ticket.key, input)
     await api.session.prompt({ sessionID: session.id, text: prompt }).catch((err) => {
@@ -322,9 +290,7 @@ class WorkManager {
   }
 
   private emit(id: string, state: WorkState): void {
-    for (const win of BrowserWindow.getAllWindows()) {
-      win.webContents.send(IPC.eventPush, { kind: 'work.updated', workId: id, state })
-    }
+    pushToWindows({ kind: 'work.updated', workId: id, state })
   }
 
   private workBySession(sessionId: string): WorkRow | undefined {
@@ -335,26 +301,26 @@ class WorkManager {
     const data = (e.data ?? {}) as Record<string, unknown>
     const sessionId = data.sessionID
     if (typeof sessionId !== 'string') return
+    // Fast miss on the index: chat/reviewer sessions never touch SQLite here.
+    if (sessionIndex.kindOf(sessionId) !== 'work') return
     const work = this.workBySession(sessionId)
     if (!work) return
 
     switch (e.type) {
       case 'session.text.delta': {
         if (work.state !== 'BUILDING') return
-        const msgId = String(data.assistantMessageID ?? '')
-        for (const win of BrowserWindow.getAllWindows()) {
-          win.webContents.send(IPC.eventPush, {
-            kind: 'work.delta',
-            workId: work.id,
-            sessionId,
-            messageId: msgId,
-            text: String(data.delta ?? '')
-          })
-        }
+        streamBuffer.push({
+          kind: 'work.delta',
+          workId: work.id,
+          sessionId,
+          messageId: String(data.assistantMessageID ?? ''),
+          text: String(data.delta ?? '')
+        })
         break
       }
       case 'session.execution.succeeded': {
         if (work.state !== 'BUILDING') return
+        streamBuffer.flush(sessionId)
         // M4: build finished → concurrent read-only reviewer fan-out (no more auto-approve).
         this.setState(work.id, 'REVIEW')
         void reviewManager.startRound(work.id, reviewManager.latestRound(work.id) + 1, true).catch((err) => {
@@ -365,6 +331,7 @@ class WorkManager {
       }
       case 'session.execution.failed':
       case 'session.execution.interrupted': {
+        streamBuffer.flush(sessionId)
         if (work.state === 'BUILDING') this.setState(work.id, 'WAITING_HUMAN', `Build ${e.type === 'session.execution.failed' ? 'failed' : 'was interrupted'}.`)
         break
       }
@@ -380,7 +347,10 @@ class WorkManager {
     if (shipManager.isShipping(id)) throw new Error('Shipping is in progress; wait for it to finish before abandoning this work.')
     if (reviewManager.isStartingReview(id)) throw new Error('Review is starting; wait for it to finish starting before abandoning this work.')
     await reviewManager.cancelWork(id)
-    if (work.session_id) await openCodeService.api.session.remove({ sessionID: work.session_id }).catch(() => undefined)
+    if (work.session_id) {
+      sessionIndex.forget(work.session_id)
+      await openCodeService.api.session.remove({ sessionID: work.session_id }).catch(() => undefined)
+    }
     await exec('git', ['-C', work.repo_dir, 'worktree', 'remove', '--force', work.worktree_dir]).catch(() => undefined)
     let note: string | undefined
     try {
@@ -410,13 +380,7 @@ class WorkManager {
       }
       this.touch(work.id)
     }
-    const files = [
-      ...images.map((img) => {
-        const base64 = img.data.startsWith('data:') ? img.data.slice(img.data.indexOf(',') + 1) : img.data
-        return { uri: `data:${img.mime};base64,${base64}`, name: img.name }
-      }),
-      ...(refs && work ? fileAttachments(refs, work.worktree_dir) : [])
-    ]
+    const files = [...promptImageFiles(images), ...(refs && work ? fileAttachments(refs, work.worktree_dir) : [])]
     const skills = refs ? skillAttachments(refs) : []
     const payload = {
       sessionID: sessionId,
@@ -429,9 +393,7 @@ class WorkManager {
       await openCodeService.api.session.prompt(payload)
     } catch (err) {
       // Steer refused (session state raced) — park the follow-up so it is not lost.
-      const msg = String((err as Error)?.message ?? err ?? '')
-      const conflict = (err as { status?: unknown })?.status === 409 || /409|conflict|busy|already running/i.test(msg)
-      if (!queued && conflict) {
+      if (!queued && isConflict(err)) {
         try {
           await openCodeService.api.session.prompt({ ...payload, delivery: 'queue' })
           return
@@ -486,17 +448,7 @@ function extractDescription(raw: unknown): string {
   if (typeof d === 'string') return d
   if (d && typeof d === 'object') {
     // ADF → crude text extraction; rich rendering lands with the UI polish pass.
-    const texts: string[] = []
-    const walk = (n: unknown): void => {
-      if (Array.isArray(n)) return void n.forEach(walk)
-      if (n && typeof n === 'object') {
-        const o = n as Record<string, unknown>
-        if (typeof o.text === 'string') texts.push(o.text)
-        if (o.content) walk(o.content)
-      }
-    }
-    walk(d)
-    return texts.join('\n')
+    return collectAdfText(d).join('\n')
   }
   return ''
 }

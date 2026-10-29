@@ -7,10 +7,10 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { connect as netConnect } from 'node:net'
-import { BrowserWindow } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { getDb } from './db'
-import { IPC, type ScriptDef, type ScriptInput, type ScriptRunRow, type ScriptStatus } from '@shared/types'
+import { pushToWindows } from './push'
+import type { PushEvent, ScriptDef, ScriptInput, ScriptRunRow, ScriptStatus } from '@shared/types'
 import { openCodeService } from './opencode/service'
 
 const OUTPUT_TAIL_LIMIT = 16_384
@@ -30,16 +30,6 @@ class ScriptManager {
   wire(): void {
     if (this.wired) return
     this.wired = true
-    getDb().exec(`
-      CREATE TABLE IF NOT EXISTS script (
-        id TEXT PRIMARY KEY, name TEXT NOT NULL, command TEXT NOT NULL,
-        cwd TEXT, interactive INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS script_run (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, script_id TEXT NOT NULL,
-        started_at INTEGER NOT NULL, ended_at INTEGER, exit_code INTEGER, output_tail TEXT
-      );
-    `)
   }
 
   list(): ScriptDef[] {
@@ -213,10 +203,8 @@ class ScriptManager {
     this.pushStatus()
   }
 
-  private push(event: { kind: 'script.output'; scriptId: string; chunk: string } | { kind: 'script.status'; status: ScriptStatus[] }): void {
-    for (const win of BrowserWindow.getAllWindows()) {
-      win.webContents.send(IPC.eventPush, event)
-    }
+  private push(event: PushEvent): void {
+    pushToWindows(event)
   }
 
   private pushStatus(): void {

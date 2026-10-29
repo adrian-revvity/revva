@@ -8,9 +8,11 @@
  */
 import { BrowserWindow, Notification } from 'electron'
 import { getDb } from '../db'
+import { sessionIndex } from './session-index'
 import { openCodeService, describeError } from './service'
 import { eventBus, type RawEvent } from './bus'
-import { IPC, type PendingItem } from '@shared/types'
+import type { PendingItem } from '@shared/types'
+import { pushToWindows } from '../push'
 
 interface InboxRow {
   session_id: string
@@ -29,7 +31,6 @@ class InboxManager {
   wire(): void {
     if (this.wired) return
     this.wired = true
-    ensureSchema()
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
     eventBus.on('stream:reconnect', () => void this.resync())
     openCodeService.onStatus((s) => {
@@ -57,49 +58,66 @@ class InboxManager {
   }
 
   /** Re-pull pending items for every session we own (crash/SSE-gap safety net). */
+  private resyncing = false
   async resync(): Promise<void> {
     if (!openCodeService.connected) return
-    const sessionIds = this.knownSessions()
-    const fresh = new Map<string, PendingItem>()
-    for (const sessionID of sessionIds) {
-      const dir = this.directoryOf(sessionID)
-      try {
-        for (const f of await openCodeService.api.session.form.list({ sessionID })) {
-          fresh.set(`form:${f.id}`, {
-            kind: 'form',
-            id: f.id,
-            sessionID,
-            title: f.title,
-            directory: dir,
-            createdAt: Date.now(),
-            fields: f.fields as unknown as PendingItem['fields']
-          })
-        }
-      } catch {
-        /* session gone */
-      }
-      try {
-        for (const p of await openCodeService.api.permission.list({ sessionID })) {
-          fresh.set(`perm:${p.id}`, {
-            kind: 'permission',
-            id: p.id,
-            sessionID,
-            title: p.message ?? `${p.action} ${p.resources.slice(0, 2).join(', ')}`,
-            directory: dir,
-            createdAt: Date.now(),
-            action: p.action,
-            resources: p.resources
-          })
-        }
-      } catch {
-        /* session gone */
-      }
+    if (this.resyncing) return // two reconnects in one resync window: the final swap below is authoritative anyway
+    this.resyncing = true
+    try {
+      const sessionIds = this.knownSessions()
+      const fresh = new Map<string, PendingItem>()
+      // Sessions are independent; per-session the two list calls are too.
+      await Promise.allSettled(
+        sessionIds.map(async (sessionID) => {
+          const dir = this.directoryOf(sessionID)
+          const owner = this.ownerLabel(sessionID)
+          const [forms, perms] = await Promise.allSettled([
+            openCodeService.api.session.form.list({ sessionID }),
+            openCodeService.api.permission.list({ sessionID })
+          ])
+          // A rejected list means the session is gone/unreadable — skip it (as the old per-call catch did).
+          if (forms.status === 'fulfilled') {
+            for (const f of forms.value) {
+              const key = `form:${f.id}`
+              fresh.set(key, {
+                kind: 'form',
+                id: f.id,
+                sessionID,
+                title: f.title,
+                directory: dir,
+                // Keep the original wait time so the oldest-first order survives reconnects.
+                createdAt: this.pending.get(key)?.createdAt ?? Date.now(),
+                fields: f.fields as unknown as PendingItem['fields'],
+                owner
+              })
+            }
+          }
+          if (perms.status === 'fulfilled') {
+            for (const p of perms.value) {
+              const key = `perm:${p.id}`
+              fresh.set(key, {
+                kind: 'permission',
+                id: p.id,
+                sessionID,
+                title: p.message ?? `${p.action} ${p.resources.slice(0, 2).join(', ')}`,
+                directory: dir,
+                createdAt: this.pending.get(key)?.createdAt ?? Date.now(),
+                action: p.action,
+                resources: p.resources,
+                owner
+              })
+            }
+          }
+        })
+      )
+      this.pending = fresh
+      this.push()
+      // Preview tails are fetched after the snapshot is up (resync runs on every
+      // connect; message.list per session would slow the initial paint otherwise).
+      for (const [key, item] of fresh) this.attachLastMessage(key, item.sessionID)
+    } finally {
+      this.resyncing = false
     }
-    this.pending = fresh
-    this.push()
-    // Preview tails are fetched after the snapshot is up (resync runs on every
-    // connect; message.list per session would slow the initial paint otherwise).
-    for (const [key, item] of fresh) this.attachLastMessage(key, item.sessionID)
   }
 
   private knownSessions(): string[] {
@@ -224,11 +242,7 @@ class InboxManager {
   }
 
   private isKnown(sessionID: string): boolean {
-    const db = getDb()
-    return (
-      db.prepare('SELECT 1 FROM chat WHERE session_id = ?').get(sessionID) !== undefined ||
-      db.prepare('SELECT 1 FROM work WHERE session_id = ?').get(sessionID) !== undefined
-    )
+    return sessionIndex.kindOf(sessionID) !== undefined
   }
 
   /** A blocked run is visibly WAITING_HUMAN on its ticket card. */
@@ -268,19 +282,8 @@ class InboxManager {
   }
 
   private push(): void {
-    const snapshot = this.list()
-    for (const win of BrowserWindow.getAllWindows()) {
-      win.webContents.send(IPC.eventPush, { kind: 'inbox', items: snapshot })
-    }
+    pushToWindows({ kind: 'inbox', items: this.list() })
   }
-}
-
-function ensureSchema(): void {
-  getDb().exec(`CREATE TABLE IF NOT EXISTS inbox_audit (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL, kind TEXT NOT NULL, ref_id TEXT NOT NULL,
-    answer TEXT, answered_at INTEGER NOT NULL
-  );`)
 }
 
 export const inboxManager = new InboxManager()

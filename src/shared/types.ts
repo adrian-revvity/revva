@@ -66,6 +66,7 @@ export const settingsKeySchema = z.enum([
   'reviewMaxRounds',
   'jira.connected',
   'jira.siteUrl',
+  'jira.commentPollSecs',
   'model.favorites',
   'prompt.start',
   'prompt.tackle',
@@ -577,7 +578,7 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   /** New Jira comments pending action (M6). */
   z.object({ kind: z.literal('comments'), items: z.array(jiraCommentSchema) }),
   z.object({ kind: z.literal('script.output'), scriptId: z.string(), chunk: z.string() }),
-  z.object({ kind: z.literal('script.status'), status: scriptStatusSchema })
+  z.object({ kind: z.literal('script.status'), status: z.array(scriptStatusSchema) })
 ])
 export type PushEvent = z.infer<typeof pushEventSchema>
 

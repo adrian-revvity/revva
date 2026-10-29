@@ -6,8 +6,8 @@
  * `stream:reconnect` so subsystems can resync.
  */
 import { EventEmitter } from 'node:events'
-import { BrowserWindow } from 'electron'
-import { IPC, type PushEvent } from '@shared/types'
+import type { PushEvent } from '@shared/types'
+import { pushToWindows } from '../push'
 import { openCodeService } from './service'
 
 class EventBus extends EventEmitter {
@@ -80,7 +80,7 @@ class EventBus extends EventEmitter {
     }
     if (running === undefined) return
     const update: PushEvent = { kind: 'session.activity', sessionId, running }
-    for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IPC.eventPush, update)
+    pushToWindows(update)
   }
 
   private pushInbox(event: RawEvent): void {
@@ -88,7 +88,7 @@ class EventBus extends EventEmitter {
     if (typeof sessionId !== 'string') return
     if (!event.type.startsWith('session.inbox.')) return
     const update: PushEvent = { kind: 'session.queue', sessionId }
-    for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IPC.eventPush, update)
+    pushToWindows(update)
   }
 
   private pushModel(event: RawEvent): void {
@@ -96,7 +96,7 @@ class EventBus extends EventEmitter {
     const sessionId = event.data?.sessionID
     if (typeof sessionId !== 'string') return
     const update: PushEvent = { kind: 'session.model', sessionId }
-    for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IPC.eventPush, update)
+    pushToWindows(update)
   }
 }
 

@@ -33,7 +33,7 @@ export function SetupView(): React.JSX.Element {
   const [newFolder, setNewFolder] = useState('')
   const [category, setCategory] = useState<InventoryCategory>('models')
 
-  const status = useQuery({ queryKey: ['service-status'], queryFn: () => window.revva.service.status(), refetchInterval: 5000 })
+  const status = useQuery({ queryKey: ['service-status'], queryFn: () => window.revva.service.status() })
   const workspaces = useQuery({ queryKey: ['workspaces'], queryFn: () => window.revva.workspace.list() })
   const connected = status.data?.state === 'connected'
   const agents = useQuery({ queryKey: ['agents'], queryFn: () => window.revva.inventory.agents(), enabled: connected })
