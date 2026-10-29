@@ -16,6 +16,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
+import { useTriage } from '@/views/InboxView'
 import type { WorkSummary } from '@shared/types'
 
 type Section = 'inbox' | 'jira' | 'github' | 'scripts' | 'setup'
@@ -45,6 +46,7 @@ export function DashboardView({
     staleTime: 30_000
   })
   const inbox = useQuery({ queryKey: ['inbox'], queryFn: () => window.revva.inbox.list() })
+  const triage = useTriage()
   const prsMine = useQuery({ queryKey: ['gh-prs', 'mine'], queryFn: () => window.revva.github.list('mine'), staleTime: 30_000 })
   const prsReview = useQuery({ queryKey: ['gh-prs', 'review'], queryFn: () => window.revva.github.list('review'), staleTime: 30_000 })
   const chats = useQuery({ queryKey: ['chats'], queryFn: () => window.revva.chat.list() })
@@ -131,17 +133,24 @@ export function DashboardView({
             }
           />
           <StatCard
-            icon={<InboxIcon className={cn('size-4', inboxItems.length > 0 && 'text-amber-500')} />}
+            icon={<InboxIcon className={cn('size-4', triage.length > 0 && 'text-amber-500')} />}
             label="Inbox"
             onClick={() => go('inbox')}
             value={
-              inboxItems.length > 0 ? (
-                <span className="text-amber-600 dark:text-amber-400">{inboxItems.length} waiting on you</span>
+              triage.length > 0 ? (
+                <span className="text-amber-600 dark:text-amber-400">{triage.length} waiting on you</span>
               ) : (
                 'Clear'
               )
             }
-            sub={inboxItems.length > 0 ? inboxItems.map((i) => i.title).slice(0, 2).join(' · ') : 'No forms or permissions pending'}
+            sub={
+              triage.length > 0
+                ? triage
+                    .map((e) => (e.type === 'pending' ? e.item.title : `${e.item.owner} · finished unread`))
+                    .slice(0, 2)
+                    .join(' · ')
+                : 'Nothing needs you'
+            }
           />
           <StatCard
             icon={<Hammer className="size-4" />}

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { GitBranch, RefreshCw, Trash2 } from 'lucide-react'
+import { GitBranch, RefreshCw, Trash2, TriangleAlert } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -88,12 +88,23 @@ export function WorktreesDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <GitBranch className="size-4" /> Worktrees
+            {worktrees.data && <Badge variant="secondary">{items.length}</Badge>}
           </DialogTitle>
           <DialogDescription>
             Linked worktrees across your repos. Removing also deletes the branch only when git
             allows it — unmerged branches are always kept.
           </DialogDescription>
         </DialogHeader>
+
+        {items.length > 10 && (
+          <p className="flex items-center gap-2 text-xs text-amber-700 dark:text-amber-400">
+            <TriangleAlert className="size-4 shrink-0" aria-hidden="true" />
+            More than 10 linked worktrees. Review any you no longer need.
+          </p>
+        )}
+        {worktrees.isError && worktrees.data && (
+          <p role="alert" className="text-xs text-destructive">Couldn’t refresh worktrees. Showing the last known list.</p>
+        )}
 
         <div className="flex shrink-0 items-center gap-2">
           <Button
@@ -133,7 +144,12 @@ export function WorktreesDialog({
               <Skeleton className="h-10 w-full" />
             </div>
           )}
-          {!worktrees.isLoading && items.length === 0 && (
+          {worktrees.isError && !worktrees.data && (
+            <p role="alert" className="p-6 text-center text-sm text-destructive">
+              Couldn’t load worktrees. Use Refresh to try again.
+            </p>
+          )}
+          {!worktrees.isLoading && (!worktrees.isError || worktrees.data) && items.length === 0 && (
             <p className="p-6 text-center text-sm text-muted-foreground">
               No worktrees found in your repos.
             </p>

@@ -1,12 +1,13 @@
 import { useEffect, useMemo } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
-import { CircleDot, GitBranch, FolderGit2 } from 'lucide-react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { CircleDot } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import type { PushEvent, WorkSummary } from '@shared/types'
-import { TranscriptView, type TranscriptDrive } from './Chat'
-import { FormCard, PermissionCard, useInbox } from './InboxView'
+import { SessionIdButton, TranscriptView, type TranscriptDrive } from './Chat'
+import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from '@/components/ui/popover'
+import { workStateLabels } from '@/lib/work-state'
 import { ReviewPanel, ReviewRerunButton } from './ReviewPanel'
-import { ShipPanel } from './ShipPanel'
+import { ShipHeaderButton, ShipPanel } from './ShipPanel'
 import { CommentsStrip } from './CommentsStrip'
 
 const stateClasses: Record<string, string> = {
@@ -26,9 +27,16 @@ const stateClasses: Record<string, string> = {
  */
 export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element {
   const sessionId = work.sessionId
-  const allPending = useInbox()
-  const pending = allPending.filter((p) => p.sessionID === sessionId)
   const qc = useQueryClient()
+
+  // Opening the cockpit counts as "seen": clears the inbox finished-unread card
+  // and the unread flag on the work.
+  useEffect(() => {
+    if (!work.unread) return
+    void window.revva.triage.markRead('work', work.id).then(() => {
+      void qc.invalidateQueries({ queryKey: ['works'] })
+    })
+  }, [work.unread, work.id, qc])
 
   // Orca lesson: push events alone go stale (e.g. the agent commits while the window
   // is hidden). Refetch the panels' data whenever the window regains focus too.
@@ -83,30 +91,25 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <ReviewPanel workId={work.id} />
+      <ReviewPanel workId={work.id} state={work.state} auto={work.mode === 'auto'} />
       <ShipPanel work={work} />
-      <CommentsStrip workId={work.id} />
-      {pending.length > 0 && (
-        <div className="max-h-64 shrink-0 space-y-2 overflow-y-auto border-b bg-amber-500/5 p-3">
-          <p className="text-[11px] font-medium text-amber-700 dark:text-amber-400">
-            Waiting on you ({pending.length})
-          </p>
-          {pending.map((p) =>
-            p.kind === 'form' ? <FormCard key={p.id} item={p} /> : <PermissionCard key={p.id} item={p} />
-          )}
+      {work.blocker && (
+        <div role="alert" className="shrink-0 border-b bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          {work.blocker}
         </div>
       )}
+      <CommentsStrip workId={work.id} />
       <TranscriptView
       sessionId={sessionId}
       drive={drive}
       emptyHint="The build session is spinning up — output appears here live."
+      hideSessionDetails
       header={
         <>
-          <span className="font-mono text-[13px] font-semibold">{work.ticketKey}</span>
-          <span className="truncate text-[13px] text-muted-foreground">{work.ticketSummary}</span>
+          <span className="min-w-0 flex-1 truncate text-[13px] font-medium" title={work.ticketSummary}>{work.ticketSummary}</span>
           <Badge variant="outline" className={`text-[10px] ${stateClasses[work.state] ?? ''}`}>
             <CircleDot className="mr-1 size-3" />
-            {work.state}
+            {workStateLabels[work.state]}
           </Badge>
           {work.mode === 'auto' && (
             <Badge className="text-[10px]">AUTO</Badge>
@@ -114,17 +117,55 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
           {(work.state === 'APPROVED' || work.state === 'WAITING_HUMAN') && (
             <ReviewRerunButton workId={work.id} />
           )}
-          <Badge variant="outline" className="ml-auto max-w-56 truncate font-mono text-[10px] font-normal">
-            <GitBranch className="mr-1 inline size-3" />
-            {work.branch}
-          </Badge>
-          <Badge variant="outline" className="max-w-52 truncate font-mono text-[10px] font-normal">
-            <FolderGit2 className="mr-1 inline size-3" />
-            {work.worktreeDir.split('/').filter(Boolean).pop()}
-          </Badge>
+          <ShipHeaderButton work={work} />
         </>
       }
     />
     </div>
+  )
+}
+
+export function WorkDetailsPopover({ work }: { work: WorkSummary }): React.JSX.Element {
+  const model = useQuery({
+    queryKey: ['session-model', work.sessionId],
+    queryFn: () => window.revva.session.model(work.sessionId!),
+    enabled: !!work.sessionId,
+    refetchInterval: 10_000
+  })
+  const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models() })
+  const fullModel = model.data
+    ? `${model.data.providerID}/${model.data.id}${model.data.variant ? ` · ${model.data.variant}` : ''}`
+    : model.isError ? 'Unavailable' : model.isPending && work.sessionId ? 'Loading…' : 'Service default'
+  const shortModel = model.data
+    ? models.data?.find((item) => item.providerID === model.data?.providerID && item.id === model.data?.id)?.name || model.data.id
+    : fullModel
+
+  return (
+    <Popover key={work.id}>
+      <PopoverTrigger className="no-drag shrink-0 rounded-full border px-2.5 py-1 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring">
+        Details
+      </PopoverTrigger>
+      <PopoverContent align="end" className="gap-3 p-3">
+        <PopoverTitle>Conversation details</PopoverTitle>
+        <dl className="flex flex-col gap-3 text-xs">
+          <div>
+            <dt className="text-muted-foreground">Branch</dt>
+            <dd className="break-all font-mono">{work.branch}</dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">Worktree</dt>
+            <dd className="break-all font-mono">{work.worktreeDir}</dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">Model</dt>
+            <dd title={fullModel}>{shortModel}</dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">Session</dt>
+            <dd>{work.sessionId ? <SessionIdButton key={work.sessionId} sessionId={work.sessionId} /> : 'Unavailable'}</dd>
+          </div>
+        </dl>
+      </PopoverContent>
+    </Popover>
   )
 }

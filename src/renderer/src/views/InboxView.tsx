@@ -1,6 +1,21 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Inbox as InboxIcon, ShieldAlert, MessageCircleQuestion, FolderOpen } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import {
+  Inbox as InboxIcon,
+  ShieldAlert,
+  MessageCircleQuestion,
+  FolderOpen,
+  CheckCheck,
+  ArrowUp,
+  ArrowUpRight,
+  ChevronLeft,
+  ChevronRight,
+  List,
+  Layers,
+  ArrowLeftRight
+} from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -8,8 +23,10 @@ import { Textarea } from '@/components/ui/textarea'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Separator } from '@/components/ui/separator'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
-import type { InboxField, PendingItem } from '@shared/types'
+import { MD_COMPONENTS } from '@/components/message-markdown'
+import type { FinishedRun, InboxField, PendingItem, TriageEntry } from '@shared/types'
 
 /** Raw FormInfo.fields come across IPC untyped; normalize to InboxField[]. */
 function normalizeFields(raw: unknown): InboxField[] {
@@ -36,7 +53,7 @@ function normalizeFields(raw: unknown): InboxField[] {
     .filter((f) => f.key)
 }
 
-export function useInbox(): PendingItem[] {
+function useInboxQuery() {
   const qc = useQueryClient()
   const q = useQuery({ queryKey: ['inbox'], queryFn: () => window.revva.inbox.list() })
   // Main pushes the authoritative snapshot; keep the cache in sync.
@@ -45,27 +62,372 @@ export function useInbox(): PendingItem[] {
       if (e.kind === 'inbox') qc.setQueryData(['inbox'], e.items)
     })
   }, [qc])
-  return q.data ?? []
+  return q
 }
 
-export function InboxView(): React.JSX.Element {
-  const items = useInbox()
+export function useInbox(): PendingItem[] {
+  return useInboxQuery().data ?? []
+}
+
+/** Pending items stay available even if the newer finished-run feed fails to load. */
+function useTriageState(): { entries: TriageEntry[]; loading: boolean; error: boolean; errorDetail: string | null; unavailable: boolean; pendingError: boolean; pendingErrorDetail: string | null; retrying: boolean; retry: () => void } {
+  const qc = useQueryClient()
+  const pending = useInboxQuery()
+  const [retrying, setRetrying] = useState(false)
+  // During development the renderer can reload before the Electron preload does.
+  const unavailable = !window.revva.triage
+  const q = useQuery({
+    queryKey: ['triage'],
+    queryFn: () => window.revva.triage.list(),
+    enabled: !unavailable,
+    retry: false
+  })
+  useEffect(() => {
+    return window.revva.events.on((e) => {
+      if (e.kind === 'triage') qc.setQueryData(['triage'], e.entries)
+      // Any pending-item or completion change invalidates the merged feed.
+      else if (e.kind === 'inbox' || e.kind === 'chat.idle' || e.kind === 'work.updated')
+        void qc.invalidateQueries({ queryKey: ['triage'] })
+    })
+  }, [qc])
+  return {
+    entries: [
+      ...(pending.data ?? []).map((item): TriageEntry => ({ type: 'pending', item })),
+      ...(q.data ?? []).filter((entry) => entry.type === 'finished')
+    ],
+    loading: pending.isLoading || (!unavailable && q.isLoading),
+    error: q.isError,
+    errorDetail: q.isError ? errorMessage(q.error) : null,
+    unavailable,
+    pendingError: pending.isError,
+    pendingErrorDetail: pending.isError ? errorMessage(pending.error) : null,
+    retrying,
+    retry: () => {
+      if (retrying) return
+      setRetrying(true)
+      const requests = []
+      if (pending.isError) requests.push(pending.refetch())
+      if (!unavailable && q.isError) requests.push(q.refetch())
+      void Promise.allSettled(requests).finally(() => setRetrying(false))
+    }
+  }
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message || error.name
+  if (typeof error === 'string') return error
+  try {
+    return JSON.stringify(error) || 'Unknown error'
+  } catch {
+    return String(error)
+  }
+}
+
+export function useTriage(): TriageEntry[] {
+  return useTriageState().entries
+}
+
+/**
+ * Email-style triage: cards ordered needs-you → finished-unseen. Browse without
+ * dismissing an item; acting on one removes it. "All" shows the stacked list.
+ */
+export function InboxView({
+  onOpenChat,
+  onOpenWork
+}: {
+  onOpenChat: (sessionId: string) => void
+  onOpenWork: (workId: string) => void
+}): React.JSX.Element {
+  const qc = useQueryClient()
+  const { entries, loading, error, errorDetail, unavailable, pendingError, pendingErrorDetail, retrying, retry } = useTriageState()
+  const [focusMode, setFocusMode] = useState(true)
+  const [selection, setSelection] = useState<{ key: string; index: number } | null>(null)
+  const selectedIndex = selection ? entries.findIndex((entry) => entryKey(entry) === selection.key) : -1
+  const index = selectedIndex >= 0 ? selectedIndex : Math.min(selection?.index ?? 0, Math.max(entries.length - 1, 0))
+  const current = entries[index]
+
+  useEffect(() => {
+    if (selectedIndex < 0 || !selection || selectedIndex === selection.index) return
+    setSelection({ key: selection.key, index: selectedIndex })
+  }, [selectedIndex, selection])
+
+  const select = (nextIndex: number): void => {
+    const entry = entries[nextIndex]
+    if (entry) setSelection({ key: entryKey(entry), index: nextIndex })
+  }
+
+  const markRead = (entry: TriageEntry): void => {
+    if (entry.type !== 'finished') return
+    void window.revva.triage.markRead(entry.item.source, entry.item.workId ?? entry.item.sessionID).then(() => {
+      void qc.invalidateQueries({ queryKey: ['triage'] })
+      void qc.invalidateQueries({ queryKey: ['chats'], refetchType: 'all' })
+    })
+  }
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
-      <div className="mx-auto max-w-2xl space-y-4 px-6 py-6">
-        <header>
-          <h2 className="flex items-center gap-2 text-lg font-semibold">
-            <InboxIcon className="size-5" /> Inbox
-          </h2>
-          <p className="text-xs text-muted-foreground">
-            Pending questions and permission requests from all chats and ticket runs.
-          </p>
+      <div className="mx-auto max-w-5xl space-y-4 px-4 py-6 sm:px-6">
+        <header className="flex items-start gap-2">
+          <div className="min-w-0 flex-1">
+            <h2 className="flex items-center gap-2 text-lg font-semibold">
+              <InboxIcon className="size-5" /> Inbox
+              {entries.length > 0 && (
+                <Badge variant="secondary" className="text-[10px]">
+                  {entries.length}
+                </Badge>
+              )}
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              Questions, permissions, and finished runs you haven’t seen.
+            </p>
+          </div>
+          {entries.length > 1 && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="outline" size="sm" onClick={() => setFocusMode((f) => !f)}>
+                  {focusMode ? <List className="size-3.5" /> : <Layers className="size-3.5" />}
+                  {focusMode ? 'All' : 'Focus'}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {focusMode ? 'Show every card at once' : 'One card at a time'}
+              </TooltipContent>
+            </Tooltip>
+          )}
         </header>
-        {items.length === 0 && (
+
+        {(error || unavailable || pendingError || retrying) && (
+          <div role="alert" className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-400">
+            <div className="flex items-center justify-between gap-3">
+              <span>
+                {retrying && !pendingError && !error && !unavailable && 'Retrying inbox…'}
+                {pendingError && 'Couldn’t load pending questions. '}
+                {unavailable
+                  ? 'Finished runs are unavailable. Restart Revva to load the latest app update.'
+                  : error ? 'Couldn’t load finished runs.' : null}
+              </span>
+              {(pendingError || error || retrying) && (
+                <Button size="sm" variant="outline" onClick={retry} disabled={retrying}>{retrying ? 'Retrying…' : 'Retry'}</Button>
+              )}
+            </div>
+            {(errorDetail || pendingErrorDetail) && (
+              <details className="mt-2">
+                <summary className="cursor-pointer font-medium">Technical details</summary>
+                <div className="mt-2 flex flex-col gap-2">
+                  {pendingErrorDetail && <pre className="overflow-x-auto whitespace-pre-wrap break-all">Pending questions: {pendingErrorDetail}</pre>}
+                  {errorDetail && <pre className="overflow-x-auto whitespace-pre-wrap break-all">Finished runs: {errorDetail}</pre>}
+                  {errorDetail?.includes('No handler registered') && (
+                    <p>Quit and restart Revva completely to load the current main process.</p>
+                  )}
+                </div>
+              </details>
+            )}
+          </div>
+        )}
+
+        {entries.length === 0 && loading && (
+          <p className="py-14 text-center text-sm text-muted-foreground">Loading inbox…</p>
+        )}
+        {entries.length === 0 && !loading && !error && !unavailable && !pendingError && (
           <p className="py-14 text-center text-sm text-muted-foreground">Nothing waiting on you.</p>
         )}
-        {items.map((item) => (item.kind === 'form' ? <FormCard key={item.id} item={item} /> : <PermissionCard key={item.id} item={item} />))}
+
+        {focusMode && current && (
+          <nav aria-label="Inbox items" className="flex items-center justify-between gap-3">
+            <p aria-live="polite" className="text-sm font-medium">
+              {interactionLabel(current)} {index + 1} of {entries.length}
+            </p>
+            <div className="flex gap-1">
+              <Button variant="outline" size="sm" disabled={index === 0} onClick={() => select(index - 1)}>
+                <ChevronLeft data-icon="inline-start" /> Previous
+              </Button>
+              <Button variant="outline" size="sm" disabled={index === entries.length - 1} onClick={() => select(index + 1)}>
+                Next <ChevronRight data-icon="inline-end" />
+              </Button>
+            </div>
+          </nav>
+        )}
+        {entries.map((entry, entryIndex) => (
+          <div key={entryKey(entry)} hidden={focusMode && entryIndex !== index}>
+            <TriageCard entry={entry} onOpenChat={onOpenChat} onOpenWork={onOpenWork} onMarkRead={markRead} />
+          </div>
+        ))}
       </div>
+    </div>
+  )
+}
+
+function interactionLabel(entry: TriageEntry): string {
+  if (entry.type === 'finished') return entry.item.source === 'chat' ? 'Message ready' : 'Work update'
+  return entry.item.kind === 'form' ? 'Question' : 'Permission request'
+}
+
+function entryKey(entry: TriageEntry): string {
+  return entry.type === 'pending'
+    ? `pending:${entry.item.kind}:${entry.item.id}`
+    : `finished:${entry.item.source}:${entry.item.sessionID}`
+}
+
+/** One card in the feed: a pending question/permission or a finished-unseen run. */
+function TriageCard({
+  entry,
+  onOpenChat,
+  onOpenWork,
+  onMarkRead
+}: {
+  entry: TriageEntry
+  onOpenChat: (sessionId: string) => void
+  onOpenWork: (workId: string) => void
+  onMarkRead: (entry: TriageEntry) => void
+}): React.JSX.Element {
+  if (entry.type === 'pending') {
+    return entry.item.kind === 'form' ? <FormCard item={entry.item} /> : <PermissionCard item={entry.item} />
+  }
+  return (
+    <FinishedRunCard
+      item={entry.item}
+      onOpenChat={onOpenChat}
+      onOpenWork={onOpenWork}
+      onMarkRead={() => onMarkRead(entry)}
+    />
+  )
+}
+
+function FinishedRunCard({
+  item,
+  onOpenChat,
+  onOpenWork,
+  onMarkRead
+}: {
+  item: FinishedRun
+  onOpenChat: (sessionId: string) => void
+  onOpenWork: (workId: string) => void
+  onMarkRead: () => void
+}): React.JSX.Element {
+  const [draft, setDraft] = useState('')
+  const reply = useMutation({
+    mutationFn: (text: string) => window.revva.chat.prompt(item.sessionID, text),
+    onSuccess: () => {
+      setDraft('')
+      onMarkRead()
+    }
+  })
+  const open = (): void => {
+    if (item.source === 'work' && item.workId) onOpenWork(item.workId)
+    else onOpenChat(item.sessionID)
+    onMarkRead()
+  }
+  return (
+    <div className="rounded-lg border p-4 shadow-sm">
+      <div className="flex items-start gap-2">
+        <ArrowLeftRight className="mt-0.5 size-4 shrink-0 text-emerald-500" />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 flex-wrap items-center gap-1">
+            <span className="min-w-0 truncate text-sm font-medium">
+              {item.source === 'work' ? `${item.owner} finished` : item.owner}
+            </span>
+            <Button type="button" variant="ghost" size="xs" className="text-muted-foreground" disabled={reply.isPending} onClick={open}>
+              {item.source === 'work' ? 'Open cockpit' : 'Open chat'} <ArrowUpRight data-icon="inline-end" />
+            </Button>
+          </div>
+          <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <FolderOpen className="size-3" />
+            <span className="truncate font-mono">{item.directory}</span>
+          </div>
+        </div>
+        <div className="flex shrink-0 flex-wrap justify-end gap-1">
+          <Badge variant="secondary" className="text-[10px]">{item.source === 'chat' ? 'message ready' : 'work update'}</Badge>
+          {item.workState && <Badge variant="outline" className="text-[10px]">{item.workState.toLowerCase()}</Badge>}
+        </div>
+      </div>
+      {item.preview && <FinishedMessage text={item.preview} />}
+      {item.source === 'chat' && (
+        <form
+          className="mt-4 flex flex-col gap-2"
+          onSubmit={(event) => {
+            event.preventDefault()
+            if (draft.trim() && !reply.isPending) reply.mutate(draft.trim())
+          }}
+        >
+          {reply.error instanceof Error && <p role="alert" className="text-xs text-destructive">{reply.error.message}</p>}
+          <div className="flex flex-col rounded-xl border border-input bg-background focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/30">
+            <Textarea
+              aria-label={`Reply to ${item.owner}`}
+              placeholder="Continue this conversation…"
+              rows={2}
+              value={draft}
+              disabled={reply.isPending}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                  event.preventDefault()
+                  event.currentTarget.form?.requestSubmit()
+                }
+              }}
+              className="max-h-48 min-h-16 resize-none rounded-none border-0 bg-transparent px-4 pb-2 pt-3 shadow-none focus-visible:ring-0 dark:bg-transparent"
+            />
+            <div className="flex flex-wrap items-center justify-end gap-1 px-2 pb-2">
+              <span className="mr-auto px-1 text-xs text-muted-foreground">Enter to send · Shift+Enter for a new line</span>
+              <Button type="button" size="sm" variant="ghost" disabled={reply.isPending} onClick={onMarkRead}>
+                <CheckCheck data-icon="inline-start" /> Mark read
+              </Button>
+              <Button type="submit" size="sm" disabled={!draft.trim() || reply.isPending}>
+                <ArrowUp data-icon="inline-start" /> {reply.isPending ? 'Sending…' : 'Send'}
+              </Button>
+            </div>
+          </div>
+        </form>
+      )}
+      {item.source === 'work' && (
+        <div className="mt-3 flex justify-end">
+          <Button type="button" size="sm" variant="ghost" onClick={onMarkRead}>
+            <CheckCheck data-icon="inline-start" /> Mark read
+          </Button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function FinishedMessage({ text }: { text: string }): React.JSX.Element {
+  const [expanded, setExpanded] = useState(false)
+  const [overflowing, setOverflowing] = useState(false)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
+  const id = useId()
+
+  useEffect(() => {
+    if (expanded) return
+    const container = containerRef.current
+    const content = contentRef.current
+    if (!container || !content) return
+    const measure = (): void => setOverflowing(content.scrollHeight > container.clientHeight + 1)
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(container)
+    observer.observe(content)
+    return () => observer.disconnect()
+  }, [expanded, text])
+
+  return (
+    <div className="mt-4 min-w-0">
+      <div
+        id={id}
+        ref={containerRef}
+        role={overflowing && !expanded ? 'region' : undefined}
+        aria-label={overflowing && !expanded ? 'Message' : undefined}
+        tabIndex={overflowing && !expanded ? 0 : undefined}
+        className={cn('min-w-0', !expanded && 'max-h-72 overflow-y-auto')}
+      >
+        <div ref={contentRef} className="overflow-x-auto break-words text-sm leading-relaxed text-foreground">
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>{text}</ReactMarkdown>
+        </div>
+      </div>
+      {(overflowing || expanded) && (
+        <Button type="button" variant="ghost" size="sm" className="mt-2" aria-expanded={expanded} aria-controls={id} onClick={() => setExpanded((value) => !value)}>
+          {expanded ? 'Show less' : 'Show full message'}
+        </Button>
+      )}
     </div>
   )
 }
@@ -111,7 +473,7 @@ export function FormCard({ item }: { item: PendingItem }): React.JSX.Element {
           {reply.isPending ? 'Sending…' : 'Answer & continue'}
         </Button>
       </div>
-      {reply.error instanceof Error && <p className="mt-2 text-xs text-destructive">{reply.error.message}</p>}
+      {reply.error instanceof Error && <p role="alert" className="mt-2 text-xs text-destructive">{reply.error.message}</p>}
     </div>
   )
 }
@@ -223,28 +585,29 @@ export function PermissionCard({ item }: { item: PendingItem }): React.JSX.Eleme
         <Badge variant="outline" className="border-amber-500/40 text-[10px]">permission</Badge>
       </div>
       <div className={cn('mt-3 flex justify-end gap-2')}>
-        <Button size="sm" variant="outline" onClick={() => reply.mutate('reject')}>
+        <Button size="sm" variant="outline" disabled={reply.isPending} onClick={() => reply.mutate('reject')}>
           Reject
         </Button>
-        <Button size="sm" variant="secondary" onClick={() => reply.mutate('once')}>
+        <Button size="sm" variant="secondary" disabled={reply.isPending} onClick={() => reply.mutate('once')}>
           Allow once
         </Button>
-        <Button size="sm" onClick={() => reply.mutate('always')}>
+        <Button size="sm" disabled={reply.isPending} onClick={() => reply.mutate('always')}>
           Always allow
         </Button>
       </div>
+      {reply.error instanceof Error && <p role="alert" className="mt-2 text-xs text-destructive">{reply.error.message}</p>}
     </div>
   )
 }
 
 function OwnerLine({ item }: { item: PendingItem }): React.JSX.Element {
   return (
-    <p className="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+    <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
       <span className="font-medium">{item.owner ?? 'session'}</span>
       <Separator orientation="vertical" className="h-3" />
       <FolderOpen className="size-3" />
       <span className="truncate font-mono">{item.directory}</span>
-    </p>
+    </div>
   )
 }
 

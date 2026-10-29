@@ -1,7 +1,7 @@
 /**
  * Typed IPC surface. Renderer never touches node/electron APIs directly.
  */
-import { app, ipcMain, dialog, shell, BrowserWindow } from 'electron'
+import { app, ipcMain, dialog, shell, clipboard, BrowserWindow } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
@@ -9,6 +9,7 @@ import { IPC, settingsKeySchema, chatCreateInputSchema, type Workspace } from '@
 import { openCodeService } from './opencode/service'
 import { chatManager } from './opencode/chats'
 import { inboxManager } from './opencode/inbox'
+import { triageManager } from './opencode/triage'
 import { listAgents, listModels, listSkills } from './opencode/inventory'
 import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
@@ -28,6 +29,7 @@ import {
   startWorkInputSchema,
   inboxAnswerSchema,
   permissionDecisionSchema,
+  prMergeMethodSchema,
   scriptInputSchema,
   roleConfigSchema,
   taskSessionInputSchema,
@@ -157,12 +159,20 @@ export function registerIpc(): void {
     chatManager.prompt(String(sessionId), String(text), promptImageList(images), Boolean(queued), promptRefs(refs))
   )
   ipcMain.handle(IPC.chatInterrupt, (_e, sessionId: string) => chatManager.interrupt(String(sessionId)))
-  ipcMain.handle(IPC.chatSeen, (_e, sessionId: string) => chatManager.markSeen(String(sessionId)))
+  ipcMain.handle(IPC.chatSeen, (_e, sessionId: string) => {
+    chatManager.markSeen(String(sessionId))
+    // Opening the session discharges its finished-unread card — re-push the feed.
+    triageManager.push()
+  })
   ipcMain.handle(IPC.chatRename, (_e, sessionId: string, title: string) => chatManager.rename(String(sessionId), String(title)))
   ipcMain.handle(IPC.chatDelete, (_e, sessionId: string) => chatManager.remove(String(sessionId)))
   ipcMain.handle(IPC.sessionModel, async (_e, sessionId: string) => {
     const session = await openCodeService.api.session.get({ sessionID: String(sessionId) })
     return session.model ?? null
+  })
+  ipcMain.handle(IPC.sessionCopyId, (_e, sessionId: unknown) => {
+    if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 500) throw new Error('Invalid session ID.')
+    clipboard.writeText(sessionId)
   })
   ipcMain.handle(IPC.sessionContextUsage, async (_e, sessionId: string) => {
     const api = openCodeService.api
@@ -227,7 +237,11 @@ export function registerIpc(): void {
   ipcMain.handle(IPC.workReviews, (_e, workId: string) => reviewManager.reviewsFor(String(workId)))
   ipcMain.handle(IPC.workReviewStart, async (_e, workId: string) => {
     const round = reviewManager.latestRound(String(workId)) + 1
-    await reviewManager.startRound(String(workId), round)
+    await reviewManager.startRound(String(workId), round, true)
+  })
+  ipcMain.handle(IPC.workReviewRetry, (_e, workId: string, reviewId: number) => {
+    if (!Number.isSafeInteger(reviewId) || reviewId < 1) throw new Error('Invalid review ID.')
+    return reviewManager.retryReview(String(workId), reviewId)
   })
   ipcMain.handle(IPC.workShipCheck, (_e, workId: string) => shipManager.checks(String(workId)))
   ipcMain.handle(IPC.workShip, (_e, workId: string) => shipManager.ship(String(workId)))
@@ -245,6 +259,11 @@ export function registerIpc(): void {
   ipcMain.handle(IPC.inboxReplyPermission, (_e, sessionId: string, requestId: string, decision: unknown) =>
     inboxManager.replyPermission(String(sessionId), String(requestId), permissionDecisionSchema.parse(decision)))
 
+  /* ---------- triage inbox (finished-unseen feed) ---------- */
+  ipcMain.handle(IPC.triageList, () => triageManager.list())
+  ipcMain.handle(IPC.triageMarkRead, (_e, source: unknown, id: string) =>
+    triageManager.markRead(source === 'work' ? 'work' : 'chat', String(id)))
+
   /* ---------- comment watcher (M6) ---------- */
   ipcMain.handle(IPC.commentsPending, () => commentWatcher.pending())
   ipcMain.handle(IPC.commentsTackle, (_e, workId: string) => commentWatcher.tackleComments(String(workId)))
@@ -259,6 +278,20 @@ export function registerIpc(): void {
     return githubManager.startReview(parsed.url)
   })
   ipcMain.handle(IPC.githubSeen, (_e, prUrl: string) => githubManager.markSeen(String(prUrl)))
+  ipcMain.handle(IPC.githubAlerts, () => githubManager.alerts())
+  ipcMain.handle(IPC.githubAlertsSeen, (_e, urls?: unknown) =>
+    githubManager.markAlertsSeen(Array.isArray(urls) ? urls.map(String) : undefined)
+  )
+  ipcMain.handle(IPC.githubMerge, (_e, ref: unknown, method: unknown) => {
+    const parsed = parsePrRef(String(ref))
+    if (!parsed?.url) throw new Error('Pass a full PR URL or owner/repo#123 (bare numbers are ambiguous across projects).')
+    return githubManager.merge(parsed.url, prMergeMethodSchema.parse(method))
+  })
+  ipcMain.handle(IPC.githubRebase, (_e, ref: unknown) => {
+    const parsed = parsePrRef(String(ref))
+    if (!parsed?.url) throw new Error('Pass a full PR URL or owner/repo#123 (bare numbers are ambiguous across projects).')
+    return githubManager.rebase(parsed.url)
+  })
   ipcMain.handle(IPC.taskTicketSession, (_e, input: unknown) => {
     const parsed = taskSessionInputSchema.parse({ ...((input ?? {}) as object), kind: 'ticket' })
     if (parsed.kind !== 'ticket') throw new Error('invalid input')

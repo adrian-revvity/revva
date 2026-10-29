@@ -29,11 +29,16 @@ All plans stamped commit `830a20f` (typecheck clean there as of 2026-10-28).
 | 005 | Comment watcher: 5-min configurable poll, overlap guard, bounded fetch | P2 | S | — | TODO |
 | 007 | Extract 5 copy-pasted main-process helpers | P2 | M | 001; after 002/003 | TODO |
 | 008 | Delete dead vendored UI (sidebar/dropdown/sheet) + `cn` dep | P3 | S | — | TODO |
+| 009 | [Protect worktree contents before removal](009-safe-worktree-removal.md) | P1 | M | — | TODO |
+| 010 | [Bind review completion to the correct execution](010-review-completion-freshness.md) | P1 | M | — | TODO |
+| 011 | [Choose queue or steer in the composer](011-queue-or-steer-composer.md) | P2 | S–M | — | TODO |
+| 012 | [Add human diff comments to ticket work](012-inline-diff-review.md) | P2 | L | 010 | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale)
 
 ## Dependency notes
 
+- **New plans 009–012** were added 2026-10-29 at commit `ecf85d5` and are based on a dirty working tree. Preserve and inspect the existing in-flight changes; don't reset, stash, or overwrite them. Execute 009 → 010 → 011 → 012 as the recommended order; 012 depends on 010 because feedback must not weaken the review gate. 011 is otherwise independent.
 - **002 after 001**: both edit `wire()`/`ensureSchema` regions of the same
   module set; 001's deletions shift lines 002's excerpts cite.
 - **003 after 002**: 003 replaces the bodies of `onEvent()` handlers right

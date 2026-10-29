@@ -197,8 +197,9 @@ class CommentWatcher {
     if (!work) return
     try {
       // Agent's reply section → one Jira comment quoting what was tackled.
-      const messages = await openCodeService.api.message.list({ sessionID: sessionId, order: 'asc', limit: 200 })
-      const last = [...messages.data].reverse().find((m) => m.type === 'assistant')
+      // desc so the limit keeps the newest messages; first assistant = final reply.
+      const messages = await openCodeService.api.message.list({ sessionID: sessionId, order: 'desc', limit: 200 })
+      const last = messages.data.find((m) => m.type === 'assistant')
       let text = ''
       for (const part of (last as { content?: unknown[] })?.content ?? []) {
         const p = part as Record<string, unknown>

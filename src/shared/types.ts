@@ -320,7 +320,10 @@ export const workSummarySchema = z.object({
   state: workStateSchema,
   sessionId: z.string().optional(),
   prUrl: z.string().optional(),
-  updatedAt: z.number()
+  blocker: z.string().optional(),
+  updatedAt: z.number(),
+  /** Pipeline reached a human-relevant state since the user last opened the cockpit. */
+  unread: z.boolean().optional()
 })
 export type WorkSummary = z.infer<typeof workSummarySchema>
 
@@ -332,7 +335,7 @@ export const startWorkInputSchema = z.object({
   model: modelRefSchema.optional(),
   parentWorkId: z.string().optional(),
   grill: z.boolean().default(false),
-  /** Push + PR automatically once all review gates approve (opt-in per run). */
+  /** Also ship automatically in interactive mode; AUTO always ships after approval. */
   shipOnApprove: z.boolean().default(false),
   /** Per-run reviewer/fixer selections; fall back to role defaults when omitted. */
   reviewSel: z
@@ -394,9 +397,30 @@ export const pullRequestSchema = z.object({
   /** Unseen (by the user) comments from someone else exist on this PR. */
   hasNewComments: z.boolean().optional(),
   latestOtherCommentAuthor: z.string().optional(),
-  latestOtherCommentAt: z.number().optional()
+  latestOtherCommentAt: z.number().optional(),
+  /** GraphQL mergeable: MERGEABLE / CONFLICTING / UNKNOWN. */
+  mergeable: z.enum(['MERGEABLE', 'CONFLICTING', 'UNKNOWN']).optional(),
+  /** CLEAN / DIRTY / BLOCKED / BEHIND / DRAFT / UNSTABLE / HAS_HOOKS. */
+  mergeStateStatus: z.string().optional(),
+  /** Became CONFLICTING since the user last looked. */
+  hasNewConflicts: z.boolean().optional(),
+  /** Review decision became APPROVED since the user last looked. */
+  hasNewApproval: z.boolean().optional()
 })
 export type PullRequest = z.infer<typeof pullRequestSchema>
+
+export const prMergeMethodSchema = z.enum(['squash', 'merge', 'rebase'])
+export type PrMergeMethod = z.infer<typeof prMergeMethodSchema>
+
+/** What changed on a PR since the user last acknowledged it (sidebar bell). */
+export const prAlertSchema = z.object({
+  url: z.string(),
+  repo: z.string(),
+  number: z.number(),
+  title: z.string(),
+  kinds: z.array(z.enum(['comment', 'conflict', 'approval']))
+})
+export type PrAlert = z.infer<typeof prAlertSchema>
 
 export const prDetailSchema = pullRequestSchema.extend({
   headRefName: z.string(),
@@ -455,6 +479,35 @@ export type PendingItem = z.infer<typeof pendingItemSchema>
 export const inboxAnswerSchema = z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.array(z.string())]))
 export const permissionDecisionSchema = z.enum(['once', 'always', 'reject'])
 
+/* ---------- Triage inbox (email-style: everything waiting on you) ---------- */
+
+/**
+ * A finished run the user has not looked at yet (chat reply or ticket-work
+ * outcome). Sits in the triage feed beside pending forms/permissions, ranked
+ * below them; dismissed by opening the session or marking it read.
+ */
+export const finishedRunSchema = z.object({
+  sessionID: z.string(),
+  source: z.enum(['chat', 'work']),
+  /** Ticket works only: cockpit target and pipeline state for the badge. */
+  workId: z.string().optional(),
+  workState: workStateSchema.optional(),
+  /** Chat title or ticket key. */
+  owner: z.string(),
+  directory: z.string(),
+  updatedAt: z.number(),
+  /** Full text of the final assistant message, when available. */
+  preview: z.string().optional()
+})
+export type FinishedRun = z.infer<typeof finishedRunSchema>
+
+/** One card in the triage feed: an agent needing an answer, or a finished unread run. */
+export const triageEntrySchema = z.union([
+  z.object({ type: z.literal('pending'), item: pendingItemSchema }),
+  z.object({ type: z.literal('finished'), item: finishedRunSchema })
+])
+export type TriageEntry = z.infer<typeof triageEntrySchema>
+
 /* ---------- Scripts (user one-click commands, e.g. "morning") ---------- */
 
 export const scriptDefSchema = z.object({
@@ -505,6 +558,8 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('chat.message'), sessionId: z.string(), message: chatMessageSchema }),
   z.object({ kind: z.literal('chat.idle'), sessionId: z.string() }),
   z.object({ kind: z.literal('chat.tool'), sessionId: z.string(), tool: z.string(), state: z.string() }),
+  /** OpenCode auto-titled the session from its first message. */
+  z.object({ kind: z.literal('chat.renamed'), sessionId: z.string(), title: z.string() }),
   /** Queue contents or the session's selected model changed — renderer refetches. */
   z.object({ kind: z.literal('session.queue'), sessionId: z.string() }),
   z.object({ kind: z.literal('session.model'), sessionId: z.string() }),
@@ -512,6 +567,10 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('work.updated'), workId: z.string(), state: workStateSchema }),
   z.object({ kind: z.literal('work.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
   z.object({ kind: z.literal('inbox'), items: z.array(pendingItemSchema) }),
+  /** Ranked triage feed: pending items + finished-unseen runs (pushed on dismissal). */
+  z.object({ kind: z.literal('triage'), entries: z.array(triageEntrySchema) }),
+  /** Poller found new comments/conflicts/approvals (or their flags cleared). */
+  z.object({ kind: z.literal('github.alerts'), items: z.array(prAlertSchema) }),
   z.object({ kind: z.literal('review.updated'), workId: z.string(), round: z.number(), reviews: z.array(reviewRowSchema) }),
   /** Live streamed text from a reviewer/fixer session. */
   z.object({ kind: z.literal('review.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
@@ -567,6 +626,7 @@ export interface RevvaApi {
   }
   session: {
     model(sessionId: string): Promise<(ModelRef & { variant?: string }) | null>
+    copyId(sessionId: string): Promise<void>
     contextUsage(sessionId: string): Promise<{ tokens: number; limit?: number; providerID: string; modelID: string } | null>
     active(): Promise<string[]>
     /** Messages waiting in OpenCode's inbox for this session. */
@@ -596,6 +656,8 @@ export interface RevvaApi {
     reviews(workId: string): Promise<ReviewRow[]>
     /** Manually start another review round (e.g. after resolving a blocker). */
     reviewStart(workId: string): Promise<void>
+    /** Retry one reviewer or failed fixer in the latest round. */
+    reviewRetry(workId: string, reviewId: number): Promise<void>
     /** Pre-flight checks for shipping (push/PR/Jira). */
     shipCheck(workId: string): Promise<ShipCheck[]>
     /** Push + PR + Jira sync; opens the PR in the browser. */
@@ -616,8 +678,16 @@ export interface RevvaApi {
     list(scope?: 'mine' | 'review'): Promise<PullRequest[]>
     /** Spin up a PR-review agent session (worktree checked out in the background). */
     review(prUrl: string): Promise<TaskSessionResult>
-    /** Clear the "new comment" flag for a PR. */
+    /** Clear the "new comment/conflict/approval" flags for a PR. */
     markSeen(prUrl: string): Promise<void>
+    /** New comments/conflicts/approvals across both scopes (poller-maintained). */
+    alerts(): Promise<PrAlert[]>
+    /** Clear alert flags; omit urls to clear every current alert. */
+    markAlertsSeen(urls?: string[]): Promise<void>
+    /** gh pr merge — explicit user action; auto ship still never merges. */
+    merge(prUrl: string, method: PrMergeMethod): Promise<void>
+    /** Rebase the PR head onto its base and force-with-lease push the update. */
+    rebase(prUrl: string): Promise<void>
   }
   task: {
     /** Ad-hoc session linked to a ticket (no pipeline), in that ticket's repo or a chosen folder. */
@@ -636,6 +706,12 @@ export interface RevvaApi {
     list(): Promise<PendingItem[]>
     replyForm(sessionId: string, formId: string, answer: Record<string, string | number | boolean | string[]>): Promise<void>
     replyPermission(sessionId: string, requestId: string, decision: 'once' | 'always' | 'reject'): Promise<void>
+  }
+  triage: {
+    /** Ranked feed: pending forms/permissions first, then finished-unseen chats/works. */
+    list(): Promise<TriageEntry[]>
+    /** Archive a finished-unseen card without opening the session. */
+    markRead(source: 'chat' | 'work', id: string): Promise<void>
   }
   scripts: {
     list(): Promise<ScriptDef[]>

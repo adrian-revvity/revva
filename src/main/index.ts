@@ -6,6 +6,7 @@ import { openCodeService } from './opencode/service'
 import { eventBus } from './opencode/bus'
 import { chatManager } from './opencode/chats'
 import { inboxManager } from './opencode/inbox'
+import { githubManager } from './github'
 import { workManager } from './pipeline/works'
 import { reviewManager } from './review'
 import { scriptManager } from './scripts'
@@ -60,6 +61,7 @@ app.whenReady().then(() => {
   reviewManager.wire()
   scriptManager.wire()
   commentWatcher.wire()
+  githubManager.startPolling()
   void jiraAuth.load().then(() => {
     if (jiraAuth.status().connected) void jiraMcp.connect().catch(() => undefined)
   })

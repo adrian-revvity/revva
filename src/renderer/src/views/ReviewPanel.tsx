@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { TranscriptView, type TranscriptDrive } from './Chat'
-import type { PipelineRole, PushEvent, ReviewRow } from '@shared/types'
+import type { PipelineRole, PushEvent, ReviewRow, WorkState } from '@shared/types'
 
 const roleMeta: Partial<Record<PipelineRole, { label: string; icon: React.JSX.Element }>> = {
   sol: { label: 'Sol-loop', icon: <ScanEye className="size-3.5" /> },
@@ -28,9 +28,10 @@ const statusMeta: Record<string, { cls: string; text: string }> = {
  * Review ledger strip under the cockpit header: one card per reviewer of the latest round
  * (fixer when one is running), expandable to its live transcript. Reviewers run concurrently.
  */
-export function ReviewPanel({ workId }: { workId: string }): React.JSX.Element | null {
+export function ReviewPanel({ workId, state, auto }: { workId: string; state: WorkState; auto: boolean }): React.JSX.Element | null {
   const qc = useQueryClient()
   const reviews = useQuery({ queryKey: ['reviews', workId], queryFn: () => window.revva.work.reviews(workId) })
+  const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models() })
   const [open, setOpen] = useState<number | null>(null)
 
   useEffect(() => {
@@ -41,23 +42,39 @@ export function ReviewPanel({ workId }: { workId: string }): React.JSX.Element |
 
   const rows = reviews.data ?? []
   const round = rows.reduce((m, r) => (r.role === 'fixer' ? m : Math.max(m, r.round)), 0)
-  const current = rows.filter((r) => r.round === round)
+  const current = [...new Map(rows.filter((r) => r.round === round).map((r) => [r.role, r])).values()]
   const fixer = rows.filter((r) => r.role === 'fixer' && r.round === round - 1).at(-1)
   const visible = fixer && current.every((r) => r.status === 'pending') ? [fixer, ...current] : current
   if (round === 0 && !fixer) return null
 
+  const selected = visible.find((r) => r.id === open)
   return (
     <div className="shrink-0 space-y-1 border-b bg-muted/30 px-3 py-2">
       <div className="flex flex-wrap items-center gap-1.5">
         <span className="mr-1 text-[11px] font-medium text-muted-foreground">
-          Review · round {round || '—'}
+          {state === 'BUILDING' ? 'Previous review' : 'Review'} · round {round || '—'}
         </span>
         {visible.map((r) => (
-          <ReviewChip key={r.id} row={r} active={open === r.id} onClick={() => setOpen(open === r.id ? null : r.id)} />
+          <ReviewChip
+            key={r.id}
+            row={r}
+            modelName={models.data?.find((m) => m.providerID === r.model?.providerID && m.id === r.model?.id)?.name}
+            active={open === r.id}
+            onClick={() => setOpen(open === r.id ? null : r.id)}
+          />
         ))}
       </div>
-      {open !== null && visible.some((r) => r.id === open) && visible.find((r) => r.id === open)?.sessionId && (
-        <ReviewTranscript row={visible.find((r) => r.id === open)!} onClose={() => setOpen(null)} />
+      {state === 'WAITING_HUMAN' && !selected && (
+        <p className="text-[11px] text-muted-foreground">Select an agent to see its result and retry it, or re-run the whole review below.</p>
+      )}
+      {selected && (
+        <ReviewDetail
+          key={selected.id}
+          row={selected}
+          canRetry={state === 'WAITING_HUMAN'}
+          auto={auto}
+          onClose={() => setOpen(null)}
+        />
       )}
     </div>
   )
@@ -65,10 +82,12 @@ export function ReviewPanel({ workId }: { workId: string }): React.JSX.Element |
 
 function ReviewChip({
   row,
+  modelName,
   active,
   onClick
 }: {
   row: ReviewRow
+  modelName?: string
   active: boolean
   onClick: () => void
 }): React.JSX.Element {
@@ -79,6 +98,7 @@ function ReviewChip({
       <TooltipTrigger asChild>
         <button
           onClick={onClick}
+          aria-expanded={active}
           className={cn(
             'flex items-center gap-1.5 rounded-md border bg-background px-2 py-1 text-[11px] transition-colors hover:bg-accent',
             active && 'border-foreground/40 bg-accent',
@@ -98,13 +118,59 @@ function ReviewChip({
           ) : null}
           <span className={st.cls}>{st.text}</span>
           {row.agentID && <span className="text-muted-foreground">· {row.agentID}</span>}
-          {row.model && <span className="text-muted-foreground">· {row.model.id}</span>}
+          {row.model && <span className="max-w-32 truncate text-muted-foreground">· {modelName || row.model.id}</span>}
         </button>
       </TooltipTrigger>
       <TooltipContent className="max-w-xs text-[11px]">
-        {row.error ?? row.findings?.slice(0, 400) ?? `${meta.label} reviewer (read-only)`}
+        {row.model && <div>Model: {row.model.providerID}/{row.model.id}</div>}
+        <div>{row.error ?? row.findings?.slice(0, 400) ?? `${meta.label} reviewer (read-only)`}</div>
       </TooltipContent>
     </Tooltip>
+  )
+}
+
+function ReviewDetail({ row, canRetry, auto, onClose }: {
+  row: ReviewRow
+  canRetry: boolean
+  auto: boolean
+  onClose: () => void
+}): React.JSX.Element {
+  const qc = useQueryClient()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const label = roleMeta[row.role]?.label ?? row.role
+  const retryable = canRetry && row.status !== 'running' && row.status !== 'pending' && row.status !== 'skipped' && (row.role !== 'fixer' || row.status === 'error')
+  return (
+    <div className="flex flex-col gap-2 rounded-md border bg-background p-2 text-xs">
+      {row.error && <p className="text-destructive">{row.error}</p>}
+      {!row.sessionId && !row.error && <p className="text-muted-foreground">{row.findings || 'No session was started.'}</p>}
+      {retryable && (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true)
+              setError(null)
+              void window.revva.work.reviewRetry(row.workId, row.id)
+                .then(() => {
+                  void qc.invalidateQueries({ queryKey: ['reviews', row.workId] })
+                  onClose()
+                })
+                .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+                .finally(() => setBusy(false))
+            }}
+          >
+            {busy ? 'Starting…' : `Retry ${label}`}
+          </Button>
+          <span className="text-muted-foreground">{auto ? 'AUTO continues when all review gates pass.' : 'Other results are kept if the worktree is unchanged.'}</span>
+        </div>
+      )}
+      {error && <p role="alert" className="text-destructive">{error}</p>}
+      {row.sessionId && <ReviewTranscript row={row} onClose={onClose} />}
+      {!row.sessionId && <Button size="sm" variant="ghost" className="self-start" onClick={onClose}>Close</Button>}
+    </div>
   )
 }
 
@@ -173,21 +239,26 @@ function ReviewTranscript({ row, onClose }: { row: ReviewRow; onClose: () => voi
 export function ReviewRerunButton({ workId, disabled }: { workId: string; disabled?: boolean }): React.JSX.Element {
   const qc = useQueryClient()
   const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   return (
+    <>
     <Button
       size="sm"
       variant="outline"
       disabled={busy || disabled}
       onClick={() => {
         setBusy(true)
+        setError(null)
         void window.revva.work
           .reviewStart(workId)
-          .catch((err) => console.error(err))
+          .catch((err) => setError(err instanceof Error ? err.message : String(err)))
           .finally(() => setBusy(false))
           .then(() => qc.invalidateQueries({ queryKey: ['reviews', workId] }))
       }}
     >
       Re-run review
     </Button>
+    {error && <span role="alert" className="text-xs text-destructive">{error}</span>}
+    </>
   )
 }

@@ -13,6 +13,7 @@ import {
   Github,
   Trash2,
   FolderGit2,
+  TriangleAlert,
   Inbox as InboxIcon
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -21,14 +22,16 @@ import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
+import { workStateLabels } from '@/lib/work-state'
 import { SetupView } from '@/views/Setup'
 import { ChatView } from '@/views/Chat'
 import { NewChatDialog } from '@/views/NewChatDialog'
 import { WorktreesDialog } from '@/views/WorktreesDialog'
 import { DashboardView } from '@/views/DashboardView'
 import { BoardView } from '@/views/BoardView'
-import { WorkCockpit } from '@/views/WorkCockpit'
+import { WorkCockpit, WorkDetailsPopover } from '@/views/WorkCockpit'
 import { InboxView, useInbox } from '@/views/InboxView'
+import { useGithubAlerts } from '@/views/GitHubView'
 import { ScriptsView } from '@/views/ScriptsView'
 import { GitHubView } from '@/views/GitHubView'
 
@@ -64,6 +67,13 @@ export default function App(): React.JSX.Element {
   })
   const chats = useQuery({ queryKey: ['chats'], queryFn: () => window.revva.chat.list() })
   const works = useQuery({ queryKey: ['works'], queryFn: () => window.revva.work.list() })
+  // The cleanup list includes linked worktrees in known repos, not main checkouts.
+  const worktrees = useQuery({
+    queryKey: ['worktrees'],
+    queryFn: () => window.revva.worktrees.list(),
+    staleTime: 10_000,
+    refetchInterval: 60_000
+  })
   const activity = useQuery({
     queryKey: ['session-activity'],
     queryFn: () => window.revva.session.active(),
@@ -71,6 +81,12 @@ export default function App(): React.JSX.Element {
     refetchInterval: 5000
   })
   const pending = useInbox()
+  const ghAlerts = useGithubAlerts()
+  const worktreeCount = worktrees.data?.length
+  const worktreeWarning = worktreeCount !== undefined && worktreeCount > 10
+  const worktreeDescription = worktreeCount === undefined
+    ? worktrees.isLoading ? 'Checking worktrees' : 'Worktree count unavailable'
+    : `${worktreeCount} linked worktrees in known repos${worktrees.isError ? ' (last known count)' : ''}${worktreeWarning ? ' · review for cleanup' : ''}`
 
   useEffect(() => {
     return window.revva.events.on((event) => {
@@ -81,7 +97,7 @@ export default function App(): React.JSX.Element {
           void qc.invalidateQueries({ queryKey: ['session-activity'] })
         }
       }
-      if (event.kind === 'chat.idle' || event.kind === 'chat.message') void chats.refetch()
+      if (event.kind === 'chat.idle' || event.kind === 'chat.message' || event.kind === 'chat.renamed') void chats.refetch()
       if (event.kind === 'chat.idle' && event.sessionId === '*') void qc.invalidateQueries({ queryKey: ['session-activity'] })
       if (event.kind === 'session.activity') {
         if (!qc.getQueryData<string[]>(['session-activity'])) {
@@ -114,10 +130,16 @@ export default function App(): React.JSX.Element {
   }
   const selectedSessionId = view.kind === 'chat' ? view.sessionId : activeWork?.sessionId
   const selectedActivity = selectedSessionId ? sessionActivity(selectedSessionId) : undefined
-  const runningWorks = (works.data ?? []).filter(
-    (w) => w.state === 'BUILDING' || w.state === 'REVIEW' || w.state === 'FIXING' || w.state === 'REWORK' || w.state === 'WAITING_HUMAN'
+  const ongoingWorks = (works.data ?? []).filter((w) => w.state !== 'SHIPPED' && w.state !== 'ABANDONED')
+  const runningWorks = ongoingWorks.filter(
+    (w) => w.id !== activeWork?.id && (w.state === 'BUILDING' || w.state === 'REVIEW' || w.state === 'FIXING' || w.state === 'REWORK' || w.state === 'WAITING_HUMAN')
   )
-  const waitingCount = pending.length
+  // Inbox badge: pending questions/permissions + finished runs nobody has seen.
+  const inboxCount =
+    pending.length +
+    (chats.data ?? []).filter((c) => c.unread).length +
+    (works.data ?? []).filter((w) => w.unread).length
+  const waitingCount = inboxCount
 
   const deleteChat = (sessionId: string, title: string): void => {
     if (!confirm(`Delete chat "${title}"? The OpenCode session is removed too.`)) return
@@ -150,9 +172,9 @@ export default function App(): React.JSX.Element {
             onClick={() => setView({ kind: 'dashboard' })}
           />
           <NavButton
-            icon={<InboxIcon className={cn('size-4', pending.length > 0 && 'text-amber-500')} />}
+            icon={<InboxIcon className={cn('size-4', inboxCount > 0 && 'text-amber-500')} />}
             label="Inbox"
-            badge={pending.length > 0 ? pending.length : undefined}
+            badge={inboxCount > 0 ? inboxCount : undefined}
             active={view.kind === 'inbox'}
             onClick={() => setView({ kind: 'inbox' })}
           />
@@ -163,8 +185,9 @@ export default function App(): React.JSX.Element {
             onClick={() => setView({ kind: 'jira' })}
           />
           <NavButton
-            icon={<Github className="size-4" />}
+            icon={<Github className={cn('size-4', ghAlerts.length > 0 && 'text-amber-500')} />}
             label="GitHub"
+            badge={ghAlerts.length > 0 ? ghAlerts.length : undefined}
             active={view.kind === 'github'}
             onClick={() => setView({ kind: 'github' })}
           />
@@ -174,63 +197,68 @@ export default function App(): React.JSX.Element {
             active={view.kind === 'scripts'}
             onClick={() => setView({ kind: 'scripts' })}
           />
-          {runningWorks.map((w) => (
-            <NavButton
-              key={w.id}
-              icon={
-                <Hammer
-                  className={cn('size-4', w.state === 'BUILDING' && 'animate-pulse text-sky-500')}
-                />
-              }
-              label={w.ticketKey}
-              sublabel={w.state}
-              activity={w.sessionId ? sessionActivity(w.sessionId) : undefined}
-              active={view.kind === 'work' && view.workId === w.id}
-              onClick={() => setView({ kind: 'work', workId: w.id })}
-              actions={
-                <NavAction
-                  title="Abandon work"
-                  onClick={() => abandonWork(w.id, w.ticketKey)}
-                />
-              }
-            />
-          ))}
         </div>
 
         <Separator className="my-2" />
 
-        <div className="px-3 pb-2">
-          <Button
-            size="sm"
-            className="w-full justify-start gap-2"
-            onClick={() => setNewChatOpen(true)}
-            disabled={st?.state !== 'connected'}
-          >
-            <Plus className="size-4" /> New chat
-          </Button>
-        </div>
-        <div className="px-3 pb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-          Chats
-        </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
-          {chats.isLoading && <Skeleton className="mx-1 h-8" />}
-          {chats.data?.map((c) => (
-            <NavButton
-              key={c.sessionId}
-              icon={<MessageSquare className="size-4 shrink-0" />}
-              label={c.title}
-              activity={sessionActivity(c.sessionId)}
-              unread={!!c.unread}
-              active={view.kind === 'chat' && view.sessionId === c.sessionId}
-              onClick={() => {
-                setView({ kind: 'chat', sessionId: c.sessionId })
-                if (c.unread) {
-                  void window.revva.chat.markSeen(c.sessionId).then(() => chats.refetch())
-                }
-              }}
-              actions={<NavAction title="Delete chat" onClick={() => deleteChat(c.sessionId, c.title)} />}
-            />
-          ))}
+        <div className="min-h-0 flex-1 overflow-y-auto pb-2">
+          <h2 className="px-3 pb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+            Tickets
+          </h2>
+          <div className="px-2">
+            {works.isLoading && <Skeleton className="mx-1 h-8" />}
+            {works.isError && <p className="px-2 py-1.5 text-xs text-muted-foreground">Couldn’t load tickets</p>}
+            {!works.isLoading && !works.isError && ongoingWorks.length === 0 && (
+              <p className="px-2 py-1.5 text-xs text-muted-foreground">No ongoing tickets</p>
+            )}
+            {ongoingWorks.map((w) => (
+              <NavButton
+                key={w.id}
+                icon={<Hammer className={cn('size-4', w.state === 'BUILDING' && 'animate-pulse text-sky-500')} />}
+                label={w.ticketKey}
+                sublabel={workStateLabels[w.state]}
+                activity={w.sessionId && w.state !== 'WAITING_HUMAN' ? sessionActivity(w.sessionId) : undefined}
+                unread={!!w.unread}
+                active={view.kind === 'work' && view.workId === w.id}
+                onClick={() => setView({ kind: 'work', workId: w.id })}
+                actions={<NavAction title="Abandon work" onClick={() => abandonWork(w.id, w.ticketKey)} />}
+              />
+            ))}
+          </div>
+          <Separator className="my-2" />
+          <h2 className="px-3 pb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+            Chats
+          </h2>
+          <div className="px-3 pb-2">
+            <Button
+              size="sm"
+              className="w-full justify-start gap-2"
+              onClick={() => setNewChatOpen(true)}
+              disabled={st?.state !== 'connected'}
+            >
+              <Plus className="size-4" /> New chat
+            </Button>
+          </div>
+          <div className="px-2">
+            {chats.isLoading && <Skeleton className="mx-1 h-8" />}
+            {chats.data?.map((c) => (
+              <NavButton
+                key={c.sessionId}
+                icon={<MessageSquare className="size-4 shrink-0" />}
+                label={c.title}
+                activity={sessionActivity(c.sessionId)}
+                unread={!!c.unread}
+                active={view.kind === 'chat' && view.sessionId === c.sessionId}
+                onClick={() => {
+                  setView({ kind: 'chat', sessionId: c.sessionId })
+                  if (c.unread) {
+                    void window.revva.chat.markSeen(c.sessionId).then(() => chats.refetch())
+                  }
+                }}
+                actions={<NavAction title="Delete chat" onClick={() => deleteChat(c.sessionId, c.title)} />}
+              />
+            ))}
+          </div>
         </div>
 
         <Separator />
@@ -270,11 +298,19 @@ export default function App(): React.JSX.Element {
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon" className="size-7" onClick={() => setWorktreesOpen(true)}>
+              <Button
+                variant="ghost"
+                size="sm"
+                className={cn('h-7 gap-1 px-1.5', worktreeWarning && 'text-amber-700 dark:text-amber-400')}
+                aria-label={`Open worktree cleanup; ${worktreeDescription}`}
+                onClick={() => setWorktreesOpen(true)}
+              >
                 <FolderGit2 className="size-3.5" />
+                {worktreeCount !== undefined && <span className="text-[11px] tabular-nums">{worktreeCount}</span>}
+                {worktreeWarning && <TriangleAlert className="size-3.5" aria-hidden="true" />}
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Clean up worktrees</TooltipContent>
+            <TooltipContent>{worktreeDescription}</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -316,6 +352,7 @@ export default function App(): React.JSX.Element {
             <Badge variant="outline" className="no-drag font-normal">+{runningWorks.length - 3} more</Badge>
           )}
           <div className="ml-auto flex items-center gap-2">
+            {activeWork && <WorkDetailsPopover key={activeWork.id} work={activeWork} />}
             <button
               onClick={() => setView({ kind: 'inbox' })}
               className={cn(
@@ -355,7 +392,10 @@ export default function App(): React.JSX.Element {
             onOpenChat={(sessionId) => setView({ kind: 'chat', sessionId })}
           />
         ) : view.kind === 'inbox' ? (
-          <InboxView />
+          <InboxView
+            onOpenChat={(sessionId) => setView({ kind: 'chat', sessionId })}
+            onOpenWork={(workId) => setView({ kind: 'work', workId })}
+          />
         ) : view.kind === 'scripts' ? (
           <ScriptsView />
         ) : view.kind === 'github' ? (

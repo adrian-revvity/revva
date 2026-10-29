@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowUp, ChevronRight, ImageIcon, Square, X } from 'lucide-react'
-import ReactMarkdown, { type Components } from 'react-markdown'
+import { ArrowUp, Check, ChevronRight, Copy, ImageIcon, Square, X } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -9,8 +9,11 @@ import { Textarea } from '@/components/ui/textarea'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
+import { MD_COMPONENTS } from '@/components/message-markdown'
 import type { ChatMessage, ChatToolCall, FileHit, PromptImage, PromptRefs, QueuedMessage, SkillInfo } from '@shared/types'
+import { FormCard, PermissionCard, useInbox } from './InboxView'
 
 const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp'
 const MAX_IMAGES = 8
@@ -104,13 +107,45 @@ export interface TranscriptDrive {
   ): () => void
 }
 
+export function SessionIdButton({ sessionId }: { sessionId: string }): React.JSX.Element {
+  const [status, setStatus] = useState<'idle' | 'copied' | 'error'>('idle')
+  useEffect(() => {
+    if (status === 'idle') return
+    const timer = window.setTimeout(() => setStatus('idle'), 3000)
+    return () => window.clearTimeout(timer)
+  }, [status])
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          className="min-w-0 max-w-40 text-muted-foreground"
+          aria-label={`Copy session ID ${sessionId}`}
+          onClick={() => {
+            void window.revva.session.copyId(sessionId).then(() => setStatus('copied'), () => setStatus('error'))
+          }}
+        >
+          {status === 'copied' ? <Check /> : <Copy />}
+          <span className="truncate font-mono">{status === 'copied' ? 'Copied' : status === 'error' ? 'Copy failed' : sessionId}</span>
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{status === 'error' ? 'Could not copy session ID. Try again.' : `Copy session ID: ${sessionId}`}</TooltipContent>
+      <span role="status" className="sr-only">{status === 'copied' ? 'Session ID copied' : status === 'error' ? 'Could not copy session ID' : ''}</span>
+    </Tooltip>
+  )
+}
+
 export function TranscriptView({
   sessionId,
   drive,
   header,
   emptyHint,
   readOnly,
-  onNewSession
+  onNewSession,
+  hideSessionDetails
 }: {
   sessionId: string
   drive: TranscriptDrive
@@ -120,8 +155,11 @@ export function TranscriptView({
   readOnly?: boolean
   /** When set, sending exactly `/new` calls this instead (chats: fresh session, same settings). */
   onNewSession?: () => void
+  /** Session details are shown elsewhere for ticket transcripts. */
+  hideSessionDetails?: boolean
 }): React.JSX.Element {
   const qc = useQueryClient()
+  const pending = useInbox().filter((item) => item.sessionID === sessionId)
   const messages = useQuery({
     queryKey: [...drive.queryKey, sessionId],
     queryFn: () => drive.load(sessionId),
@@ -132,9 +170,13 @@ export function TranscriptView({
     queryFn: () => window.revva.session.model(sessionId),
     refetchInterval: 10_000
   })
+  const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models() })
   const modelLabel = model.data
     ? `${model.data.providerID}/${model.data.id}${model.data.variant ? ` · ${model.data.variant}` : ''}`
     : model.isError ? 'Unavailable' : model.isPending ? 'Loading…' : 'Service default'
+  const shortModelLabel = model.data
+    ? models.data?.find((item) => item.providerID === model.data?.providerID && item.id === model.data?.id)?.name || model.data.id
+    : modelLabel
   const queue = useQuery({
     queryKey: ['session-queue', sessionId],
     queryFn: () => window.revva.session.queue(sessionId),
@@ -168,12 +210,25 @@ export function TranscriptView({
     refetchInterval: running ? 30_000 : false
   })
   const usage = contextUsage.data
-  const usageText = usage
-    ? `${usage.tokens.toLocaleString()}${usage.limit ? ` / ${usage.limit.toLocaleString()} tokens · ${Math.round(usage.tokens / usage.limit * 100)}% used` : ' tokens · limit unavailable'}`
-    : contextUsage.isPending ? 'Loading…' : 'Not yet available'
-  const usageDescription = usage
-    ? `Last reported response for ${usage.providerID}/${usage.modelID}. Includes input, output, reasoning and cached tokens; the next request may differ.`
-    : 'Usage is available after the model reports token counts.'
+  const usageLabel = usage?.limit
+    ? `${Math.round(usage.tokens / usage.limit * 100)}%`
+    : '—'
+  const contextIndicator = (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={`Context usage: ${usageLabel}`}
+          className="shrink-0 rounded px-1 py-2 text-xs tabular-nums text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
+        >
+          {usageLabel}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="max-w-xs">
+        {usage ? `${usage.tokens.toLocaleString()} tokens` : contextUsage.isPending ? 'Loading…' : 'Token count unavailable'}
+      </TooltipContent>
+    </Tooltip>
+  )
 
   const skills = useQuery({
     queryKey: ['skills'],
@@ -318,10 +373,10 @@ export function TranscriptView({
       }
       if (!text && images.length === 0) return
       const refs = extractRefs(text, skills.data ?? [])
-      qc.setQueryData(draftKey, '')
-      setPendingImages([])
-      setToken(null)
       await drive.send(sessionId, text, images.length ? images : undefined, running, refs)
+      if (qc.getQueryData(draftKey) === input) qc.setQueryData(draftKey, '')
+      setPendingImages((current) => current.filter((image) => !images.includes(image)))
+      setToken(null)
       if (running) {
         // Queued behind the running turn — it shows up in the queue strip, not the transcript.
         void qc.invalidateQueries({ queryKey: ['session-queue', sessionId] })
@@ -358,42 +413,71 @@ export function TranscriptView({
   })
 
   const rows = useMemo(() => messages.data ?? [], [messages.data])
+  /** Consecutive assistant messages are steps of one agent turn — one card each. */
+  const groups = useMemo(() => groupRows(rows), [rows])
   const queued = queue.data ?? []
   const canSend = (input.trim().length > 0 || pendingImages.length > 0) && !send.isPending
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex h-10 shrink-0 items-center gap-2 overflow-hidden border-b px-4">
-        {header}
-        <Badge variant="outline" className="ml-auto min-w-0 max-w-60 shrink text-[10px] font-normal" title={`Model: ${modelLabel}`}>
-          <span className="truncate">Model: {modelLabel}</span>
-        </Badge>
+        <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">{header}</div>
+        {!hideSessionDetails && (
+          <>
+            <SessionIdButton key={sessionId} sessionId={sessionId} />
+            <Badge variant="outline" className="min-w-0 max-w-60 shrink text-[10px] font-normal" title={`Model: ${modelLabel}`}>
+              <span className="truncate">Model: {shortModelLabel}</span>
+            </Badge>
+          </>
+        )}
       </div>
-      <div className="shrink-0 border-b px-4 py-1 text-xs text-muted-foreground" title={usageDescription}>
-        <span>Context (last response): {contextUsage.isError ? 'Unavailable' : usageText}</span>
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <ScrollArea className="min-h-0 flex-1">
+          <div className="mx-auto flex max-w-3xl flex-col gap-4 px-6 py-5">
+            {messages.isLoading && <Skeleton className="h-16 w-full" />}
+            {!messages.isLoading && rows.length === 0 && !running && (
+              <p className="mt-10 text-center text-sm text-muted-foreground">{emptyHint}</p>
+            )}
+            {groups.map((g, i) =>
+              g.kind === 'user' ? (
+                <MessageRow key={g.msg.id} message={g.msg} />
+              ) : (
+                <AssistantTurn
+                  key={g.msgs[0]?.id ?? i}
+                  messages={g.msgs}
+                  streaming={running && i === groups.length - 1}
+                  streamingText={running && i === groups.length - 1 ? streamingText : null}
+                />
+              )
+            )}
+            {running && groups[groups.length - 1]?.kind !== 'assistant' && (
+              <MessageRow
+                message={{ id: 'streaming', role: 'assistant', text: streamingText ?? '', createdAt: Date.now() }}
+                streaming
+              />
+            )}
+            <div ref={bottomRef} />
+          </div>
+        </ScrollArea>
       </div>
 
-      <ScrollArea className="min-h-0 flex-1">
-        <div className="mx-auto flex max-w-3xl flex-col gap-4 px-6 py-5">
-          {messages.isLoading && <Skeleton className="h-16 w-full" />}
-          {!messages.isLoading && rows.length === 0 && !running && (
-            <p className="mt-10 text-center text-sm text-muted-foreground">{emptyHint}</p>
-          )}
-          {rows.map((m) => (
-            <MessageRow key={m.id} message={m} />
-          ))}
-          {running && (
-            <MessageRow
-              message={{ id: 'streaming', role: 'assistant', text: streamingText ?? '', createdAt: Date.now() }}
-              streaming
-            />
-          )}
-          <div ref={bottomRef} />
-        </div>
-      </ScrollArea>
+      {!readOnly && pending.length > 0 && (
+        <section aria-label="Waiting on you" className="max-h-[40vh] shrink-0 overflow-y-auto border-t bg-muted/30 px-3 py-3 sm:px-6">
+          <div className="mx-auto flex max-w-3xl flex-col gap-2">
+            <p className="text-xs font-medium text-muted-foreground">Waiting on you ({pending.length})</p>
+            {pending.map((item) =>
+              item.kind === 'form' ? (
+                <FormCard key={`${item.kind}:${item.id}`} item={item} />
+              ) : (
+                <PermissionCard key={`${item.kind}:${item.id}`} item={item} />
+              )
+            )}
+          </div>
+        </section>
+      )}
 
       {!readOnly && (
-        <div className="shrink-0 border-t px-6 py-3">
+        <div className="shrink-0 border-t px-3 py-3 sm:px-6">
           {queued.length > 0 && (
             <div className="mx-auto mb-2 flex max-w-3xl flex-col gap-1">
               {queued.map((q, i) => (
@@ -401,8 +485,11 @@ export function TranscriptView({
               ))}
             </div>
           )}
+          {send.error instanceof Error && (
+            <p role="alert" className="mx-auto mb-2 max-w-3xl text-xs text-destructive">{send.error.message}</p>
+          )}
           <form
-            className="mx-auto flex max-w-3xl items-end gap-2"
+            className="relative mx-auto max-w-3xl"
             onSubmit={(e) => {
               e.preventDefault()
               send.mutate()
@@ -420,43 +507,43 @@ export function TranscriptView({
               void addImages(Array.from(e.dataTransfer.files))
             }}
           >
-            <div className="relative flex min-w-0 flex-1 flex-col gap-2">
-              {token && menuItems > 0 && (
-                <div className="absolute bottom-full left-0 z-10 mb-2 flex w-80 flex-col overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-md">
-                  <div className="border-b px-2.5 py-1 text-[10px] text-muted-foreground">
-                    {token.kind === 'skill' ? 'Commands — Enter/Tab to insert' : 'Files — Enter/Tab to insert'}
-                  </div>
-                  {menuList.map((item, i) => (
-                    <button
-                      key={item.key}
-                      type="button"
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => pickMenu(item)}
-                      className={cn(
-                        'flex items-baseline gap-2 px-2.5 py-1.5 text-left text-xs',
-                        i === tokenIndex && 'bg-muted'
-                      )}
-                    >
-                      <span className="shrink-0 font-mono font-medium">{item.insert}</span>
-                      {item.hint && <span className="truncate text-muted-foreground">{item.hint}</span>}
-                    </button>
-                  ))}
+            {token && menuItems > 0 && (
+              <div className="absolute bottom-full left-0 z-10 mb-2 flex w-80 max-w-full flex-col overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-md">
+                <div className="border-b px-2.5 py-1 text-[10px] text-muted-foreground">
+                  {token.kind === 'skill' ? 'Commands — Enter/Tab to insert' : 'Files — Enter/Tab to insert'}
                 </div>
-              )}
+                {menuList.map((item, i) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => pickMenu(item)}
+                    className={cn(
+                      'flex items-baseline gap-2 px-2.5 py-1.5 text-left text-xs',
+                      i === tokenIndex && 'bg-muted'
+                    )}
+                  >
+                    <span className="shrink-0 font-mono font-medium">{item.insert}</span>
+                    {item.hint && <span className="truncate text-muted-foreground">{item.hint}</span>}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="flex flex-col rounded-xl border border-input bg-background focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/30">
               {pendingImages.length > 0 && (
-                <div className="flex flex-wrap gap-2">
+                <div className="flex max-h-32 flex-wrap gap-2 overflow-y-auto px-3 pt-3">
                   {pendingImages.map((img, i) => (
-                    <div key={i} className="group relative">
+                    <div key={i} className="relative shrink-0">
                       <img
                         src={`data:${img.mime};base64,${img.data}`}
                         alt={img.name ?? 'attachment'}
-                        className="size-14 rounded-md border object-cover"
+                        className="size-16 rounded-md border bg-muted object-contain"
                       />
                       <button
                         type="button"
-                        aria-label="Remove image"
+                        aria-label={`Remove ${img.name || `image ${i + 1}`}`}
                         onClick={() => setPendingImages((old) => old.filter((_, j) => j !== i))}
-                        className="absolute -right-1.5 -top-1.5 hidden rounded-full border bg-background p-0.5 shadow group-hover:block"
+                        className="absolute right-0.5 top-0.5 rounded-sm bg-background p-1 text-foreground hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring"
                       >
                         <X className="size-3" />
                       </button>
@@ -500,44 +587,54 @@ export function TranscriptView({
                 placeholder={
                   running
                     ? 'Running — send to queue your message…'
-                    : 'Message… (Enter to send, Shift+Enter for newline, paste or drop images)'
+                    : 'Message…'
                 }
+                aria-label="Message"
+                aria-describedby="composer-hint"
                 rows={2}
-                className="min-h-[44px] resize-y"
+                className="max-h-48 min-h-16 resize-none rounded-none border-0 bg-transparent px-4 pb-2 pt-3 shadow-none focus-visible:ring-0 dark:bg-transparent"
               />
+              <div className="flex min-w-0 items-center gap-1 px-2 pb-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept={IMAGE_ACCEPT}
+                  multiple
+                  className="hidden"
+                  onChange={(e) => {
+                    void addImages(Array.from(e.target.files ?? []))
+                    e.target.value = ''
+                  }}
+                />
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label="Attach images"
+                  title="Attach, paste or drop images"
+                  disabled={pendingImages.length >= MAX_IMAGES}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <ImageIcon />
+                </Button>
+                <span id="composer-hint" className="min-w-0 flex-1 truncate px-1 text-xs text-muted-foreground">
+                  Enter to send · Shift+Enter for a new line
+                </span>
+                {contextIndicator}
+                {running && (
+                  <Button type="button" size="icon-sm" variant="outline" aria-label="Stop response" title="Stop response" onClick={() => interrupt.mutate()}>
+                    <Square />
+                  </Button>
+                )}
+                <Button type="submit" size="icon-sm" aria-label={running ? 'Queue message' : 'Send message'} title={running ? 'Queue message' : 'Send message'} disabled={!canSend}>
+                  <ArrowUp />
+                </Button>
+              </div>
             </div>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept={IMAGE_ACCEPT}
-              multiple
-              className="hidden"
-              onChange={(e) => {
-                void addImages(Array.from(e.target.files ?? []))
-                e.target.value = ''
-              }}
-            />
-            <Button
-              type="button"
-              size="icon"
-              variant="ghost"
-              aria-label="Attach images"
-              disabled={pendingImages.length >= MAX_IMAGES}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <ImageIcon className="size-4" />
-            </Button>
-            {running && (
-              <Button type="button" size="icon" variant="outline" onClick={() => interrupt.mutate()}>
-                <Square className="size-4" />
-              </Button>
-            )}
-            <Button type="submit" size="icon" disabled={!canSend}>
-              <ArrowUp className="size-4" />
-            </Button>
           </form>
         </div>
       )}
+      {readOnly && <div className="shrink-0 border-t px-6 py-1 text-right">{contextIndicator}</div>}
     </div>
   )
 }
@@ -555,54 +652,84 @@ function QueuedRow({ item, position, onCancel }: { item: QueuedMessage; position
   )
 }
 
-/**
- * Markdown rendering for assistant messages. react-markdown passes an extra
- * `node` prop, so every renderer destructures it out before spreading onto DOM.
- */
-const MD_COMPONENTS: Components = {
-  a: ({ node: _node, ...props }) => (
-    <a
-      {...props}
-      className="cursor-pointer text-blue-600 underline underline-offset-2 dark:text-blue-400"
-      onClick={(e) => {
-        e.preventDefault()
-        if (props.href) void window.revva.shell.openExternal(props.href)
-      }}
-    />
-  ),
-  pre: ({ node: _node, ...props }) => (
-    <pre
-      {...props}
-      className="overflow-x-auto rounded-md border border-black/10 bg-black/[0.04] px-3 py-2 text-xs leading-relaxed dark:border-white/10 dark:bg-white/[0.06] [&_code]:bg-transparent [&_code]:p-0"
-    />
-  ),
-  code: ({ node: _node, ...props }) => (
-    <code {...props} className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/10" />
-  ),
-  table: ({ node: _node, ...props }) => <table className="my-2 w-full border-collapse text-xs" {...props} />,
-  th: ({ node: _node, ...props }) => (
-    <th className="border border-black/15 px-2 py-1 text-left font-medium dark:border-white/15" {...props} />
-  ),
-  td: ({ node: _node, ...props }) => (
-    <td className="border border-black/15 px-2 py-1 align-top dark:border-white/15" {...props} />
-  ),
-  // Tight spacing: bubbles are compact, so markdown's default margins are too wide.
-  p: ({ node: _node, ...props }) => <p className="my-1.5 first:mt-0 last:mb-0" {...props} />,
-  ul: ({ node: _node, ...props }) => <ul className="my-1.5 list-disc space-y-0.5 pl-4" {...props} />,
-  ol: ({ node: _node, ...props }) => <ol className="my-1.5 list-decimal space-y-0.5 pl-4" {...props} />,
-  li: ({ node: _node, ...props }) => <li className="pl-0.5" {...props} />,
-  h1: ({ node: _node, ...props }) => <h3 className="mt-2.5 mb-1 text-sm font-semibold first:mt-0" {...props} />,
-  h2: ({ node: _node, ...props }) => <h3 className="mt-2.5 mb-1 text-sm font-semibold first:mt-0" {...props} />,
-  h3: ({ node: _node, ...props }) => <h4 className="mt-2 mb-1 text-[13px] font-semibold first:mt-0" {...props} />,
-  h4: ({ node: _node, ...props }) => <h4 className="mt-2 mb-1 text-[13px] font-semibold first:mt-0" {...props} />,
-  blockquote: ({ node: _node, ...props }) => (
-    <blockquote className="my-1.5 border-l-2 border-black/20 pl-3 italic opacity-80 dark:border-white/25" {...props} />
-  ),
-  hr: () => <hr className="my-3 border-black/10 dark:border-white/15" />,
-  strong: ({ node: _node, ...props }) => <strong className="font-semibold" {...props} />,
-  // GFM task lists render a disabled checkbox.
-  input: ({ node: _node, ...props }) => (
-    <input type="checkbox" disabled className="mr-1.5 size-3 translate-y-0.5 accent-primary" {...props} />
+/* ---------- turn grouping ---------- */
+
+type TranscriptGroup = { kind: 'user'; msg: ChatMessage } | { kind: 'assistant'; msgs: ChatMessage[] }
+
+/** Collapse consecutive assistant messages (one per agent-loop step) into a single
+ *  turn group, so a chain of tool calls reads as one thought process, not N bubbles. */
+function groupRows(rows: ChatMessage[]): TranscriptGroup[] {
+  const out: TranscriptGroup[] = []
+  for (const m of rows) {
+    if (m.role === 'user') out.push({ kind: 'user', msg: m })
+    else {
+      const last = out[out.length - 1]
+      if (last?.kind === 'assistant') last.msgs.push(m)
+      else out.push({ kind: 'assistant', msgs: [m] })
+    }
+  }
+  return out
+}
+
+/** One agent turn as a single card: thoughts and tool steps collapsed inside,
+ *  the answer(s) visible. Auto-collapses the step list once the turn is done. */
+function AssistantTurn({
+  messages,
+  streaming,
+  streamingText
+}: {
+  messages: ChatMessage[]
+  streaming: boolean
+  streamingText: string | null
+}): React.JSX.Element {
+  const tools = messages.flatMap((m) => m.tools ?? [])
+  const thinking = messages.map((m) => m.thinking).filter(Boolean).join('\n\n')
+  const texts = messages.map((m) => m.text).filter((t) => t.trim() !== '')
+  const shown = streaming && streamingText !== null ? [...texts, streamingText] : texts
+  const busy = streaming || tools.some((t) => t.state === 'running' || t.state === 'streaming')
+
+  const [stepsOpen, setStepsOpen] = useState(true)
+  useEffect(() => {
+    setStepsOpen(busy)
+  }, [busy])
+
+  const nothingYet = shown.length === 0 && tools.length === 0 && !thinking
+  return (
+    <div className="flex justify-start">
+      <div className="flex max-w-[85%] flex-col gap-1.5 rounded-lg bg-muted px-3.5 py-2.5 text-[13px] leading-relaxed">
+        {thinking && <ThinkingBlock text={thinking} />}
+        {tools.length > 0 && (
+          <Collapsible open={stepsOpen} onOpenChange={setStepsOpen} className="group/collapsible">
+            <CollapsibleTrigger className="flex w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-xs text-muted-foreground hover:text-foreground">
+              <ChevronRight className="size-3 shrink-0 transition-transform group-data-[open]/collapsible:rotate-90" />
+              <span>
+                Worked through {tools.length} step{tools.length === 1 ? '' : 's'}
+              </span>
+              {busy && <span className="animate-pulse italic">running…</span>}
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <div className="mt-1 flex flex-col">
+                {tools.map((t) => (
+                  <ToolCallRow key={t.id} tool={t} />
+                ))}
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+        )}
+        {nothingYet ? (
+          <span className="italic text-muted-foreground">{busy ? 'Thinking…' : '…'}</span>
+        ) : (
+          shown.map((text, i) => (
+            <div key={i} className="min-w-0">
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+                {text}
+              </ReactMarkdown>
+              {streaming && i === shown.length - 1 && <span className="animate-pulse">▍</span>}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -753,7 +880,6 @@ export function ChatView({ sessionId, onOpenChat }: { sessionId: string; onOpenC
     void window.revva.chat
       .create({
         directory: chat.directory,
-        title: chat.title,
         agentID: chat.agentID,
         model: chat.providerID && chat.modelID ? { providerID: chat.providerID, id: chat.modelID } : undefined,
         ticketKey: chat.ticketKey,

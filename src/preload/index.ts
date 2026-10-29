@@ -41,6 +41,7 @@ const api: RevvaApi = {
   },
   session: {
     model: (sessionId) => ipcRenderer.invoke(IPC.sessionModel, sessionId),
+    copyId: (sessionId) => ipcRenderer.invoke(IPC.sessionCopyId, sessionId),
     contextUsage: (sessionId) => ipcRenderer.invoke(IPC.sessionContextUsage, sessionId),
     active: () => ipcRenderer.invoke(IPC.sessionActive),
     queue: (sessionId) => ipcRenderer.invoke(IPC.sessionQueue, sessionId),
@@ -65,6 +66,7 @@ const api: RevvaApi = {
     interrupt: (sessionId) => ipcRenderer.invoke(IPC.workInterrupt, sessionId),
     reviews: (workId) => ipcRenderer.invoke(IPC.workReviews, workId),
     reviewStart: (workId) => ipcRenderer.invoke(IPC.workReviewStart, workId),
+    reviewRetry: (workId, reviewId) => ipcRenderer.invoke(IPC.workReviewRetry, workId, reviewId),
     shipCheck: (workId) => ipcRenderer.invoke(IPC.workShipCheck, workId),
     ship: (workId) => ipcRenderer.invoke(IPC.workShip, workId)
   },
@@ -79,7 +81,11 @@ const api: RevvaApi = {
   github: {
     list: (scope) => ipcRenderer.invoke(IPC.githubList, scope),
     review: (prUrl) => ipcRenderer.invoke(IPC.githubReview, prUrl),
-    markSeen: (prUrl) => ipcRenderer.invoke(IPC.githubSeen, prUrl)
+    markSeen: (prUrl) => ipcRenderer.invoke(IPC.githubSeen, prUrl),
+    alerts: () => ipcRenderer.invoke(IPC.githubAlerts),
+    markAlertsSeen: (urls) => ipcRenderer.invoke(IPC.githubAlertsSeen, urls),
+    merge: (prUrl, method) => ipcRenderer.invoke(IPC.githubMerge, prUrl, method),
+    rebase: (prUrl) => ipcRenderer.invoke(IPC.githubRebase, prUrl)
   },
   task: {
     ticketSession: (input) => ipcRenderer.invoke(IPC.taskTicketSession, input)
@@ -95,6 +101,10 @@ const api: RevvaApi = {
     list: () => ipcRenderer.invoke(IPC.inboxList),
     replyForm: (sessionId, formId, answer) => ipcRenderer.invoke(IPC.inboxReplyForm, sessionId, formId, answer),
     replyPermission: (sessionId, requestId, decision) => ipcRenderer.invoke(IPC.inboxReplyPermission, sessionId, requestId, decision)
+  },
+  triage: {
+    list: () => ipcRenderer.invoke(IPC.triageList),
+    markRead: (source, id) => ipcRenderer.invoke(IPC.triageMarkRead, source, id)
   },
   scripts: {
     list: () => ipcRenderer.invoke(IPC.scriptList),

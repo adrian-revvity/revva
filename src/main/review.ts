@@ -110,9 +110,18 @@ interface TrackedSession {
   timer: NodeJS.Timeout
 }
 
+/** Attempts are append-only; only the newest result for each role gates the round. */
+function latestAttempts(rows: ReviewRow[]): ReviewRow[] {
+  const latest = new Map<ReviewRow['role'], ReviewRow>()
+  for (const row of rows) latest.set(row.role, row)
+  return [...latest.values()]
+}
+
 class ReviewManager {
   private wired = false
   private sessions = new Map<string, TrackedSession>()
+  private settling = new Set<string>()
+  private starting = new Set<string>()
   /** Fan-in guard: a round is decided exactly once. */
   private settledRounds = new Set<string>()
 
@@ -125,6 +134,10 @@ class ReviewManager {
     const stale = getDb().prepare("SELECT * FROM review WHERE status IN ('pending','running')").all() as ReviewDbRow[]
     for (const r of stale) {
       this.update(r.id, 'error', undefined, 'revva restarted while this review was running')
+    }
+    const interrupted = getDb().prepare("SELECT id FROM work WHERE state IN ('REVIEW', 'FIXING')").all() as Array<{ id: string }>
+    for (const work of interrupted) {
+      workManager.setReviewState(work.id, 'WAITING_HUMAN', 'Revva restarted during review. Re-run review to continue.')
     }
   }
 
@@ -144,85 +157,186 @@ class ReviewManager {
   }
 
   /** Kick off reviewer fan-out for a round. Called after a build settles or on demand. */
-  async startRound(workId: string, round: number): Promise<void> {
+  async startRound(workId: string, round: number, newCycle = false): Promise<void> {
     ensureSchema()
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(workId) as
       | { id: string; ticket_key: string; branch: string; worktree_dir: string; mode: string; review_sel: string | null }
       | undefined
     if (!work) throw new Error('Work not found.')
     if (this.isBusyReviewing(workId)) throw new Error('A review round is already in flight for this work.')
-    if (this.reviewsFor(workId).some((r) => r.round === round && r.role !== 'fixer')) return
+    if (shipManager.isShipping(workId)) throw new Error('Shipping is in progress.')
+    const state = (getDb().prepare('SELECT state FROM work WHERE id = ?').get(workId) as { state: string }).state
+    if (state === 'BUILDING' || state === 'ABANDONED' || state === 'SHIPPED') throw new Error(`Cannot review from state ${state}.`)
+    if (this.reviewsFor(workId).some((r) => r.round === round && r.role !== 'fixer')) throw new Error('This review round already exists.')
+    this.starting.add(workId)
+    if (newCycle) getDb().prepare('UPDATE work SET review_cycle_start = ? WHERE id = ?').run(round, workId)
+    workManager.setReviewState(workId, 'REVIEW')
 
-    const perRun = (work.review_sel ? JSON.parse(work.review_sel) : undefined) as Record<
-      string,
-      { agentID?: string; model?: ModelRef } | undefined
-    > | undefined
-    const skills = new Set((await listSkills().catch(() => [])).map((s) => s.id))
-    const uiChanged = await this.uiFilesChanged(work.worktree_dir).catch(() => false)
+    try {
+      const status = await exec('git', ['-C', work.worktree_dir, 'status', '--porcelain'])
+      if (status.stdout.trim()) throw new Error('Commit all worktree changes before starting review.')
+      const head = (await exec('git', ['-C', work.worktree_dir, 'rev-parse', 'HEAD'])).stdout.trim()
+      if (!head) throw new Error('Could not determine the commit to review.')
+      getDb().prepare('UPDATE work SET review_head = ? WHERE id = ?').run(head, workId)
 
-    const plan: Array<{ role: ReviewRole; skipReason?: string }> = [
-      { role: 'sol' },
-      { role: 'testAudit' },
-      uiChanged
-        ? skills.has('impeccable')
-          ? { role: 'impeccable' }
-          : { role: 'impeccable', skipReason: 'UI changes detected but the impeccable skill is not installed' }
-        : { role: 'impeccable', skipReason: 'no UI files changed on this branch' }
-    ]
+      const perRun = (work.review_sel ? JSON.parse(work.review_sel) : undefined) as Record<
+        string,
+        { agentID?: string; model?: ModelRef } | undefined
+      > | undefined
+      const skills = new Set((await listSkills().catch(() => [])).map((s) => s.id))
+      const uiChanged = await this.uiFilesChanged(work.worktree_dir)
 
-    const now = Date.now()
-    // Columns: work_id, round, role, session_id, status, findings, error, agent_id, provider_id, model_id, created_at, updated_at
-    const insert = getDb().prepare(
-      `INSERT INTO review(work_id, round, role, session_id, status, findings, error, agent_id, provider_id, model_id, created_at, updated_at)
-       VALUES(?,?,?,NULL,?,?,NULL,?,?,?,?,?)`
-    )
+      const plan: Array<{ role: ReviewRole; skipReason?: string; error?: string }> = [
+        { role: 'sol' },
+        { role: 'testAudit' },
+        uiChanged
+          ? skills.has('impeccable')
+            ? { role: 'impeccable' }
+            : { role: 'impeccable', error: 'UI changes detected but the impeccable skill is not installed' }
+          : { role: 'impeccable', skipReason: 'no UI files changed on this branch' }
+      ]
 
-    const live: Array<{ reviewId: number; role: ReviewRole; sel: { agentID?: string; model?: ModelRef } }> = []
-    for (const p of plan) {
-      const sel = resolveSel(workId, p.role, perRun)
-      if (p.skipReason) {
-        insert.run(workId, round, p.role, 'skipped', p.skipReason, sel.agentID ?? null, sel.model?.providerID ?? null, sel.model?.id ?? null, now, now)
-        continue
-      }
-      const res = insert.run(workId, round, p.role, 'pending', '', sel.agentID ?? null, sel.model?.providerID ?? null, sel.model?.id ?? null, now, now)
-      live.push({ reviewId: Number(res.lastInsertRowid), role: p.role, sel })
-    }
-    this.push(workId, round)
+      const now = Date.now()
+      // Columns: work_id, round, role, session_id, status, findings, error, agent_id, provider_id, model_id, created_at, updated_at
+      const insert = getDb().prepare(
+        `INSERT INTO review(work_id, round, role, session_id, status, findings, error, agent_id, provider_id, model_id, created_at, updated_at)
+         VALUES(?,?,?,NULL,?,?,NULL,?,?,?,?,?)`
+      )
 
-    // Fan out concurrently — one OpenCode session per reviewer.
-    await Promise.allSettled(
-      live.map(async ({ reviewId, role, sel }) => {
-        try {
-          const api = openCodeService.api
-          const session = await api.session.create({
-            title: `${work.ticket_key} · ${role} (round ${round})`,
-            agent: sel.agentID ?? null,
-            model: sel.model ? { providerID: sel.model.providerID, id: sel.model.id } : null,
-            location: { directory: work.worktree_dir },
-            metadata: { revva: { kind: 'review', workId, round, role } }
-          })
-          this.update(reviewId, 'running', undefined, undefined, session.id)
-          const timer = setTimeout(() => {
-            const t = this.sessions.get(session.id)
-            if (t) void this.settle(session.id, 'error', undefined, `reviewer timed out after ${SESSION_TIMEOUT_MS / 60000} min`)
-            void openCodeService.api.session.interrupt({ sessionID: session.id }).catch(() => undefined)
-          }, SESSION_TIMEOUT_MS)
-          this.sessions.set(session.id, { workId, round, role, reviewId, timer })
-          await api.session.prompt({ sessionID: session.id, text: reviewerPrompt(role, work, round, skills) })
-        } catch (err) {
-          this.update(reviewId, 'error', undefined, describeError(err))
+      const live: Array<{ reviewId: number; role: ReviewRole; sel: { agentID?: string; model?: ModelRef } }> = []
+      for (const p of plan) {
+        const sel = resolveSel(workId, p.role, perRun)
+        if (p.error) {
+          const res = insert.run(workId, round, p.role, 'error', '', sel.agentID ?? null, sel.model?.providerID ?? null, sel.model?.id ?? null, now, now)
+          this.update(Number(res.lastInsertRowid), 'error', undefined, p.error)
+          continue
         }
-      })
-    )
-    this.push(workId, round)
-    // Sessions that failed to even start settle the round immediately.
+        if (p.skipReason) {
+          insert.run(workId, round, p.role, 'skipped', p.skipReason, sel.agentID ?? null, sel.model?.providerID ?? null, sel.model?.id ?? null, now, now)
+          continue
+        }
+        const res = insert.run(workId, round, p.role, 'pending', '', sel.agentID ?? null, sel.model?.providerID ?? null, sel.model?.id ?? null, now, now)
+        live.push({ reviewId: Number(res.lastInsertRowid), role: p.role, sel })
+      }
+      this.push(workId, round)
+
+      // Fan out concurrently — one OpenCode session per reviewer.
+      await Promise.allSettled(
+        live.map(({ reviewId, role, sel }) => this.runReviewer(work, round, reviewId, role, sel, skills))
+      )
+      this.push(workId, round)
+      // Sessions that failed to even start settle the round immediately.
+    } catch (err) {
+      workManager.setReviewState(workId, 'WAITING_HUMAN', `Could not start review: ${describeError(err)}`)
+      throw err
+    } finally {
+      this.starting.delete(workId)
+    }
     void this.settleRoundIfDone(workId, round)
+  }
+
+  /** Retry one role without invalidating other reviewers' results for the same commit. */
+  async retryReview(workId: string, reviewId: number): Promise<void> {
+    ensureSchema()
+    const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(workId) as
+      | { id: string; ticket_key: string; branch: string; worktree_dir: string; state: string; review_head: string | null }
+      | undefined
+    if (!work) throw new Error('Work not found.')
+    if (work.state !== 'WAITING_HUMAN') throw new Error('Individual retries are available when the ticket needs attention.')
+    if (this.isBusyReviewing(workId) || shipManager.isShipping(workId)) throw new Error('Another review or shipping operation is in progress.')
+    const round = this.latestRound(workId)
+    const rows = latestAttempts(this.reviewsFor(workId).filter((r) => r.round === round))
+    const row = rows.find((r) => r.id === reviewId)
+    if (!row || row.status === 'pending' || row.status === 'running' || row.status === 'skipped') {
+      throw new Error('Only a completed reviewer in the latest round can be retried.')
+    }
+    if (!['sol', 'testAudit', 'impeccable', 'fixer'].includes(row.role)) throw new Error('This role cannot be retried.')
+    if (row.role === 'fixer' && row.status !== 'error') throw new Error('Only a failed fixer can be retried.')
+
+    this.starting.add(workId)
+    try {
+      const [head, status] = await Promise.all([
+        exec('git', ['-C', work.worktree_dir, 'rev-parse', 'HEAD']),
+        exec('git', ['-C', work.worktree_dir, 'status', '--porcelain'])
+      ])
+      if (!work.review_head || head.stdout.trim() !== work.review_head || status.stdout.trim()) {
+        throw new Error('The worktree changed since this review. Commit any changes and use Re-run review to review the whole team again.')
+      }
+      const changes = rows.filter((r) => r.role !== 'fixer' && r.status === 'changes')
+      if (row.role === 'fixer') {
+        if (!changes.length || rows.some((r) => r.role !== 'fixer' && r.status === 'error')) {
+          throw new Error('Resolve reviewer errors before retrying the fixer.')
+        }
+        this.starting.delete(workId)
+        await this.dispatchFixer(workId, round, changes)
+        return
+      }
+      const skills = new Set((await listSkills()).map((s) => s.id))
+      if (row.role === 'impeccable' && !skills.has('impeccable')) {
+        throw new Error('The impeccable skill is unavailable. Install or enable it in OpenCode, then retry UI review.')
+      }
+      const now = Date.now()
+      const result = getDb().prepare(
+        `INSERT INTO review(work_id, round, role, session_id, status, findings, error, agent_id, provider_id, model_id, created_at, updated_at)
+         VALUES(?,?,?,NULL,'pending','',NULL,?,?,?,?,?)`
+      ).run(workId, round, row.role, row.agentID ?? null, row.model?.providerID ?? null, row.model?.id ?? null, now, now)
+      this.settledRounds.delete(`${workId}:${round}`)
+      workManager.setReviewState(workId, 'REVIEW')
+      this.audit(workId, round, 'reviewer-retried', row.role)
+      this.push(workId, round)
+      await this.runReviewer(work, round, Number(result.lastInsertRowid), row.role as ReviewRole, { agentID: row.agentID, model: row.model }, skills)
+      this.push(workId, round)
+    } finally {
+      this.starting.delete(workId)
+    }
+    void this.settleRoundIfDone(workId, round)
+  }
+
+  private async runReviewer(
+    work: { id: string; ticket_key: string; branch: string; worktree_dir: string },
+    round: number,
+    reviewId: number,
+    role: ReviewRole,
+    sel: { agentID?: string; model?: ModelRef },
+    skills: Set<string>
+  ): Promise<void> {
+    try {
+      const api = openCodeService.api
+      const session = await api.session.create({
+        title: `${work.ticket_key} · ${role} (round ${round})`,
+        agent: sel.agentID ?? null,
+        model: sel.model ? { providerID: sel.model.providerID, id: sel.model.id } : null,
+        location: { directory: work.worktree_dir },
+        metadata: { revva: { kind: 'review', workId: work.id, round, role } }
+      })
+      this.update(reviewId, 'running', undefined, undefined, session.id)
+      const timer = setTimeout(() => {
+        if (this.sessions.has(session.id)) void this.settle(session.id, 'error', undefined, `reviewer timed out after ${SESSION_TIMEOUT_MS / 60000} min. Inspect the reviewer transcript for a stalled tool, then retry.`)
+        void api.session.interrupt({ sessionID: session.id }).catch(() => undefined)
+      }, SESSION_TIMEOUT_MS)
+      this.sessions.set(session.id, { workId: work.id, round, role, reviewId, timer })
+      await api.session.prompt({ sessionID: session.id, text: reviewerPrompt(role, work, round, skills) })
+    } catch (err) {
+      for (const [sessionId, tracked] of this.sessions) {
+        if (tracked.reviewId === reviewId) {
+          clearTimeout(tracked.timer)
+          this.sessions.delete(sessionId)
+          void openCodeService.api.session.interrupt({ sessionID: sessionId }).catch(() => undefined)
+        }
+      }
+      this.update(reviewId, 'error', undefined, describeError(err))
+    }
   }
 
   /** workManager calls this when a tracked reviewer/fixer session finished. */
   isBusyReviewing(workId: string): boolean {
+    if (this.starting.has(workId)) return true
     for (const t of this.sessions.values()) if (t.workId === workId) return true
     return false
+  }
+
+  isStartingReview(workId: string): boolean {
+    return this.starting.has(workId)
   }
 
   /** Interrupt everything in flight and mark rows error. Used by abandon(). */
@@ -274,16 +388,17 @@ class ReviewManager {
   /** Pull the reviewer's final message, parse its verdict, persist, maybe finish the round. */
   private async settle(sessionId: string, forcedStatus?: ReviewStatus, findings?: string, error?: string): Promise<void> {
     const t = this.sessions.get(sessionId)
-    if (!t) return
-    this.sessions.delete(sessionId)
+    if (!t || this.settling.has(sessionId)) return
+    this.settling.add(sessionId)
     clearTimeout(t.timer)
 
     let status: ReviewStatus = forcedStatus ?? 'changes'
     let text = findings ?? ''
     if (!forcedStatus) {
       try {
-        const res = await openCodeService.api.message.list({ sessionID: sessionId, order: 'asc', limit: 200 })
-        const lastAssistant = [...res.data].reverse().find((m) => m.type === 'assistant')
+        // desc so the limit keeps the newest messages; first assistant = final reply.
+        const res = await openCodeService.api.message.list({ sessionID: sessionId, order: 'desc', limit: 200 })
+        const lastAssistant = res.data.find((m) => m.type === 'assistant')
         for (const part of (lastAssistant as { content?: unknown[] })?.content ?? []) {
           const p = part as Record<string, unknown>
           if (p.type === 'text' && typeof p.text === 'string') text += p.text
@@ -294,7 +409,13 @@ class ReviewManager {
         error = describeError(err)
       }
     }
+    if (this.sessions.get(sessionId) !== t) {
+      this.settling.delete(sessionId)
+      return
+    }
     this.update(t.reviewId, status, text, error)
+    this.sessions.delete(sessionId)
+    this.settling.delete(sessionId)
     this.push(t.workId, t.round)
 
     if (t.role === 'fixer') {
@@ -302,11 +423,11 @@ class ReviewManager {
         // Fixes committed → next round of reviewers.
         workManager.setReviewState(t.workId, 'REVIEW')
         await this.startRound(t.workId, t.round + 1).catch((err) => {
-          workManager.setReviewState(t.workId, 'WAITING_HUMAN')
+          workManager.setReviewState(t.workId, 'WAITING_HUMAN', `Could not restart review: ${describeError(err)}`)
           this.audit(t.workId, t.round, 'review-restart-failed', describeError(err))
         })
       } else {
-        workManager.setReviewState(t.workId, 'WAITING_HUMAN')
+        workManager.setReviewState(t.workId, 'WAITING_HUMAN', `Fixer failed: ${error ?? 'session did not complete'}`)
         this.audit(t.workId, t.round, 'fixer-failed', error ?? 'fixer session did not complete')
       }
       return
@@ -319,33 +440,60 @@ class ReviewManager {
     if (this.isBusyReviewing(workId)) return
     const key = `${workId}:${round}`
     if (this.settledRounds.has(key)) return
-    const rows = this.reviewsFor(workId).filter((r) => r.round === round && r.role !== 'fixer')
+    const rows = latestAttempts(this.reviewsFor(workId).filter((r) => r.round === round && r.role !== 'fixer'))
     if (rows.length === 0) return
     if (rows.some((r) => r.status === 'pending' || r.status === 'running')) return
     this.settledRounds.add(key) // fan-in runs exactly once per round, even on parallel settle
+
+    const missing = (['sol', 'testAudit', 'impeccable'] as const).filter((role) => !rows.some((r) => r.role === role))
+    const invalidSkip = rows.some((r) => r.status === 'skipped' && (r.role !== 'impeccable' || r.findings !== 'no UI files changed on this branch'))
+    if (missing.length || invalidSkip) {
+      const reason = missing.length ? `Missing reviewers: ${missing.join(', ')}.` : 'A required reviewer was skipped.'
+      workManager.setReviewState(workId, 'WAITING_HUMAN', `${reason} Re-run the whole review.`)
+      this.audit(workId, round, 'review-incomplete', reason)
+      return
+    }
 
     const errors = rows.filter((r) => r.status === 'error')
     const changes = rows.filter((r) => r.status === 'changes')
 
     if (errors.length > 0) {
-      workManager.setReviewState(workId, 'WAITING_HUMAN')
+      workManager.setReviewState(workId, 'WAITING_HUMAN', `Review blocked: ${errors.map((r) => `${r.role}: ${r.error ?? 'did not complete'}`).join('; ')}`)
       this.audit(workId, round, 'reviewer-error', `${errors.length} reviewer(s) did not complete — approval blocked`)
       return
     }
     if (changes.length === 0) {
-      const work = getDb().prepare('SELECT ship_on_approve FROM work WHERE id = ?').get(workId) as { ship_on_approve: number | null } | undefined
-      this.audit(workId, round, 'approved', rows.map((r) => `${r.role}: approved`).join(', '))
-      if (work?.ship_on_approve) {
+      this.starting.add(workId)
+      try {
+        const work = getDb().prepare('SELECT worktree_dir, review_head FROM work WHERE id = ?').get(workId) as { worktree_dir: string; review_head: string | null }
+        const [head, status] = await Promise.all([
+          exec('git', ['-C', work.worktree_dir, 'rev-parse', 'HEAD']),
+          exec('git', ['-C', work.worktree_dir, 'status', '--porcelain'])
+        ])
+        if (!work.review_head || head.stdout.trim() !== work.review_head || status.stdout.trim()) {
+          throw new Error('The worktree changed during review. Commit the changes and re-run review.')
+        }
+      } catch (err) {
+        const reason = describeError(err)
+        workManager.setReviewState(workId, 'WAITING_HUMAN', `Review blocked: ${reason}`)
+        this.audit(workId, round, 'review-invalidated', reason)
+        return
+      } finally {
+        this.starting.delete(workId)
+      }
+      const work = getDb().prepare('SELECT mode, ship_on_approve FROM work WHERE id = ?').get(workId) as { mode: string; ship_on_approve: number | null } | undefined
+      this.audit(workId, round, 'approved', rows.map((r) => `${r.role}: ${r.status}`).join(', '))
+      workManager.setReviewState(workId, 'APPROVED')
+      if (work?.mode === 'auto' || work?.ship_on_approve) {
         // Opt-in only: push + PR the moment all gates pass (existing PR is updated).
         void shipManager.autoShip(workId)
-      } else {
-        workManager.setReviewState(workId, 'APPROVED')
       }
       return
     }
     const maxRounds = Math.min(settingGet<number>('reviewMaxRounds') ?? 3, 5)
-    if (round >= maxRounds) {
-      workManager.setReviewState(workId, 'WAITING_HUMAN')
+    const cycle = getDb().prepare('SELECT review_cycle_start FROM work WHERE id = ?').get(workId) as { review_cycle_start: number | null } | undefined
+    if (round - (cycle?.review_cycle_start ?? 1) + 1 >= maxRounds) {
+      workManager.setReviewState(workId, 'WAITING_HUMAN', `Review rounds exhausted: ${changes.length} reviewer(s) still request changes. Address the findings and re-run review.`)
       this.audit(workId, round, 'rounds-exhausted', `still ${changes.length} reviewer(s) requesting changes after ${round} rounds`)
       return
     }
@@ -372,6 +520,7 @@ class ReviewManager {
     workManager.setReviewState(workId, 'FIXING')
     this.push(workId, round)
 
+    this.starting.add(workId)
     try {
       const api = openCodeService.api
       const session = await api.session.create({
@@ -389,10 +538,20 @@ class ReviewManager {
         }
       }, SESSION_TIMEOUT_MS)
       this.sessions.set(session.id, { workId, round, role: 'fixer', reviewId, timer })
+      this.starting.delete(workId)
       await api.session.prompt({ sessionID: session.id, text: fixerPrompt(work, round, changes) })
     } catch (err) {
+      for (const [sessionId, tracked] of this.sessions) {
+        if (tracked.reviewId === reviewId) {
+          clearTimeout(tracked.timer)
+          this.sessions.delete(sessionId)
+          void openCodeService.api.session.interrupt({ sessionID: sessionId }).catch(() => undefined)
+        }
+      }
       this.update(reviewId, 'error', undefined, describeError(err))
-      workManager.setReviewState(workId, 'WAITING_HUMAN')
+      workManager.setReviewState(workId, 'WAITING_HUMAN', `Could not start fixer: ${describeError(err)}`)
+    } finally {
+      this.starting.delete(workId)
     }
     this.push(workId, round)
   }
@@ -417,10 +576,10 @@ class ReviewManager {
       files = base
         ? (await exec('git', ['-C', worktreeDir, 'diff', '--name-only', `${base}...HEAD`])).stdout
         : (await exec('git', ['-C', worktreeDir, 'show', '--name-only', '--pretty=format:', 'HEAD'])).stdout
-    } catch {
-      return false
+    } catch (err) {
+      throw new Error(`Could not determine whether UI files changed: ${describeError(err)}`)
     }
-    return /\.(tsx|jsx|vue|svelte|css|scss|less|html)$/i.test(files)
+    return files.split('\n').some((file) => /\.(tsx|jsx|vue|svelte|css|scss|less|html)$/i.test(file.trim()))
   }
 
   private update(

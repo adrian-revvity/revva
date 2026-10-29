@@ -98,7 +98,7 @@ export function StartWorkDialog({
         model: modelKey === '__default__' ? undefined : parseModelKey(modelKey),
         parentWorkId: parentWorkId === '__none__' ? undefined : parentWorkId,
         grill,
-        shipOnApprove,
+        shipOnApprove: auto || shipOnApprove,
         reviewSel: {
           sol: selOrUndefined(reviewSel.sol.agentID, reviewSel.sol.modelKey),
           testAudit: selOrUndefined(reviewSel.testAudit.agentID, reviewSel.testAudit.modelKey),
@@ -241,7 +241,7 @@ export function StartWorkDialog({
                   <Rocket className="size-3.5" /> AUTO mode
                 </Label>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  Agent pursues the goal, picks recommended options, minimizes questions. Gates still apply.
+                  Agent pursues the goal and ships after review gates pass. Blockers still need your attention.
                 </p>
               </div>
               <Switch checked={auto} onCheckedChange={(c) => setAuto(c === true)} />
@@ -257,7 +257,7 @@ export function StartWorkDialog({
               </div>
               <Checkbox checked={grill} onCheckedChange={(c) => setGrill(c === true)} />
             </label>
-            <label className="flex cursor-pointer items-center justify-between">
+            {!auto && <label className="flex cursor-pointer items-center justify-between">
               <div>
                 <Label className="flex items-center gap-1.5">
                   <Rocket className="size-3.5" /> Push when changes are done
@@ -267,7 +267,7 @@ export function StartWorkDialog({
                 </p>
               </div>
               <Checkbox checked={shipOnApprove} onCheckedChange={(c) => setShipOnApprove(c === true)} />
-            </label>
+            </label>}
           </div>
 
           <div className="space-y-2 rounded-md border p-3">

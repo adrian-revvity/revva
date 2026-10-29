@@ -36,7 +36,6 @@ export function NewChatDialog({
   const agents = useQuery({ queryKey: ['agents'], queryFn: () => window.revva.inventory.agents() })
   const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models() })
 
-  const [title, setTitle] = useState('')
   const [directory, setDirectory] = useState<string>(ANY_FOLDER)
   const [customDir, setCustomDir] = useState('')
   const [agentID, setAgentID] = useState('__default__')
@@ -57,7 +56,6 @@ export function NewChatDialog({
       if (!dir) throw new Error('Choose a project folder for this chat.')
       const chat = await window.revva.chat.create({
         directory: dir,
-        title: title.trim() || undefined,
         agentID: agentID === '__default__' ? undefined : agentID,
         model: modelKey === '__default__' ? undefined : parseModelKey(modelKey),
         ticketKey: ticketKey.trim() || undefined,
@@ -68,7 +66,6 @@ export function NewChatDialog({
     },
     onSuccess: (chat) => {
       onOpenChange(false)
-      setTitle('')
       onCreated(chat.sessionId)
     }
   })
@@ -82,21 +79,12 @@ export function NewChatDialog({
         <DialogHeader>
           <DialogTitle>New chat</DialogTitle>
           <DialogDescription>
-            A general OpenCode session — not attached to any ticket or pipeline.
+            A general OpenCode session — not attached to any ticket or pipeline. It gets a title
+            automatically from your first message.
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-3">
-          <div className="space-y-1.5">
-            <Label htmlFor="chat-title">Title</Label>
-            <Input
-              id="chat-title"
-              placeholder="e.g. refactor auth module questions"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-            />
-          </div>
-
           <div className="space-y-1.5">
             <Label>Project folder</Label>
             <Select

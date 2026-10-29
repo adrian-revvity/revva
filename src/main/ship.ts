@@ -24,6 +24,7 @@ interface ShipWorkRow {
   state: string
   parent_work_id: string | null
   pr_url: string | null
+  review_head: string | null
 }
 
 function ensureSchema(): void {
@@ -43,6 +44,12 @@ export function parseGitHubRemote(url: string): { owner: string; repo: string } 
 }
 
 class ShipManager {
+  private shipping = new Set<string>()
+
+  isShipping(workId: string): boolean {
+    return this.shipping.has(workId)
+  }
+
   /** Cheap pre-flight; every check says what to fix. ok=true ⇒ Ship is safe. */
   async checks(workId: string): Promise<ShipCheck[]> {
     ensureSchema()
@@ -82,6 +89,26 @@ class ShipManager {
           : { name: 'Clean tree', ok: true, detail: 'everything committed' }
     )
 
+    const head = await this.probe('git', ['-C', work.worktree_dir, 'rev-parse', 'HEAD'])
+    // review_head is set at the start of a round, not when it passes. A matching
+    // hash alone must never turn a failed or still-running review green.
+    const latestRound = getDb().prepare("SELECT MAX(round) AS round FROM review WHERE work_id = ? AND role != 'fixer'").get(workId) as { round: number | null }
+    const approved = latestRound.round != null && !!getDb().prepare("SELECT 1 FROM auto_decision WHERE work_id = ? AND round = ? AND kind = 'approved' LIMIT 1").get(workId, latestRound.round)
+    const latest = new Map<string, { status: string; findings: string }>()
+    if (latestRound.round != null) {
+      const rows = getDb().prepare("SELECT role, status, findings FROM review WHERE work_id = ? AND round = ? AND role != 'fixer' ORDER BY id").all(workId, latestRound.round) as Array<{ role: string; status: string; findings: string }>
+      for (const row of rows) latest.set(row.role, row)
+    }
+    const gatesPassed = (['sol', 'testAudit', 'impeccable'] as const).every((role) => {
+      const row = latest.get(role)
+      return row?.status === 'approved' || (role === 'impeccable' && row?.status === 'skipped' && row.findings === 'no UI files changed on this branch')
+    })
+    checks.push(
+      (work.state === 'APPROVED' || work.state === 'SHIPPED') && approved && gatesPassed && head.ok && !!work.review_head && head.out.trim() === work.review_head
+        ? { name: 'Reviewed commit', ok: true, detail: 'current commit passed review' }
+        : { name: 'Reviewed commit', ok: false, fatal: false, detail: 'current commit has not passed review — re-run review, or ship anyway from the dialog' }
+    )
+
     let ahead = { ok: false, out: '', err: '' }
     for (const baseRef of ['origin/HEAD', 'origin/main', 'main', 'origin/master', 'master']) {
       ahead = await this.probe('git', ['-C', work.worktree_dir, 'rev-list', '--count', 'HEAD', `^${baseRef}`])
@@ -105,68 +132,84 @@ class ShipManager {
   }
 
   /** Push + PR + Jira. With an already-linked PR this just pushes to it (update);
-   *  otherwise it creates one. Throws with a readable message when a fatal check fails. */
-  async ship(workId: string): Promise<ShipResult> {
-    ensureSchema()
-    const checks = await this.checks(workId)
-    const fatal = checks.find((c) => !c.ok && c.fatal !== false)
-    if (fatal) throw new Error(`Cannot ship: ${fatal.name} — ${fatal.detail}`)
-    const work = this.requireWork(workId)
-    if (work.state !== 'APPROVED' && work.state !== 'SHIPPED') {
-      if (work.state === 'BUILDING' || work.state === 'REVIEW' || work.state === 'FIXING') throw new Error('Reviews are still running.')
-      throw new Error(`Cannot ship from state ${work.state}.`)
-    }
+   *  otherwise it creates one. Throws with a readable message when a fatal check fails.
+   *  Outside APPROVED/SHIPPED (e.g. WAITING_HUMAN, REWORK) shipping is allowed but the
+   *  unreviewed commit is audited — the dialog shows the warning; `strict` (AUTO) keeps
+   *  the reviewed-commit check fatal because nobody is watching. */
+  async ship(workId: string, opts: { strict?: boolean } = {}): Promise<ShipResult> {
+    if (this.shipping.has(workId)) throw new Error('Shipping is already in progress.')
+    this.shipping.add(workId)
+    try {
+      ensureSchema()
+      const checks = await this.checks(workId)
+      const fatal = checks.find(
+        (c) => !c.ok && (c.fatal !== false || (opts.strict && c.name === 'Reviewed commit'))
+      )
+      if (fatal) throw new Error(`Cannot ship: ${fatal.name} — ${fatal.detail}`)
+      const work = this.requireWork(workId)
+      if (work.state === 'BUILDING' || work.state === 'REVIEW' || work.state === 'FIXING') {
+        throw new Error('Reviews are still running.')
+      }
+      if (work.state === 'READY' || work.state === 'ABANDONED') {
+        throw new Error(`Cannot ship from state ${work.state}.`)
+      }
+      if (checks.some((c) => c.name === 'Reviewed commit' && !c.ok)) {
+        audit(workId, 'ship-unreviewed', `shipping from ${work.state} — reviewed-commit gate acknowledged by user`)
+      }
 
-    audit(workId, 'ship-start', `branch ${work.branch}${work.pr_url ? ' (update existing PR)' : ''}`)
+      audit(workId, 'ship-start', `branch ${work.branch}${work.pr_url ? ' (update existing PR)' : ''}`)
 
-    // 1. Push (never force). -u so gh and gh-stack see the tracking branch.
-    const push = await this.probe('git', ['-C', work.worktree_dir, 'push', '-u', 'origin', work.branch])
-    if (!push.ok) throw new Error(`git push failed: ${push.err.slice(0, 400)}`)
-    audit(workId, 'pushed', work.branch)
+      // 1. Push (never force). -u so gh and gh-stack see the tracking branch.
+      const push = await this.probe('git', ['-C', work.worktree_dir, 'push', '-u', 'origin', work.branch])
+      if (!push.ok) throw new Error(`git push failed: ${push.err.slice(0, 400)}`)
+      audit(workId, 'pushed', work.branch)
 
-    // 2. PR: linked already ⇒ the push above updated it — no second PR, ever.
-    if (work.pr_url) {
+      // 2. PR: linked already ⇒ the push above updated it — no second PR, ever.
+      if (work.pr_url) {
+        const reviews = this.reviewLedger(workId)
+        const jira = await this.syncJira(work, work.pr_url, reviews)
+        audit(workId, 'jira-sync', jira)
+        getDb().prepare('UPDATE work SET updated_at = ? WHERE id = ?').run(Date.now(), workId)
+        workManager.setReviewState(workId, 'SHIPPED')
+        return { prUrl: work.pr_url, alreadyShipped: true }
+      }
+
+      // No PR yet: create one. Stacked work bases on the parent work's branch — this is the
+      // gh-stack relationship (child base = parent branch); plain gh pr create keeps bases correct.
+      const base = await this.baseFor(work)
       const reviews = this.reviewLedger(workId)
-      const jira = await this.syncJira(work, work.pr_url, reviews)
+      const title = this.prTitle(work)
+      const body = this.prBody(work, reviews)
+      const prArgs = [
+        'pr', 'create',
+        '--base', base,
+        '--head', work.branch,
+        '--title', title,
+        '--body', body
+      ]
+      const pr = await this.probeIn(work.worktree_dir, 'gh', prArgs)
+      const prUrl = pr.ok ? pr.out.trim().split('\n').filter(Boolean).at(-1) ?? '' : ''
+      if (!pr.ok || !prUrl.startsWith('http')) {
+        throw new Error(`gh pr create failed: ${(pr.err || pr.out).slice(0, 400)}`)
+      }
+      audit(workId, 'pr-created', `${prUrl} (base ${base})`)
+      getDb().prepare('UPDATE work SET pr_url = ?, updated_at = ? WHERE id = ?').run(prUrl, Date.now(), workId)
+      void shell.openExternal(prUrl)
+
+      // 3. Jira: transition to review-ish status + summary comment. Best effort.
+      const jira = await this.syncJira(work, prUrl, reviews)
       audit(workId, 'jira-sync', jira)
-      getDb().prepare('UPDATE work SET updated_at = ? WHERE id = ?').run(Date.now(), workId)
+
       workManager.setReviewState(workId, 'SHIPPED')
-      return { prUrl: work.pr_url, alreadyShipped: true }
+      return { prUrl, alreadyShipped: false }
+    } finally {
+      this.shipping.delete(workId)
     }
-
-    // No PR yet: create one. Stacked work bases on the parent work's branch — this is the
-    // gh-stack relationship (child base = parent branch); plain gh pr create keeps bases correct.
-    const base = await this.baseFor(work)
-    const reviews = this.reviewLedger(workId)
-    const title = this.prTitle(work)
-    const body = this.prBody(work, reviews)
-    const prArgs = [
-      'pr', 'create',
-      '--base', base,
-      '--head', work.branch,
-      '--title', title,
-      '--body', body
-    ]
-    const pr = await this.probeIn(work.worktree_dir, 'gh', prArgs)
-    const prUrl = pr.ok ? pr.out.trim().split('\n').filter(Boolean).at(-1) ?? '' : ''
-    if (!pr.ok || !prUrl.startsWith('http')) {
-      throw new Error(`gh pr create failed: ${(pr.err || pr.out).slice(0, 400)}`)
-    }
-    audit(workId, 'pr-created', `${prUrl} (base ${base})`)
-    void shell.openExternal(prUrl)
-
-    // 3. Jira: transition to review-ish status + summary comment. Best effort.
-    const jira = await this.syncJira(work, prUrl, reviews)
-    audit(workId, 'jira-sync', jira)
-
-    getDb().prepare('UPDATE work SET pr_url = ?, updated_at = ? WHERE id = ?').run(prUrl, Date.now(), workId)
-    workManager.setReviewState(workId, 'SHIPPED')
-    return { prUrl, alreadyShipped: false }
   }
 
   private reviewLedger(workId: string): Array<{ role: string; round: number; status: string }> {
     return getDb()
-      .prepare("SELECT role, round, status FROM review WHERE work_id = ? AND role != 'fixer' ORDER BY round, role")
+      .prepare("SELECT role, round, status FROM review WHERE work_id = ? AND role != 'fixer' ORDER BY round, id")
       .all(workId) as Array<{ role: string; round: number; status: string }>
   }
 
@@ -179,12 +222,13 @@ class ShipManager {
   /** AUTO mode: called by the review pipeline the moment all gates approve. */
   async autoShip(workId: string): Promise<void> {
     try {
-      const res = await this.ship(workId)
+      const res = await this.ship(workId, { strict: true })
       audit(workId, 'auto-shipped', res.prUrl)
     } catch (err) {
-      // AUTO never skips gates or hides failures: park for the human with the reason.
-      audit(workId, 'auto-ship-blocked', err instanceof Error ? err.message : String(err))
-      workManager.setReviewState(workId, 'WAITING_HUMAN')
+      // Keep the approved gate and let the user retry shipping after resolving the blocker.
+      const reason = err instanceof Error ? err.message : String(err)
+      audit(workId, 'auto-ship-blocked', reason)
+      workManager.setReviewState(workId, 'APPROVED', `Automatic shipping failed: ${reason}`)
     }
   }
 
@@ -268,7 +312,7 @@ class ShipManager {
   private requireWork(workId: string): ShipWorkRow {
     ensureSchema()
     const work = getDb()
-      .prepare('SELECT id, ticket_key, repo_dir, branch, worktree_dir, mode, state, parent_work_id, pr_url FROM work WHERE id = ?')
+      .prepare('SELECT id, ticket_key, repo_dir, branch, worktree_dir, mode, state, parent_work_id, pr_url, review_head FROM work WHERE id = ?')
       .get(workId) as ShipWorkRow | undefined
     if (!work) throw new Error('Work not found.')
     return work
