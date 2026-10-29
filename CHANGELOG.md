@@ -7,6 +7,10 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 ## [Unreleased]
 
+- (nothing yet)
+
+## [1.2.0] - 2026-10-29
+
 - **Pick the worktree and branch from the conversation** — Details now lists Revva's own worktrees (linked ones *and* the repository's main checkout) and the branches git reports for that repository, so a conversation can be moved to another checkout or switched to another branch without ever navigating a folder. Each list says what it means: which worktree is current, which one a ticket owns, which branch another worktree already holds (disabled, with the path), and which branches only exist on a remote — choosing one starts the local tracking branch. Moving a conversation moves its OpenCode session, so the agent works where you picked, and its review anchor is re-read from git; nothing is renamed, deleted or force-checked-out. Anything unsafe is refused before the first write with the reason and "Nothing was changed": a running response, a live review/ship/follow-up, a shipped run, a PR-linked conversation off its PR's branch, an agent or terminal inside either folder, a checkout with uncommitted changes, a branch two remotes both carry.
 
 - **Repo workflow skills cannot hijack Revva sessions** — every Revva-created conversation (ticket build, ticket/PR chat, reviewers, fixer, conflict/rework sessions) is now created with service-enforced permission rules denying the skills the repository itself ships (e.g. a checked-in `.claude/skills/jiraWork`), while global/user skills keep working. The OpenCode service drops even a model-initiated activation of a denied skill, so a ticket prompt can no longer be swallowed by a repo skill that halts on a missing plugin. Deny lists are discovered per folder and cached; if the skill listing fails the session is created ungated rather than locked down. To use a repo skill with an agent, run it outside Revva (e.g. the OpenCode TUI) in that checkout.
