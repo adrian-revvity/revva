@@ -7,6 +7,7 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 ## [Unreleased]
 
+- **Safer worktree removal** — abandoning a ticket or removing worktrees now previews exactly what deletion destroys (uncommitted, staged, untracked and ignored files are counted, never shown) and needs your explicit tick per worktree whenever files would go; the main checkout, unregistered folders, nested or locked worktrees are off-limits, active agents (or their absence being unprovable) block removal, and the confirmation is bound to a fingerprint of the actual contents — staged contents (full blob hashes), sizes, times, inodes, nested ignored content included: content staged, added, removed, or normally edited between preview and deletion aborts with nothing touched, and trees too large to fully verify are refused. `git worktree remove --force` is used only for content you confirmed destroying; branches still go through `branch -d` only. Abandoning while a review round is in flight now refuses instead of cancelling it — if a removal is refused or fails, nothing (not even review rounds) was changed. Removal is not race-free (a same-size rewrite that restores exact timestamps slips past the fingerprint, and writes after the last check cannot be caught) — the dialog says so.
 - **Inbox messages** — display the complete, formatted final response with an expandable view and more room to read.
 - **Worktree count** — the sidebar shows linked worktrees in known repos and warns when there are more than 10 to review.
 - **Inbox diagnostics** — show technical details when finished runs or pending questions fail to load, and indicate when retrying.
@@ -17,8 +18,7 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 - **Sidebar sections** — ongoing ticket runs have their own section above chats, and the new-chat button sits under the Chats heading.
 - **Inbox triage** — see each item’s type and position, browse without answering, and reply to finished chats directly from the inbox.
 - **Triage inbox** — finished chats and ticket runs you haven’t opened now appear in the Inbox beside pending questions, ranked below them. One card at a time: answer or open it and the next slides in, like clearing an email queue. Mark read dismisses a card without opening; opening the chat or cockpit clears it everywhere.
-- **Ticket conversations** — reduce duplicate header information, use shorter model labels, and move branch, worktree, model and session details into a top-bar popover.
-- **Questions in conversations** — answer pending questions and permission requests directly in their chat or ticket transcript, as well as in the inbox.
+- **Ticket conversations** — reduce duplicate header information, use shorter model labels, and move branch, worktree, model and session details into a top-bar popover.- **Questions in conversations** — answer pending questions and permission requests directly in their chat or ticket transcript, as well as in the inbox.
 - **Question inbox** — pending questions remain visible if the finished-run feed can’t load; the inbox now explains when Revva needs a restart or a retry.
 - **Ticket review and shipping** — follow-ups and retries start fresh review rounds, review blockers are visible, and AUTO ships after required gates pass.
 - **Conversation composer** — streamlined message entry, controls, and image previews into one compact layout.

@@ -26,7 +26,7 @@ import { workStateLabels } from '@/lib/work-state'
 import { SetupView } from '@/views/Setup'
 import { ChatView } from '@/views/Chat'
 import { NewChatDialog } from '@/views/NewChatDialog'
-import { WorktreesDialog } from '@/views/WorktreesDialog'
+import { WorktreesDialog, WorktreeRemovalDialog, type WorktreeRemovalRow } from '@/views/WorktreesDialog'
 import { DashboardView } from '@/views/DashboardView'
 import { BoardView } from '@/views/BoardView'
 import { WorkCockpit, WorkDetailsPopover } from '@/views/WorkCockpit'
@@ -59,6 +59,8 @@ export default function App(): React.JSX.Element {
   const [view, setView] = useState<View>({ kind: 'dashboard' })
   const [newChatOpen, setNewChatOpen] = useState(false)
   const [worktreesOpen, setWorktreesOpen] = useState(false)
+  const [abandonTarget, setAbandonTarget] = useState<{ workId: string; row: WorktreeRemovalRow } | null>(null)
+  const [abandonBusy, setAbandonBusy] = useState(false)
 
   const status = useQuery({
     queryKey: ['service-status'],
@@ -149,12 +151,49 @@ export default function App(): React.JSX.Element {
     })
   }
   const abandonWork = (workId: string, ticketKey: string): void => {
-    if (!confirm(`Abandon ${ticketKey}? The worktree is removed and the build session deleted. The branch is only deleted if fully merged — otherwise revva keeps it.`)) return
-    void window.revva.work.abandon(workId).then((note) => {
-      if (note) alert(note)
-      qc.invalidateQueries({ queryKey: ['works'] })
-      if (view.kind === 'work' && view.workId === workId) setView({ kind: 'dashboard' })
-    })
+    // Preview first (read-only): the dialog shows exactly what removal destroys
+    // and demands a per-worktree tick whenever files would go. A thrown refusal
+    // (locked, unregistered, unreadable state) means nothing may be touched.
+    void window.revva.work
+      .abandonPreflight(workId)
+      .then((p) => {
+        const row: WorktreeRemovalRow = {
+          label: p.ticketKey,
+          directory: p.worktreeDir,
+          branch: p.branch,
+          preflight: p.worktree
+        }
+        setAbandonTarget({ workId, row })
+      })
+      .catch((err) =>
+        alert(`Cannot abandon ${ticketKey} yet: ${(err as Error).message}\nNothing was removed.`)
+      )
+  }
+  const confirmAbandon = (workId: string, confirmedDirs: Set<string>): void => {
+    const row = abandonTarget?.row
+    setAbandonBusy(true)
+    void window.revva.work
+      .abandon({
+        id: workId,
+        confirmedSignature: row?.preflight.signature ?? '',
+        confirmed: row ? confirmedDirs.has(row.preflight.directory) : false
+      })
+      .then((note) => {
+        setAbandonTarget(null)
+        if (note) alert(note)
+        qc.invalidateQueries({ queryKey: ['works'] })
+        if (view.kind === 'work' && view.workId === workId) setView({ kind: 'dashboard' })
+      })
+      .catch((err) => {
+        // Refused or failed: the work keeps its state, files, session and
+        // review rounds — abandon never cancels anything, so a refusal (an
+        // in-flight review, drift from the confirmed state, a locked or
+        // unregistered path) changes nothing and the user can retry.
+        setAbandonTarget(null)
+        alert(`Abandon failed: ${(err as Error).message}`)
+        qc.invalidateQueries({ queryKey: ['works'] })
+      })
+      .finally(() => setAbandonBusy(false))
   }
 
   return (
@@ -420,6 +459,17 @@ export default function App(): React.JSX.Element {
       />
 
       <WorktreesDialog open={worktreesOpen} onOpenChange={setWorktreesOpen} />
+
+      <WorktreeRemovalDialog
+        open={abandonTarget !== null}
+        onOpenChange={(next) => !next && !abandonBusy && setAbandonTarget(null)}
+        title={`Abandon ${abandonTarget?.row.label ?? ''}?`}
+        intro="Removal re-fingerprints staged contents and files right before deleting and aborts when content was staged, added, removed, or normally edited since this preview — a same-size rewrite with restored timestamps, or writes after the last check, cannot be caught. Tick the worktree if its files would be destroyed. Unmerged branches are always kept."
+        rows={abandonTarget ? [abandonTarget.row] : []}
+        confirmLabel="Abandon"
+        busy={abandonBusy}
+        onConfirm={(confirmedDirs) => abandonTarget && confirmAbandon(abandonTarget.workId, confirmedDirs)}
+      />
     </div>
   )
 }
