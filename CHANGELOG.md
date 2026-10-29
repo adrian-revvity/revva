@@ -7,6 +7,10 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 ## [Unreleased]
 
+- (nothing yet)
+
+## [1.0.0] - 2026-10-29
+
 Revva 1.0 — the "run it all day" release. The GitHub and Jira boards are now drag-and-drop tile views with a PR menu that carries review, conflicts, push, rebase, merge and AI-written descriptions; conversations switch model and agent mid-run, group tool steps, show live context and tokens/sec, and never lose output when you switch away; the triage inbox became a single clear-the-queue view with OS notifications and a thinking meter; keep-awake holds off Mac sleep during long runs; and worktree removal now proves what it destroys before deleting anything.
 
 - **Safer worktree removal** — abandoning a ticket or removing worktrees now previews exactly what deletion destroys (uncommitted, staged, untracked and ignored files are counted, never shown) and needs your explicit tick per worktree whenever files would go; the main checkout, unregistered folders, nested or locked worktrees are off-limits, active agents (or their absence being unprovable) block removal, and the confirmation is bound to a fingerprint of the actual contents — staged contents (full blob hashes), sizes, times, inodes, nested ignored content included: content staged, added, removed, or normally edited between preview and deletion aborts with nothing touched, and trees too large to fully verify are refused. `git worktree remove --force` is used only for content you confirmed destroying; branches still go through `branch -d` only. Abandoning while a review round is in flight now refuses instead of cancelling it — if a removal is refused or fails, nothing (not even review rounds) was changed. Removal is not race-free (a same-size rewrite that restores exact timestamps slips past the fingerprint, and writes after the last check cannot be caught) — the dialog says so.
