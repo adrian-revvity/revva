@@ -7,6 +7,10 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 ## [Unreleased]
 
+- (nothing yet)
+
+## [1.1.0] - 2026-10-29
+
 Revva 1.1 — one conversation chrome for Jira, PRs and tagging; reviews that wait for a real *done*; and honest speed. PR review threads can be answered from the card, queued follow-ups can steer the running turn, the sprint board grew issue types, sub-task launching and family linking, worktree removal grew an audit chat, and conversations got quieter, faster and more precise (since-Send tok/s, effort picker, quiet-since timer).
 
 - **Quieter conversation header** — Jira and PR conversations now use one compact Workflow control for status, review and delivery actions. Agents and their transcripts open in a floating review window; folder, branch, model and session details move into Details. The title appears once; permanent idle-agent and review-folder bars, duplicate status badges and repeated model/session pills are gone, without changing the underlying flows.
