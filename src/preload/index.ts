@@ -40,7 +40,7 @@ const api: RevvaApi = {
   chat: {
     list: () => ipcRenderer.invoke(IPC.chatList),
     create: (input) => ipcRenderer.invoke(IPC.chatCreate, input),
-    messages: (sessionId) => ipcRenderer.invoke(IPC.chatMessages, sessionId),
+    messages: (sessionId, since) => ipcRenderer.invoke(IPC.chatMessages, sessionId, since),
     prompt: (sessionId, text, images, queued, refs, sentAt) => ipcRenderer.invoke(IPC.chatPrompt, sessionId, text, images, queued, refs, sentAt),
     interrupt: (sessionId) => ipcRenderer.invoke(IPC.chatInterrupt, sessionId),
     rename: (sessionId, title) => ipcRenderer.invoke(IPC.chatRename, sessionId, title),
@@ -77,14 +77,16 @@ const api: RevvaApi = {
   work: {
     start: (input) => ipcRenderer.invoke(IPC.workStart, input),
     list: () => ipcRenderer.invoke(IPC.workList),
+    conversationContext: (sessionId, directory) => ipcRenderer.invoke(IPC.conversationContext, sessionId, directory),
     abandonPreflight: (id) => ipcRenderer.invoke(IPC.workAbandonPreflight, id),
     abandon: (input) => ipcRenderer.invoke(IPC.workAbandon, input),
-    messages: (sessionId) => ipcRenderer.invoke(IPC.workMessages, sessionId),
+    messages: (sessionId, since) => ipcRenderer.invoke(IPC.workMessages, sessionId, since),
     prompt: (sessionId, text, images, queued, refs, sentAt) => ipcRenderer.invoke(IPC.workPrompt, sessionId, text, images, queued, refs, sentAt),
     interrupt: (sessionId) => ipcRenderer.invoke(IPC.workInterrupt, sessionId),
     reviews: (workId) => ipcRenderer.invoke(IPC.workReviews, workId),
     reviewStart: (workId) => ipcRenderer.invoke(IPC.workReviewStart, workId),
     reviewRetry: (workId, reviewId) => ipcRenderer.invoke(IPC.workReviewRetry, workId, reviewId),
+    reviewStop: (workId) => ipcRenderer.invoke(IPC.workReviewStop, workId),
     shipCheck: (workId) => ipcRenderer.invoke(IPC.workShipCheck, workId),
     ship: (workId) => ipcRenderer.invoke(IPC.workShip, workId)
   },

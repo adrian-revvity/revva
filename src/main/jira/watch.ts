@@ -91,7 +91,7 @@ class CommentWatcher {
     try {
       if (!jiraMcp.connected) return
       const works = getDb()
-        .prepare("SELECT id, ticket_key FROM work WHERE state = 'SHIPPED' OR pr_url IS NOT NULL")
+        .prepare("SELECT id, ticket_key FROM work WHERE state != 'ABANDONED' AND ticket_key != '' AND (state = 'SHIPPED' OR pr_url IS NOT NULL)")
         .all() as Array<{ id: string; ticket_key: string }>
       if (works.length === 0) return
       const me = await jiraMcp.myAccountId().catch(() => undefined)

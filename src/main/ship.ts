@@ -51,6 +51,14 @@ class ShipManager {
     const work = this.requireWork(workId)
     const checks: ShipCheck[] = []
 
+    const attached = await this.probe('git', ['-C', work.worktree_dir, 'branch', '--show-current'])
+    checks.push({
+      name: 'Ticket branch',
+      ok: attached.ok && !!work.branch && attached.out.trim() === work.branch,
+      detail: attached.ok && work.branch && attached.out.trim() === work.branch
+        ? work.branch : 'Choose the conversation’s Git worktree with its ticket branch checked out before shipping.'
+    })
+
     const gh = await this.probe('gh', ['--version'])
     checks.push(
       gh.ok
@@ -116,12 +124,12 @@ class ShipManager {
         : { name: 'Commits ahead of base', ok: false, detail: 'nothing committed on this branch yet' }
     )
 
-    const jiraOk = jiraMcp.connected
+    const jiraOk = !work.ticket_key || jiraMcp.connected
     checks.push({
       name: 'Jira sync',
       ok: jiraOk,
       fatal: false,
-      detail: jiraOk ? 'status transition + summary comment after PR' : 'not connected — PR will be created without Jira updates'
+      detail: !work.ticket_key ? 'no Jira link — not needed' : jiraOk ? 'status transition + summary comment after PR' : 'not connected — PR will be created without Jira updates'
     })
     return checks
   }
@@ -234,13 +242,14 @@ class ShipManager {
     }
     // Lineage recorded at worktree creation survives outside our DB.
     const recorded = await this.probe('git', ['-C', work.worktree_dir, 'config', 'branch.' + work.branch + '.base'])
-    if (recorded.ok && recorded.out.trim()) return recorded.out.trim().replace('origin/', '')
+    if (recorded.ok && recorded.out.trim() && !/^[0-9a-f]{40,64}$/i.test(recorded.out.trim())) return recorded.out.trim().replace('origin/', '')
     const head = await this.probe('git', ['-C', work.worktree_dir, 'symbolic-ref', 'refs/remotes/origin/HEAD', '--short'])
     if (head.ok) return head.out.trim().replace('origin/', '')
     return 'main'
   }
 
   private prTitle(work: ShipWorkRow): string {
+    if (!work.ticket_key) return (getDb().prepare('SELECT title FROM chat WHERE session_id = (SELECT session_id FROM work WHERE id = ?)').get(work.id) as { title: string } | undefined)?.title || work.branch
     const ticket = getDb().prepare('SELECT summary FROM ticket WHERE key = ?').get(work.ticket_key) as { summary: string } | undefined
     return `${work.ticket_key}: ${ticket?.summary ?? work.branch}`
   }
@@ -261,7 +270,7 @@ class ShipManager {
       [
         '## Summary',
         '',
-        ticket?.summary ? `${work.ticket_key}: ${ticket.summary}` : work.ticket_key,
+        ticket?.summary ? `${work.ticket_key}: ${ticket.summary}` : work.ticket_key || this.prTitle(work),
         '',
         '## Changes',
         ...(commits.length ? commits.map((subject) => `- ${subject}`) : ['- Change details were unavailable; see the PR diff.']),
@@ -279,6 +288,7 @@ class ShipManager {
     prUrl: string,
     reviews: Array<{ role: string; round: number; status: string }>
   ): Promise<string> {
+    if (!work.ticket_key) return 'skipped: no Jira ticket linked'
     if (!jiraMcp.connected) return 'skipped: Jira not connected'
     const notes: string[] = []
     try {

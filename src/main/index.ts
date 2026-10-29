@@ -16,6 +16,9 @@ import { jiraMcp } from './jira/mcp'
 import { commentWatcher } from './jira/watch'
 import { sessionIndex } from './opencode/session-index'
 import { throughputMeter } from './opencode/throughput'
+import { handleTranscriptImages, registerImageScheme } from './opencode/transcript-images'
+
+registerImageScheme()
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -55,6 +58,7 @@ app.whenReady().then(() => {
     app.dock?.setIcon(join(app.getAppPath(), 'build/icon.png'))
   }
   registerIpc()
+  handleTranscriptImages()
   keepAwake.restore()
   createWindow()
 

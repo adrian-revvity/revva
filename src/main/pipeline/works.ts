@@ -11,7 +11,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { existsSync } from 'node:fs'
 import { mkdir, realpath } from 'node:fs/promises'
-import { join, basename } from 'node:path'
+import { join, basename, dirname, resolve } from 'node:path'
 import { BrowserWindow } from 'electron'
 import { openCodeService, describeError } from '../opencode/service'
 import { eventBus, type RawEvent } from '../opencode/bus'
@@ -21,11 +21,11 @@ import { sessionIndex } from '../opencode/session-index'
 import { streamBuffer } from '../opencode/stream-buffer'
 import { pushToWindows } from '../push'
 import { notifyInbound } from '../notify'
-import { collectAdfText, isConflict, promptImageFiles } from '../util'
+import { collectAdfText, fetchLastAssistantText, isConflict, promptImageFiles } from '../util'
 import { reviewManager } from '../review'
 import { shipManager } from '../ship'
 import { performRemoval, preflightWorktreeRemoval, requireAbsenceOfAgents, staleConfirmationError } from '../worktree-safety'
-import { renderPrompt, DEFAULT_START_PROMPT } from '@shared/prompts'
+import { renderPrompt, DEFAULT_START_PROMPT, BUILD_COMPLETION_INSTRUCTIONS } from '@shared/prompts'
 import {
   IPC,
   type PromptImage,
@@ -46,6 +46,7 @@ interface WorkRow {
   repo_dir: string
   branch: string
   worktree_dir: string
+  owns_worktree: number
   parent_work_id: string | null
   mode: string
   state: string
@@ -79,6 +80,8 @@ function stateLabel(state: WorkState): string {
 
 class WorkManager {
   private wired = false
+  /** Invalidate an async completion check when a new turn/follow-up starts. */
+  private buildRevisions = new Map<string, number>()
 
   wire(): void {
     if (this.wired) return
@@ -98,10 +101,11 @@ class WorkManager {
     return {
       id: r.id,
       ticketKey: r.ticket_key,
-      ticketSummary: ticket?.summary ?? r.ticket_key,
+      ticketSummary: ticket?.summary ?? (r.ticket_key || (getDb().prepare('SELECT title FROM chat WHERE session_id = ?').get(r.session_id) as { title: string } | undefined)?.title || r.branch),
       repoDir: r.repo_dir,
       branch: r.branch,
       worktreeDir: r.worktree_dir,
+      ownsWorktree: r.owns_worktree !== 0,
       parentWorkId: r.parent_work_id ?? undefined,
       mode: r.mode as WorkSummary['mode'],
       state: r.state as WorkSummary['state'],
@@ -111,6 +115,107 @@ class WorkManager {
       updatedAt: r.updated_at,
       unread: (r.seen_at ?? 0) < r.updated_at && UNREAD_WORTHY_STATES.has(r.state)
     }
+  }
+
+  /** Session identity, not the shared Jira key, determines pipeline ownership. */
+  forSession(sessionId: string): WorkSummary | undefined {
+    const work = this.workBySession(sessionId)
+    return work && work.state !== 'ABANDONED' ? this.toSummary(work) : undefined
+  }
+
+  /** Lightweight utility state shared by Jira- and PR-linked conversations.
+   *  No session creation, agent prompt, checkout or file operation happens here. */
+  async conversationContext(sessionId: string, directory?: string): Promise<WorkSummary> {
+    const chat = getDb().prepare('SELECT ticket_key, directory, pr_url FROM chat WHERE session_id = ?').get(sessionId) as
+      { ticket_key: string | null; directory: string; pr_url: string | null } | undefined
+    if (!chat) throw new Error('Conversation not found.')
+    const existing = this.workBySession(sessionId)
+    if (!chat.ticket_key && !chat.pr_url && (!existing || existing.state === 'ABANDONED')) throw new Error('Link this conversation to a Jira ticket or PR to enable its review utilities.')
+    if (existing && existing.state !== 'ABANDONED' && !directory) {
+      sessionIndex.register(sessionId, 'work')
+      return this.toSummary(existing)
+    }
+    if (existing && existing.state !== 'ABANDONED') {
+      if (existing.state === 'SHIPPED') throw new Error('The shipped run’s review folder cannot be reassigned. Start another linked conversation for new work.')
+      if (reviewManager.isBusyReviewing(existing.id) || shipManager.isShipping(existing.id)) throw new Error('Stop review or wait for shipping before changing the review folder.')
+      await reviewManager.requireStoppedReviews(existing.id)
+    }
+    const [session, active] = await Promise.all([
+      openCodeService.api.session.get({ sessionID: sessionId }),
+      openCodeService.api.session.active()
+    ])
+    const folder = directory ? await realpath(directory) : session.location.directory
+    let worktreeDir = folder
+    let repoDir = folder
+    let branch = ''
+    let blocker: string | undefined
+    try {
+      worktreeDir = (await exec('git', ['-C', folder, 'rev-parse', '--show-toplevel'])).stdout.trim()
+      const common = (await exec('git', ['-C', worktreeDir, 'rev-parse', '--git-common-dir'])).stdout.trim()
+      repoDir = dirname(resolve(worktreeDir, common))
+      branch = (await exec('git', ['-C', worktreeDir, 'branch', '--show-current'])).stdout.trim()
+      if (!branch) blocker = 'This conversation is on detached HEAD. Check out a branch before review or shipping.'
+    } catch {
+      blocker = 'Choose a Git repository or worktree for this conversation before reviewing or shipping. Its transcript and files stay where they are.'
+    }
+    if (existing && existing.state !== 'ABANDONED') {
+      if (reviewManager.isBusyReviewing(existing.id) || shipManager.isShipping(existing.id)) throw new Error('Review or shipping started while selecting the folder; retry once it finishes.')
+      if (existing.pr_url && existing.branch && (existing.repo_dir !== repoDir || existing.branch !== branch)) throw new Error('This conversation is linked to a PR. Choose that PR’s existing repository and branch, not an unrelated checkout.')
+    }
+    // Recheck after the service/FS probes: the user may have unlinked meanwhile.
+    const linked = getDb().prepare('SELECT ticket_key FROM chat WHERE session_id = ?').get(sessionId) as { ticket_key: string | null } | undefined
+    if (!linked || linked.ticket_key !== chat.ticket_key) throw new Error('Conversation properties changed while loading its utilities; retry.')
+    // Concurrent opens must share the same review state, not create two runs.
+    const latest = this.forSession(sessionId)
+    if (latest && !directory) return latest
+    if (latest && latest.id !== existing?.id) throw new Error('Conversation settings changed; retry selecting the review folder.')
+    const now = Date.now()
+    const state: WorkState = sessionId in active ? 'BUILDING' : 'WAITING_HUMAN'
+    const id = existing && existing.state !== 'ABANDONED' ? existing.id : randomUUID()
+    if (existing && existing.state !== 'ABANDONED') {
+      getDb().prepare('UPDATE work SET repo_dir = ?, worktree_dir = ?, branch = ?, state = ?, blocker = ?, owns_worktree = 0, parent_work_id = NULL, review_head = NULL, review_base = NULL, updated_at = ? WHERE id = ?')
+        .run(repoDir, worktreeDir, branch, state, blocker ?? null, now, id)
+    } else {
+      getDb().prepare(`INSERT INTO work(id, ticket_key, repo_dir, branch, worktree_dir, owns_worktree, mode, state, session_id, pr_url, blocker, created_at, updated_at)
+        VALUES(?,?,?,?,?,0,'interactive',?,?,?,?,?,?)`)
+        .run(id, chat.ticket_key ?? '', repoDir, branch, worktreeDir, state, sessionId, chat.pr_url, blocker ?? null, now, now)
+    }
+    sessionIndex.register(sessionId, 'work')
+    this.emit(id, state)
+    return this.toSummary(getDb().prepare('SELECT * FROM work WHERE id = ?').get(id) as WorkRow)
+  }
+
+  /** Removing a conversation never deletes its folder or branch. */
+  async forgetConversation(sessionId: string): Promise<void> {
+    const work = this.workBySession(sessionId)
+    if (!work || work.state === 'ABANDONED') return
+    if (reviewManager.isBusyReviewing(work.id) || shipManager.isShipping(work.id)) throw new Error('Stop review or wait for shipping before deleting this conversation.')
+    await reviewManager.requireStoppedReviews(work.id)
+    if (reviewManager.isBusyReviewing(work.id) || shipManager.isShipping(work.id)) throw new Error('Review or shipping started; wait before deleting this conversation.')
+    getDb().prepare("UPDATE work SET state = 'ABANDONED', session_id = NULL, updated_at = ? WHERE id = ?").run(Date.now(), work.id)
+    this.buildRevisions.delete(sessionId)
+    sessionIndex.register(sessionId, 'chat')
+    this.emit(work.id, 'ABANDONED')
+  }
+
+  /** Ticket tagging is a property update, not a new pipeline/run. */
+  async setTicketProperty(sessionId: string, ticketKey: string | null): Promise<void> {
+    const work = this.workBySession(sessionId)
+    if (!work || work.state === 'ABANDONED') return
+    const chat = getDb().prepare('SELECT pr_url FROM chat WHERE session_id = ?').get(sessionId) as { pr_url: string | null } | undefined
+    if (!ticketKey && !chat?.pr_url) {
+      await this.forgetConversation(sessionId)
+      return
+    }
+    getDb().prepare('UPDATE work SET ticket_key = ? WHERE id = ?').run(ticketKey ?? '', work.id)
+    this.emit(work.id, work.state as WorkState)
+  }
+
+  async requireEditableLinks(sessionId: string): Promise<void> {
+    const work = this.workBySession(sessionId)
+    if (!work || work.state === 'ABANDONED') return
+    if (reviewManager.isBusyReviewing(work.id) || shipManager.isShipping(work.id)) throw new Error('Stop review or wait for shipping before changing the conversation’s links.')
+    await reviewManager.requireStoppedReviews(work.id)
   }
 
   async start(input: StartWorkInput): Promise<WorkSummary> {
@@ -166,9 +271,13 @@ class WorkManager {
       agent: input.agentID ?? null,
       model: input.model ? { providerID: input.model.providerID, id: input.model.id } : null,
       location: { directory: worktreeDir },
-      metadata: { revva: { kind: 'work', workId: id, ticketKey: ticket.key, phase: 'build', mode: input.mode } }
+      metadata: { revva: { kind: 'chat', workId: id, ticketKey: ticket.key, phase: 'build', mode: input.mode } }
     })
     getDb().prepare('UPDATE work SET session_id = ? WHERE id = ?').run(session.id, id)
+    // A started ticket is also an ordinary conversation with ticket properties.
+    getDb().prepare(`INSERT INTO chat(session_id, title, directory, agent_id, provider_id, model_id, ticket_key, created_at, updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?)`)
+      .run(session.id, `${ticket.key}: ${ticket.summary}`, worktreeDir, input.agentID ?? null, input.model?.providerID ?? null, input.model?.id ?? null, ticket.key, now, now)
     sessionIndex.register(session.id, 'work')
 
     const prompt = await this.buildPrompt(ticket.key, input)
@@ -217,6 +326,7 @@ class WorkManager {
       `Pipeline context (Revva):`,
       '- You are in a dedicated git worktree on branch ' + slugBranch(ticketKey) + '.',
       '- Commit your work with clear messages referencing ' + ticketKey + '. Do not push, do not open PRs — Revva ships after review.',
+      BUILD_COMPLETION_INSTRUCTIONS,
       ...modeLines
     ].join('\n')
   }
@@ -232,6 +342,17 @@ class WorkManager {
     const root = settingGet<string>('worktreeRoot') || join(repoDir, '..', `${basename(repoDir)}-worktrees`)
     const name = branch.replace(/\//g, '-')
 
+    // Both creation paths use the same explicit base, never the checkout's
+    // current feature branch. The service otherwise defaults to detached HEAD.
+    const base = baseRef ?? (await defaultBranch(repoDir))
+    if (!(await refExists(repoDir, base))) {
+      await exec('git', ['-C', repoDir, 'fetch', '--all', '--prune'], { timeout: 120_000 }).catch(() => undefined)
+      if (!(await refExists(repoDir, base))) throw new Error(`Base branch ${base} was not found in ${repoDir}.`)
+    }
+    const baseHead = (await exec('git', ['-C', repoDir, 'rev-parse', base])).stdout.trim()
+    const branchExists = await refExists(repoDir, `refs/heads/${branch}`)
+    let serviceDir: string | undefined
+
     // Prefer the service-managed worktree API.
     try {
       const api = openCodeService.api
@@ -241,20 +362,25 @@ class WorkManager {
         const info = await api.worktree.create({
           projectID: project.id,
           name,
-          ...(baseRef ? { from: baseRef } : {})
-        } as never)
-        const dir = (info as unknown as { directory?: string }).directory
-        if (dir) return dir
+          branch,
+          from: baseHead
+        })
+        serviceDir = info.directory
       }
     } catch {
       // fall through to git
     }
 
-    // Lazy fetch: only hit the network when the requested base isn't already local.
-    const base = baseRef ?? (await defaultBranch(repoDir))
-    if (!(await refExists(repoDir, base))) {
-      await exec('git', ['-C', repoDir, 'fetch', '--all', '--prune'], { timeout: 120_000 }).catch(() => undefined)
-      if (!(await refExists(repoDir, base))) throw new Error(`Base branch ${base} was not found in ${repoDir}.`)
+    if (serviceDir) {
+      // A materialized folder must satisfy the branch contract. Do not silently
+      // create a second folder or reset anything if the service returned a bad one.
+      const attached = (await exec('git', ['-C', serviceDir, 'branch', '--show-current'])).stdout.trim()
+      if (attached !== branch) throw new Error(`OpenCode created ${serviceDir} on ${attached || 'detached HEAD'}, not ${branch}. No build was started; inspect this worktree before retrying.`)
+      const head = (await exec('git', ['-C', serviceDir, 'rev-parse', 'HEAD'])).stdout.trim()
+      if (!branchExists && head !== baseHead) throw new Error(`OpenCode created ${serviceDir} at an unexpected base. No build was started; inspect this worktree before retrying.`)
+      const configured = await exec('git', ['-C', serviceDir, 'config', '--get', `branch.${branch}.base`]).then((r) => r.stdout.trim()).catch(() => '')
+      if (!configured) await exec('git', ['-C', serviceDir, 'config', `branch.${branch}.base`, baseHead])
+      return serviceDir
     }
 
     await mkdir(root, { recursive: true }).catch(() => undefined)
@@ -265,7 +391,6 @@ class WorkManager {
     const receipt = `revva-create:${process.pid}:${randomUUID()}`
     // Existing branch (rerun after a crashed/removed worktree): adopt it as-is rather
     // than fail or reset — its commits are the point. Same policy as a taken directory.
-    const branchExists = await refExists(repoDir, `refs/heads/${branch}`)
     try {
       // Phase 1: locked, detached, no checkout — ours by receipt alone; branch untouched.
       await exec('git', [
@@ -277,7 +402,8 @@ class WorkManager {
       } else {
         await exec('git', ['-C', target, 'checkout', '-b', branch, base], { timeout: 120_000 })
       }
-      await exec('git', ['-C', target, 'config', 'branch.' + branch + '.base', base])
+      const configured = await exec('git', ['-C', target, 'config', '--get', `branch.${branch}.base`]).then((r) => r.stdout.trim()).catch(() => '')
+      if (!configured) await exec('git', ['-C', target, 'config', 'branch.' + branch + '.base', baseHead])
       await exec('git', ['-C', repoDir, 'worktree', 'unlock', target]).catch(() => undefined)
     } catch (err) {
       // Leave nothing half-built: only remove what our receipt still owns.
@@ -320,7 +446,7 @@ class WorkManager {
   }
 
   private workBySession(sessionId: string): WorkRow | undefined {
-    return getDb().prepare('SELECT * FROM work WHERE session_id = ?').get(sessionId) as WorkRow | undefined
+    return getDb().prepare('SELECT * FROM work WHERE session_id = ? ORDER BY updated_at DESC LIMIT 1').get(sessionId) as WorkRow | undefined
   }
 
   private onEvent(e: RawEvent): void {
@@ -333,6 +459,10 @@ class WorkManager {
     if (!work) return
 
     switch (e.type) {
+      case 'session.execution.started': {
+        this.buildRevisions.set(sessionId, (this.buildRevisions.get(sessionId) ?? 0) + 1)
+        break
+      }
       case 'session.text.delta': {
         if (work.state !== 'BUILDING') return
         streamBuffer.push({
@@ -347,12 +477,7 @@ class WorkManager {
       case 'session.execution.succeeded': {
         if (work.state !== 'BUILDING') return
         streamBuffer.flush(sessionId)
-        // M4: build finished → concurrent read-only reviewer fan-out (no more auto-approve).
-        this.setState(work.id, 'REVIEW')
-        void reviewManager.startRound(work.id, reviewManager.latestRound(work.id) + 1, true).catch((err) => {
-          console.warn('[work] review fan-out failed:', describeError(err))
-          this.setReviewState(work.id, 'WAITING_HUMAN', `Could not start review: ${describeError(err)}`)
-        })
+        void this.finishBuildTurn(work, this.buildRevisions.get(sessionId) ?? 0)
         break
       }
       case 'session.execution.failed':
@@ -361,6 +486,29 @@ class WorkManager {
         if (work.state === 'BUILDING') this.setState(work.id, 'WAITING_HUMAN', `Build ${e.type === 'session.execution.failed' ? 'failed' : 'was interrupted'}.`)
         break
       }
+    }
+  }
+
+  /** A successful prompt execution can be a refusal or a planning pause. */
+  private async finishBuildTurn(work: WorkRow, revision: number): Promise<void> {
+    const sessionId = work.session_id!
+    const stillCurrent = (): boolean => this.workBySession(sessionId)?.state === 'BUILDING' && (this.buildRevisions.get(sessionId) ?? 0) === revision
+    try {
+      const text = await fetchLastAssistantText(sessionId)
+      if (!stillCurrent()) return
+      const lastLine = text.split('\n').map((line) => line.trim().replace(/[*`>_#]/g, '').trim()).filter(Boolean).at(-1)
+      if (lastLine !== 'REVVA: DONE') {
+        this.setState(work.id, 'WAITING_HUMAN', 'The build turn ended without declaring implementation complete. Review was not started. Read the agent’s reply and send a follow-up, or start review manually when ready.')
+        return
+      }
+      this.setState(work.id, 'REVIEW')
+      await reviewManager.startRound(work.id, reviewManager.latestRound(work.id) + 1, true)
+    } catch (err) {
+      if ((this.buildRevisions.get(sessionId) ?? 0) !== revision) return
+      const current = this.workBySession(sessionId)
+      if (!current || !['BUILDING', 'REVIEW'].includes(current.state)) return
+      console.warn('[work] completion/review failed:', describeError(err))
+      this.setReviewState(work.id, 'WAITING_HUMAN', `Could not finish build/start review: ${describeError(err)}`)
     }
   }
 
@@ -373,6 +521,7 @@ class WorkManager {
   async abandonPreflight(id: string): Promise<WorkAbandonPreflight> {
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(id) as WorkRow | undefined
     if (!work) throw new Error('Work not found.')
+    if (work.owns_worktree === 0) throw new Error('This ticket workflow uses an existing conversation and folder. Remove its ticket link to detach the workflow; its files and conversation are kept.')
     const preflight = await preflightWorktreeRemoval(work.repo_dir, work.worktree_dir)
     return {
       workId: work.id,
@@ -409,6 +558,7 @@ class WorkManager {
   async abandon(id: string, confirmedSignature: string, confirmed: boolean): Promise<string | undefined> {
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(id) as WorkRow | undefined
     if (!work) return
+    if (work.owns_worktree === 0) throw new Error('Existing conversation folders are never removed by Abandon. Remove the ticket link instead; files and transcript are kept.')
     if (shipManager.isShipping(id)) throw new Error('Shipping is in progress; wait for it to finish before abandoning this work.')
     // Active review ⇒ refuse before anything (including any cancellation) can happen.
     if (reviewManager.isBusyReviewing(id)) {
@@ -477,6 +627,7 @@ class WorkManager {
     if (work.session_id) {
       sessionIndex.forget(work.session_id)
       await openCodeService.api.session.remove({ sessionID: work.session_id }).catch(() => undefined)
+      getDb().prepare('DELETE FROM chat WHERE session_id = ?').run(work.session_id)
     }
     let note: string | undefined
     try {
@@ -484,7 +635,18 @@ class WorkManager {
     } catch (err) {
       const e = err as { stderr?: string; message?: string }
       const reason = (e.stderr || e.message || 'not fully merged').trim().slice(0, 160)
-      note = `Branch ${work.branch} kept (git refused to delete it: ${reason})`
+      // Legacy service-created worktrees could be detached: the recorded
+      // branch never existed. Confirm absence via the exact ref, not localized
+      // stderr text or refExists() (which also treats git failures as absence).
+      let branchPresent: boolean | undefined
+      try {
+        await exec('git', ['-C', final.repoDir, 'show-ref', '--verify', '--quiet', `refs/heads/${work.branch}`])
+        branchPresent = true
+      } catch (probeError) {
+        if ((probeError as { code?: number }).code === 1) branchPresent = false
+      }
+      if (branchPresent === true) note = `Branch ${work.branch} kept (git refused to delete it: ${reason})`
+      else if (branchPresent === undefined) note = `Work abandoned, but branch ${work.branch} cleanup could not be verified (${reason})`
     }
     this.setState(id, 'ABANDONED')
     return note
@@ -492,13 +654,19 @@ class WorkManager {
 
   /** Follow-up message into a running/finished build session. */
   async followUp(sessionId: string, text: string, images: PromptImage[] = [], queued = false, refs?: PromptRefs): Promise<void> {
-    const work = this.workBySession(sessionId)
+    let work = this.workBySession(sessionId)
     let resumed = false
     if (work) {
+      if (work.state === 'ABANDONED') throw new Error('This work was abandoned; start a new ticket run instead.')
       if (shipManager.isShipping(work.id)) throw new Error('Shipping is in progress; wait for it to finish before sending a follow-up.')
       if (reviewManager.isBusyReviewing(work.id) || work.state === 'REVIEW' || work.state === 'FIXING') {
-        throw new Error('Review is in progress; wait for it to finish or re-run a stuck review before sending a follow-up.')
+        throw new Error('Review is in progress. Use Stop review in the review panel, or wait for it to finish before sending a follow-up.')
       }
+      await reviewManager.requireStoppedReviews(work.id)
+      work = this.workBySession(sessionId)
+      if (!work || work.state === 'ABANDONED') throw new Error('This work was removed or abandoned while checking the session.')
+      // Recheck after the service probe: a reviewer/ship may have started.
+      if (reviewManager.isBusyReviewing(work.id) || shipManager.isShipping(work.id) || work.state === 'REVIEW' || work.state === 'FIXING') throw new Error('Review or shipping started while checking the session; try again once it finishes.')
       // A human re-prompting a settled build takes it back through review.
       if (['WAITING_HUMAN', 'APPROVED', 'SHIPPED'].includes(work.state)) {
         this.setState(work.id, 'BUILDING')
@@ -510,12 +678,13 @@ class WorkManager {
     const skills = refs ? skillAttachments(refs) : []
     const payload = {
       sessionID: sessionId,
-      text,
+      text: work ? `${text}\n\n${BUILD_COMPLETION_INSTRUCTIONS}` : text,
       ...(files.length ? { files } : {}),
       ...(skills.length ? { skills } : {}),
       delivery: (queued ? 'queue' : 'steer') as 'queue' | 'steer'
     }
     try {
+      this.buildRevisions.set(sessionId, (this.buildRevisions.get(sessionId) ?? 0) + 1)
       await openCodeService.api.session.prompt(payload)
     } catch (err) {
       // Steer refused (session state raced) — park the follow-up so it is not lost.

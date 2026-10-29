@@ -9,6 +9,10 @@ import { EventEmitter } from 'node:events'
 import type { PushEvent } from '@shared/types'
 import { pushToWindows } from '../push'
 import { openCodeService } from './service'
+import { streamBuffer } from './stream-buffer'
+
+const TRANSCRIPT_RESET_EVENTS = new Set(['session.message.content.updated', 'session.revert.committed', 'session.compaction.ended'])
+const TOOL_STATE_EVENTS = new Set(['session.tool.called', 'session.tool.success', 'session.tool.failed'])
 
 class EventBus extends EventEmitter {
   private abort: AbortController | undefined
@@ -51,6 +55,16 @@ class EventBus extends EventEmitter {
           if ((event as RawEvent).type === 'server.connected') this.emit('stream:reconnect')
           if (process.env.REVVA_DEBUG_EVENTS) console.log('[bus]', (event as RawEvent).type)
           this.emit('event', event)
+          const raw = event as RawEvent
+          if ((raw.type === 'session.step.ended' || raw.type === 'session.step.failed') && typeof raw.data?.sessionID === 'string') {
+            streamBuffer.flush(raw.data.sessionID)
+          }
+          if (TRANSCRIPT_RESET_EVENTS.has(raw.type) && typeof raw.data?.sessionID === 'string') {
+            pushToWindows({ kind: 'session.transcript', sessionId: raw.data.sessionID })
+          }
+          if (TOOL_STATE_EVENTS.has(raw.type) && typeof raw.data?.sessionID === 'string') {
+            pushToWindows({ kind: 'chat.tool', sessionId: raw.data.sessionID, tool: String(raw.data.name ?? 'tool'), state: raw.type })
+          }
           if ((event as RawEvent).type === 'mcp.status.changed') {
             pushToWindows({ kind: 'mcp.changed' })
           }
@@ -115,7 +129,7 @@ export interface RawEvent {
 /**
  * True when the event says the session started running, false when it stopped,
  * undefined when the event says nothing about running state. Shared with the
- * watchdog so "still marked busy" cannot drift from what the UI is told.
+ * metrics so "still marked busy" cannot drift from what the UI is told.
  */
 export function runningSignal(event: RawEvent): boolean | undefined {
   if (event.type === 'session.execution.started') return true

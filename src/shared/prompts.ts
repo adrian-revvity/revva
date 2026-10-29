@@ -8,7 +8,7 @@ export const DEFAULT_START_PROMPT = `You are working on Jira ticket {ticketKey}:
 
 {description}
 
-Tackle this ticket end to end: read the whole ticket, understand the surrounding code before touching it, and follow good engineering practices — small focused changes, tests around new behavior, no drive-by refactors. Use available skills and subagents where they help (planning, research, review). Keep the tree committable and commit your work with clear messages referencing {ticketKey}.
+Tackle this ticket end to end: read the whole ticket, understand the surrounding code before touching it, and follow the repository's engineering and testing policies — small focused changes, no drive-by refactors. Use available skills and subagents where they help with planning or research. Keep the tree committable and commit your work with clear messages referencing {ticketKey}.
 
 Do not push and do not open PRs — revva runs reviews and ships for you.`
 
@@ -35,6 +35,12 @@ Write Markdown that will be embedded inside the existing PR body:
 
 export const PROMPT_PLACEHOLDER_HELP =
   'Placeholders: {ticketKey} {summary} {description} {prUrl} {prNumber} {repo} {title} {base} {head}'
+
+/** Always appended, including when the user customized the start template. */
+export const BUILD_COMPLETION_INSTRUCTIONS = `Revva implementation phase:
+- Do not launch code-review, test-audit or UI-review agents during implementation; Revva runs the independent review team after you finish. Run the repository's appropriate verification yourself.
+- Only when the ticket is fully implemented, verified according to repo policy, and committed, end your final message with exactly REVVA: DONE on its own last line.
+- If blocked, missing a dependency/plugin, asking a question, or only presenting a plan, explain what is needed and do NOT emit REVVA: DONE. Ending a turn alone does not start review.`
 
 /** Replace {known} placeholders; unknown ones are left untouched so typos stay visible. */
 export function renderPrompt(template: string, vars: Record<string, string>): string {

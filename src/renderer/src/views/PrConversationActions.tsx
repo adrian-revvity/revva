@@ -146,7 +146,7 @@ export function PrMenu({
     <>
       <DropdownMenu onOpenChange={setOpen}>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm" className="h-6 gap-1 px-2 text-[11px]">
+          <Button variant="outline" size="sm" className="shrink-0">
             <Github data-icon="inline-start" />
             {data ? `PR #${data.number}` : 'PR'} <ChevronDown data-icon="inline-end" />
           </Button>

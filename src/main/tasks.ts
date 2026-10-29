@@ -1,8 +1,8 @@
 /**
- * One-click task sessions outside the full pipeline:
+ * One-click tasks create ordinary conversations pre-linked to a ticket:
  * - ticketSession: "Open a session related to that ticket" — an ordinary OpenCode
  *   session (chat) in the ticket's repo, seeded with the tunable tackle prompt.
- *   No worktree, no state machine; revva only keeps it in the chat index.
+ *   No new checkout is created; the link enables the shared conversation utilities.
  * PR reviews live in github.ts (they need a worktree checkout).
  */
 import { homedir } from 'node:os'

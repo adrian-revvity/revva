@@ -15,6 +15,7 @@
  */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { existsSync } from 'node:fs'
 import { lstat } from 'node:fs/promises'
 import { basename, isAbsolute, join } from 'node:path'
 import { openCodeService } from './opencode/service'
@@ -52,7 +53,10 @@ class WorktreeManager {
     const dirs = new Set<string>()
     for (const w of getDb().prepare('SELECT path FROM workspace').all() as Array<{ path: string }>) dirs.add(w.path)
     for (const w of getDb().prepare('SELECT DISTINCT repo_dir FROM work').all() as Array<{ repo_dir: string }>) dirs.add(w.repo_dir)
-    return [...dirs]
+    // A workspace may be a plain container folder and work rows may point at
+    // deleted test repos; only real checkouts have a .git entry, and querying
+    // anything else makes git fail noisily on every listing.
+    return [...dirs].filter((dir) => existsSync(join(dir, '.git')))
   }
 
   /** All linked worktrees across known repos, marked with revva ownership/busy state. */
@@ -109,6 +113,16 @@ class WorktreeManager {
           const list = await openCodeService.api.worktree.list({ projectID: projectId })
           for (const wt of list) {
             if (!wt.directory || wt.directory === repoDir) continue
+            // OpenCode's registry is append-only: rows for worktrees removed outside
+            // OpenCode (git worktree remove, rm -rf) linger forever and would show as
+            // ghosts here. Git's listing already covers every real registration, prunable
+            // ones included, so a service row whose folder is gone is never actionable —
+            // drop it instead of surfacing an entry preflight must refuse.
+            try {
+              await lstat(join(wt.directory, '.git'))
+            } catch {
+              continue
+            }
             const work = byDir.get(wt.directory)
             add({
               repoDir,

@@ -52,8 +52,12 @@ class JiraAuth {
       if (existsSync(this.clientPath)) {
         this.client = JSON.parse(readFileSync(this.clientPath, 'utf8')) as ClientReg
       }
-      if (existsSync(this.storePath) && safeStorage.isEncryptionAvailable()) {
-        const json = safeStorage.decryptString(readFileSync(this.storePath))
+      if (existsSync(this.storePath) && (await safeStorage.isAsyncEncryptionAvailable())) {
+        const bytes = readFileSync(this.storePath)
+        const dec = await safeStorage.decryptStringAsync(bytes)
+        // Key rotation: the docs say to decrypt once more to receive the string
+        // under the new key; the second call performs the re-wrap.
+        const json = dec.shouldReEncrypt ? (await safeStorage.decryptStringAsync(bytes)).result : dec.result
         this.tokens = json ? (JSON.parse(json) as Tokens) : undefined
       }
     } catch {
@@ -61,11 +65,11 @@ class JiraAuth {
     }
   }
 
-  private persist(): void {
+  private async persist(): Promise<void> {
     mkdirSync(this.secretsDir, { recursive: true })
     if (this.client) writeFileSync(this.clientPath, JSON.stringify(this.client))
-    if (this.tokens && safeStorage.isEncryptionAvailable()) {
-      writeFileSync(this.storePath, safeStorage.encryptString(JSON.stringify(this.tokens)))
+    if (this.tokens && (await safeStorage.isAsyncEncryptionAvailable())) {
+      writeFileSync(this.storePath, await safeStorage.encryptStringAsync(JSON.stringify(this.tokens)))
     }
   }
 
@@ -140,7 +144,7 @@ class JiraAuth {
         redirect_uri: redirectUri,
         code_verifier: verifier
       })
-      this.persist()
+      await this.persist()
     } finally {
       server.close()
     }
@@ -153,10 +157,10 @@ class JiraAuth {
         grant_type: 'refresh_token',
         refresh_token: this.tokens.refresh_token
       })
-      this.persist()
+      await this.persist()
     } catch (err) {
       this.tokens = undefined
-      this.persist()
+      await this.persist()
       throw err
     }
   }

@@ -49,7 +49,9 @@ class TriageManager {
     const out: FinishedRun[] = []
     const chats = db
       .prepare(
-        'SELECT session_id, title, directory, updated_at FROM chat WHERE (seen_at IS NULL OR seen_at < updated_at) AND updated_at >= ?'
+        `SELECT session_id, title, directory, updated_at FROM chat
+         WHERE (seen_at IS NULL OR seen_at < updated_at) AND updated_at >= ?
+           AND NOT EXISTS (SELECT 1 FROM work WHERE work.session_id = chat.session_id AND work.state != 'ABANDONED')`
       )
       .all(cutoff) as Array<{ session_id: string; title: string; directory: string; updated_at: number }>
     for (const c of chats) {
@@ -81,7 +83,7 @@ class TriageManager {
         source: 'work',
         workId: w.id,
         workState: w.state as FinishedRun['workState'],
-        owner: w.ticket_key,
+        owner: w.ticket_key || (db.prepare('SELECT title FROM chat WHERE session_id = ?').get(w.session_id) as { title: string } | undefined)?.title || 'Conversation',
         directory: w.worktree_dir,
         updatedAt: w.updated_at
       })

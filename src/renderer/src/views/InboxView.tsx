@@ -452,7 +452,7 @@ function FinishedRunCard({
       : window.revva.work.messages(item.sessionID),
     enabled: visible,
     staleTime: Infinity,
-    select: (messages) => {
+    select: ({ messages }) => {
       for (let i = messages.length - 1; i >= 0; i--) {
         const message = messages[i]
         if (message?.role === 'assistant' && message.text.trim()) return message.text

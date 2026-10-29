@@ -22,26 +22,30 @@ export interface DeltaSource {
 
 interface Entry {
   text: string
-  timer: NodeJS.Timeout | undefined
   source: DeltaSource
 }
 
 class StreamBuffer {
   private accum = new Map<string, Entry>()
+  private dirty = new Set<string>()
+  private timer: NodeJS.Timeout | undefined
 
   /** Feed one raw delta; accumulated pushes start/continue on their own timer. */
   push(source: DeltaSource): void {
     const key = `${source.sessionId}:${source.messageId}`
-    const entry = this.accum.get(key) ?? { text: '', timer: undefined, source }
+    const entry = this.accum.get(key) ?? { text: '', source }
     entry.text += source.text
     entry.source = source
     this.accum.set(key, entry)
-    if (entry.timer) return
-    entry.timer = setTimeout(() => {
-      entry.timer = undefined
-      const cur = this.accum.get(key)
-      if (!cur) return
-      this.send(cur.source, cur.text)
+    this.dirty.add(key)
+    if (this.timer) return
+    this.timer = setTimeout(() => {
+      this.timer = undefined
+      for (const id of this.dirty) {
+        const cur = this.accum.get(id)
+        if (cur) this.send(cur.source, cur.text)
+      }
+      this.dirty.clear()
     }, COALESCE_MS)
   }
 
@@ -49,10 +53,22 @@ class StreamBuffer {
   flush(sessionId: string): void {
     for (const [key, entry] of this.accum) {
       if (!key.startsWith(`${sessionId}:`)) continue
-      if (entry.timer) clearTimeout(entry.timer)
       this.send(entry.source, entry.text)
       this.accum.delete(key)
+      this.dirty.delete(key)
     }
+    if (!this.dirty.size && this.timer) {
+      clearTimeout(this.timer)
+      this.timer = undefined
+    }
+  }
+
+  /** Missing SSE fragments invalidate the accumulator; history repairs the gap. */
+  reset(): void {
+    if (this.timer) clearTimeout(this.timer)
+    this.timer = undefined
+    this.accum.clear()
+    this.dirty.clear()
   }
 
   private send(source: DeltaSource, text: string): void {

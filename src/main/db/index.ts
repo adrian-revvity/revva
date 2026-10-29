@@ -135,6 +135,11 @@ function migrate(db: Database.Database): void {
     addColumnIfMissing(db, 'ticket', 'parent_key', 'TEXT')
     db.exec('PRAGMA user_version = 6;')
   }
+  if (version < 7) {
+    // Linked chats borrow an existing folder; they never grant deletion rights.
+    addColumnIfMissing(db, 'work', 'owns_worktree', 'INTEGER NOT NULL DEFAULT 1')
+    db.exec('PRAGMA user_version = 7;')
+  }
 }
 
 function addColumnIfMissing(db: Database.Database, table: string, column: string, decl: string): boolean {

@@ -28,13 +28,14 @@ import { ConnectionStatus } from '@/components/ConnectionStatus'
 import { cn } from '@/lib/utils'
 import { subscribeTranscripts } from '@/lib/transcript-stream'
 import { workStateLabels } from '@/lib/work-state'
+import { parsePrRef } from '@shared/pr-ref'
 import { SetupView } from '@/views/Setup'
 import { ChatView } from '@/views/Chat'
 import { NewChatDialog } from '@/views/NewChatDialog'
 import { WorktreesDialog, WorktreeRemovalDialog, type WorktreeRemovalRow } from '@/views/WorktreesDialog'
 import { DashboardView } from '@/views/DashboardView'
 import { BoardView } from '@/views/BoardView'
-import { WorkCockpit, WorkDetailsPopover } from '@/views/WorkCockpit'
+import { WorkCockpit } from '@/views/WorkCockpit'
 import { InboxView, useInbox } from '@/views/InboxView'
 import { useGithubAlerts } from '@/views/GitHubView'
 import { ScriptsView } from '@/views/ScriptsView'
@@ -134,8 +135,8 @@ export default function App(): React.JSX.Element {
   const st = status.data
   const stateInfo = serviceStateLabels[st?.state ?? 'connecting']
   const activeWork =
-    view.kind === 'work' ? works.data?.find((w) => w.id === view.workId) : undefined
-  const activeChat = view.kind === 'chat' ? chats.data?.find((c) => c.sessionId === view.sessionId) : undefined
+    view.kind === 'work' ? works.data?.find((w) => w.id === view.workId)
+      : view.kind === 'chat' ? works.data?.find((w) => w.sessionId === view.sessionId && w.state !== 'ABANDONED') : undefined
   const sessionActivity = (sessionId: string): SessionActivity => {
     if (status.data?.state !== 'connected' || activity.isError) return 'Unavailable'
     if (pending.some((item) => item.sessionID === sessionId)) return 'Needs you'
@@ -144,10 +145,12 @@ export default function App(): React.JSX.Element {
   }
   const selectedSessionId = view.kind === 'chat' ? view.sessionId : activeWork?.sessionId
   const selectedActivity = selectedSessionId ? sessionActivity(selectedSessionId) : undefined
-  const ticketWorks = (works.data ?? []).filter((w) => w.state !== 'ABANDONED')
+  const ticketWorks = (works.data ?? []).filter((w) => !!w.ticketKey && w.state !== 'ABANDONED')
   const ongoingWorks = ticketWorks.filter((w) => w.state !== 'SHIPPED')
   const ticketGroups = new Map<string, { works: typeof ticketWorks; chats: NonNullable<typeof chats.data> }>()
   for (const w of ticketWorks) {
+    // One conversation per session, even when it also has pipeline properties.
+    if (chats.data?.some((c) => c.sessionId === w.sessionId)) continue
     const group = ticketGroups.get(w.ticketKey) ?? { works: [], chats: [] }
     group.works.push(w)
     ticketGroups.set(w.ticketKey, group)
@@ -158,13 +161,20 @@ export default function App(): React.JSX.Element {
     group.chats.push(chat)
     ticketGroups.set(chat.ticketKey, group)
   }
+  const prGroups = new Map<string, NonNullable<typeof chats.data>>()
+  for (const chat of chats.data ?? []) {
+    if (chat.ticketKey || !chat.prUrl) continue
+    const group = prGroups.get(chat.prUrl) ?? []
+    group.push(chat)
+    prGroups.set(chat.prUrl, group)
+  }
   const runningWorks = ongoingWorks.filter(
     (w) => w.id !== activeWork?.id && (w.state === 'BUILDING' || w.state === 'REVIEW' || w.state === 'FIXING' || w.state === 'REWORK' || w.state === 'WAITING_HUMAN')
   )
   // Inbox badge: pending questions/permissions + finished runs nobody has seen.
   const inboxCount =
     pending.length +
-    (chats.data ?? []).filter((c) => c.unread).length +
+    (chats.data ?? []).filter((c) => c.unread && !works.data?.some((w) => w.sessionId === c.sessionId && w.state !== 'ABANDONED')).length +
     (works.data ?? []).filter((w) => w.unread).length
   const waitingCount = inboxCount
 
@@ -173,13 +183,16 @@ export default function App(): React.JSX.Element {
     void window.revva.chat.remove(sessionId).then(() => {
       qc.invalidateQueries({ queryKey: ['chats'] })
       if (view.kind === 'chat' && view.sessionId === sessionId) setView({ kind: 'dashboard' })
-    })
+    }).catch((err) => alert(`Could not delete conversation: ${(err as Error).message}`))
   }
   const unlinkFromTicket = (sessionId: string): void => {
     void window.revva.chat
       .setTicket(sessionId, null)
-      .then(() => qc.invalidateQueries({ queryKey: ['chats'] }))
-      .catch((err) => console.error('[chat] unlink failed:', err))
+      .then(() => {
+        void qc.invalidateQueries({ queryKey: ['chats'] })
+        void qc.invalidateQueries({ queryKey: ['works'] })
+      })
+      .catch((err) => alert(`Could not remove ticket link: ${(err as Error).message}`))
   }
   /** Hover actions on a chat row: unlink while it lives in a ticket group, plus delete. */
   const chatActions = (chat: { sessionId: string; title: string; ticketKey?: string }): React.JSX.Element => (
@@ -220,6 +233,12 @@ export default function App(): React.JSX.Element {
     )
   }
   const abandonWork = (workId: string, ticketKey: string): void => {
+    const work = works.data?.find((w) => w.id === workId)
+    if (work?.ownsWorktree === false && work.sessionId) {
+      unlinkFromTicket(work.sessionId)
+      setView({ kind: 'chat', sessionId: work.sessionId })
+      return
+    }
     // Preview first (read-only): the dialog shows exactly what removal destroys
     // and demands a per-worktree tick whenever files would go. A thrown refusal
     // (locked, unregistered, unreadable state) means nothing may be touched.
@@ -251,6 +270,7 @@ export default function App(): React.JSX.Element {
         setAbandonTarget(null)
         if (note) alert(note)
         qc.invalidateQueries({ queryKey: ['works'] })
+        qc.invalidateQueries({ queryKey: ['chats'] })
         if (view.kind === 'work' && view.workId === workId) setView({ kind: 'dashboard' })
       })
       .catch((err) => {
@@ -335,7 +355,7 @@ export default function App(): React.JSX.Element {
                         activity={w.sessionId && w.state !== 'WAITING_HUMAN' ? sessionActivity(w.sessionId) : undefined}
                         unread={!!w.unread} active={view.kind === 'work' && view.workId === w.id}
                         onClick={() => setView({ kind: 'work', workId: w.id })}
-                        actions={<NavAction title="Abandon work" onClick={() => abandonWork(w.id, w.ticketKey)} />} />
+                        actions={<NavAction title={w.ownsWorktree === false ? 'Remove ticket link (keeps files and conversation)' : 'Abandon work'} onClick={() => abandonWork(w.id, w.ticketKey)} />} />
                     ))}
                     {group.chats.map((c) => (
                       <NavButton key={c.sessionId} icon={c.prUrl ? <Hammer className="size-4 shrink-0" /> : <MessageSquare className="size-4 shrink-0" />} label={c.title}
@@ -352,6 +372,32 @@ export default function App(): React.JSX.Element {
             ))}
           </div>
           <Separator className="my-2" />
+          {prGroups.size > 0 && <>
+            <h2 className="px-3 pb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Pull requests</h2>
+            <div className="px-2">
+              {[...prGroups].map(([url, conversations]) => {
+                const ref = parsePrRef(url)
+                return <Collapsible key={url} defaultOpen>
+                  <CollapsibleTrigger className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[13px] font-medium hover:bg-sidebar-accent" title={url}>
+                    <Github className="size-3.5 shrink-0" />
+                    <span className="min-w-0 flex-1 truncate">{ref?.repo ? `${ref.repo}#${ref.number}` : url}</span>
+                    <span className="text-[10px] text-muted-foreground">{conversations.length}</span>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent>
+                    <div className="ml-3 border-l pl-1">
+                      {conversations.map((chat) => <NavButton key={chat.sessionId} icon={<MessageSquare className="size-4" />} label={chat.title}
+                        activity={sessionActivity(chat.sessionId)} unread={!!chat.unread} active={view.kind === 'chat' && view.sessionId === chat.sessionId}
+                        onClick={() => {
+                          setView({ kind: 'chat', sessionId: chat.sessionId })
+                          if (chat.unread) void window.revva.chat.markSeen(chat.sessionId).then(() => chats.refetch())
+                        }} actions={chatActions(chat)} />)}
+                    </div>
+                  </CollapsibleContent>
+                </Collapsible>
+              })}
+            </div>
+            <Separator className="my-2" />
+          </>}
           <h2 className="px-3 pb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
             Chats
           </h2>
@@ -367,7 +413,7 @@ export default function App(): React.JSX.Element {
           </div>
           <div className="px-2">
             {chats.isLoading && <Skeleton className="mx-1 h-8" />}
-            {chats.data?.filter((c) => !c.ticketKey).map((c) => (
+            {chats.data?.filter((c) => !c.ticketKey && !c.prUrl).map((c) => (
               <NavButton
                 key={c.sessionId}
                 icon={c.prUrl ? <Hammer className="size-4 shrink-0" /> : <MessageSquare className="size-4 shrink-0" />}
@@ -438,7 +484,7 @@ export default function App(): React.JSX.Element {
       <main className="flex min-w-0 flex-1 flex-col">
         <div className="drag-region flex h-11 shrink-0 items-center gap-2 border-b px-3">
           <span className="no-drag min-w-0 truncate text-[13px] font-medium text-muted-foreground">
-            {view.kind === 'work' ? activeWork?.ticketKey : view.kind === 'chat' ? (activeChat?.title ?? 'Chat') : <span className="capitalize">{view.kind}</span>}
+            {view.kind === 'work' || view.kind === 'chat' ? 'Conversation' : <span className="capitalize">{view.kind}</span>}
           </span>
           {selectedActivity && <ActivityBadge activity={selectedActivity} />}
           {runningWorks.slice(0, 3).map((w) => (
@@ -464,7 +510,6 @@ export default function App(): React.JSX.Element {
             <Badge variant="outline" className="no-drag font-normal">+{runningWorks.length - 3} more</Badge>
           )}
           <div className="ml-auto flex items-center gap-2">
-            {activeWork && <WorkDetailsPopover key={activeWork.id} work={activeWork} />}
             <button
               onClick={() => setView({ kind: 'inbox' })}
               className={cn(
@@ -516,7 +561,7 @@ export default function App(): React.JSX.Element {
           <BoardView works={works.data ?? []} onStart={(workId) => setView({ kind: 'work', workId })} />
         ) : view.kind === 'work' ? (
           activeWork ? (
-            <WorkCockpit key={activeWork.sessionId ?? activeWork.id} work={activeWork} />
+            <WorkCockpit key={activeWork.sessionId ?? activeWork.id} work={activeWork} onOpenChat={(sessionId) => setView({ kind: 'chat', sessionId })} />
           ) : (
             <div className="p-8 text-sm text-muted-foreground">Loading work…</div>
           )

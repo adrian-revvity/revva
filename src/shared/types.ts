@@ -91,7 +91,8 @@ export type SettingsKey = z.infer<typeof settingsKeySchema>
 
 export const modelRefSchema = z.object({
   providerID: z.string(),
-  id: z.string()
+  id: z.string(),
+  variant: z.string().optional()
 })
 export type ModelRef = z.infer<typeof modelRefSchema>
 
@@ -125,7 +126,7 @@ export type ChatCreateInput = z.infer<typeof chatCreateInputSchema>
 
 export type ChatRole = 'user' | 'assistant' | 'system' | 'tool'
 
-/** One image rendered inside a transcript bubble (base64 data URL). */
+/** One transcript image: a local attachment URL, or an optimistic base64 data URL. */
 export const chatImageSchema = z.object({
   name: z.string().optional(),
   mime: z.string(),
@@ -410,6 +411,8 @@ export const workSummarySchema = z.object({
   repoDir: z.string(),
   branch: z.string(),
   worktreeDir: z.string(),
+  /** False for a pipeline attached to an existing conversation/folder. */
+  ownsWorktree: z.boolean().optional(),
   parentWorkId: z.string().optional(),
   mode: workModeSchema,
   state: workStateSchema,
@@ -691,22 +694,24 @@ export interface ScriptRunRow {
 
 /* ---------- Events pushed main → renderer ---------- */
 
-/** Stale-run watchdog entry: a session Revva believes is running but has gone quiet. */
-export const staleSessionSchema = z.object({
+export const throughputSnapshotSchema = z.object({
   sessionId: z.string(),
-  kind: z.enum(['chat', 'work', 'review']),
-  /** Work ticket or chat title — what the sidebar calls it. */
-  owner: z.string(),
-  directory: z.string(),
-  /** Epoch ms of the last progress signal. */
-  lastBeat: z.number(),
-  /** How long it has been quiet, in ms. */
-  silentMs: z.number(),
-  workId: z.string().optional(),
-  wakeCount: z.number(),
-  lastWakeError: z.string().optional()
+  tokensPerSecond: z.number(),
+  totalTokens: z.number(),
+  estimated: z.boolean(),
+  elapsedMs: z.number(),
+  msSinceOutput: z.number().nullable(),
+  toolIdleMs: z.number(),
+  modelIdleMs: z.number(),
+  running: z.boolean()
 })
-export type StaleSession = z.infer<typeof staleSessionSchema>
+export type ThroughputSnapshot = z.infer<typeof throughputSnapshotSchema>
+
+/** A refresh includes the overlap row so a mutable last step is reconciled. */
+export interface TranscriptPage {
+  messages: ChatMessage[]
+  reset: boolean
+}
 
 export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('service'), status: serviceStatusSchema }),
@@ -722,17 +727,9 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('session.model'), sessionId: z.string() }),
   z.object({ kind: z.literal('session.agent'), sessionId: z.string() }),
   z.object({ kind: z.literal('session.activity'), sessionId: z.string(), running: z.boolean() }),
+  z.object({ kind: z.literal('session.transcript'), sessionId: z.string() }),
   /** Output tokens / elapsed time since Send; frozen when the interaction ends. */
-  z.object({
-    kind: z.literal('session.throughput'),
-    sessionId: z.string(),
-    tokensPerSecond: z.number(),
-    totalTokens: z.number(),
-    estimated: z.boolean(),
-    elapsedMs: z.number(),
-    msSinceOutput: z.number().nullable(),
-    running: z.boolean()
-  }),
+  z.object({ kind: z.literal('session.throughput'), items: z.array(throughputSnapshotSchema) }),
   z.object({ kind: z.literal('work.updated'), workId: z.string(), state: workStateSchema }),
   z.object({ kind: z.literal('work.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
   z.object({ kind: z.literal('inbox'), items: z.array(pendingItemSchema) }),
@@ -746,9 +743,7 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   /** New Jira comments pending action (M6). */
   z.object({ kind: z.literal('comments'), items: z.array(jiraCommentSchema) }),
   z.object({ kind: z.literal('script.output'), scriptId: z.string(), chunk: z.string() }),
-  z.object({ kind: z.literal('script.status'), status: z.array(scriptStatusSchema) }),
-  /** Stale-run watchdog: sessions marked running that have gone quiet. */
-  z.object({ kind: z.literal('session.stale'), items: z.array(staleSessionSchema) })
+  z.object({ kind: z.literal('script.status'), status: z.array(scriptStatusSchema) })
 ])
 export type PushEvent = z.infer<typeof pushEventSchema>
 
@@ -795,7 +790,7 @@ export interface RevvaApi {
   chat: {
     list(): Promise<ChatSummary[]>
     create(input: ChatCreateInput): Promise<ChatSummary>
-    messages(sessionId: string): Promise<ChatMessage[]>
+    messages(sessionId: string, since?: string): Promise<TranscriptPage>
     /** `queued` = park in the inbox behind the running turn instead of steering into it. */
     prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs, sentAt?: number): Promise<void>
     interrupt(sessionId: string): Promise<void>
@@ -806,7 +801,7 @@ export interface RevvaApi {
     remove(sessionId: string): Promise<void>
   }
   session: {
-    model(sessionId: string): Promise<(ModelRef & { variant?: string }) | null>
+    model(sessionId: string): Promise<(ModelRef & { variants?: string[] }) | null>
     /** Switch the model for subsequent provider turns (live, mid-conversation). */
     setModel(sessionId: string, model: ModelRef): Promise<void>
     /** Current agent of the session (null = service default). */
@@ -844,10 +839,12 @@ export interface RevvaApi {
   work: {
     start(input: StartWorkInput): Promise<WorkSummary>
     list(): Promise<WorkSummary[]>
+    /** Shared utilities for an existing conversation, regardless of its Jira/PR properties. */
+    conversationContext(sessionId: string, directory?: string): Promise<WorkSummary>
     /** Read-only proof of what abandoning would destroy (worktree safety + notes). */
     abandonPreflight(id: string): Promise<WorkAbandonPreflight>
     abandon(input: WorkAbandonInput): Promise<string | undefined>
-    messages(sessionId: string): Promise<ChatMessage[]>
+    messages(sessionId: string, since?: string): Promise<TranscriptPage>
     prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs, sentAt?: number): Promise<void>
     interrupt(sessionId: string): Promise<void>
     /** Review ledger for one work (all rounds). */
@@ -856,6 +853,8 @@ export interface RevvaApi {
     reviewStart(workId: string): Promise<void>
     /** Retry one reviewer or failed fixer in the latest round. */
     reviewRetry(workId: string, reviewId: number): Promise<void>
+    /** Stop reviewers/fixer, including sessions still running after a restart. No deletion. */
+    reviewStop(workId: string): Promise<void>
     /** Pre-flight checks for shipping (push/PR/Jira). */
     shipCheck(workId: string): Promise<ShipCheck[]>
     /** Push + PR + Jira sync; opens the PR in the browser. */

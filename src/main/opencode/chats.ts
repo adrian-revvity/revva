@@ -1,7 +1,8 @@
 /**
- * General chats: ordinary OpenCode sessions with no ticket/pipeline metadata.
+ * Conversations: ordinary OpenCode sessions with optional Jira/PR properties.
  * Revva only stores the index (which session is a chat, its title/dir) in sqlite;
- * all transcript state lives in OpenCode.
+ * all transcript state lives in OpenCode. Links enable the shared utilities;
+ * creating a linked session and tagging one later use the same path.
  */
 import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
@@ -10,15 +11,17 @@ import { BrowserWindow } from 'electron'
 import { openCodeService, describeError } from './service'
 import { eventBus, type RawEvent } from './bus'
 import { streamBuffer } from './stream-buffer'
+import { transcriptImage } from './transcript-images'
 import { getDb } from '../db'
 import { sessionIndex } from './session-index'
 import { parsePrRef, repoFromGitRemote, resolvePrRef } from '@shared/pr-ref'
 import { ticketKeyFromText } from '@shared/ticket-key'
-import { IPC, type ChatCreateInput, type ChatMessage, type ChatSummary, type PromptImage, type PromptRefs, type PushEvent, type QueuedMessage } from '@shared/types'
+import { IPC, type ChatCreateInput, type ChatMessage, type ChatSummary, type PromptImage, type PromptRefs, type PushEvent, type QueuedMessage, type TranscriptPage } from '@shared/types'
 import { fileAttachments, skillAttachments } from './prompt-refs'
 import { pushToWindows } from '../push'
 import { notifyInbound } from '../notify'
 import { isConflict, promptImageFiles } from '../util'
+import { workManager } from '../pipeline/works'
 
 const exec = promisify(execFile)
 
@@ -142,7 +145,10 @@ class ChatManager {
     this.wired = true
     eventBus.on('event', (e: RawEvent) => this.onEvent(e))
     // SSE is live-only: after a reconnect the renderer refetches via its queries.
-    eventBus.on('stream:reconnect', () => pushToWindows({ kind: 'chat.idle', sessionId: '*' }))
+    eventBus.on('stream:reconnect', () => {
+      streamBuffer.reset()
+      pushToWindows({ kind: 'chat.idle', sessionId: '*' })
+    })
   }
 
   list(): ChatSummary[] {
@@ -215,7 +221,7 @@ class ChatManager {
           s.time?.created ?? Date.now(),
           s.time?.updated ?? Date.now()
         )
-        sessionIndex.register(s.id, 'chat')
+        sessionIndex.register(s.id, workManager.forSession(s.id) ? 'work' : 'chat')
       }
     } catch (err) {
       console.warn('[chat] reconcile failed:', describeError(err))
@@ -224,7 +230,7 @@ class ChatManager {
 
   /** Move a conversation between ticket groups without changing its transcript. */
   async setTicket(sessionId: string, ticketKey: string | null): Promise<void> {
-    const row = getDb().prepare('SELECT session_id FROM chat WHERE session_id = ?').get(sessionId)
+    const row = getDb().prepare('SELECT session_id, ticket_key FROM chat WHERE session_id = ?').get(sessionId) as { session_id: string; ticket_key: string | null } | undefined
     if (!row) throw new Error('Chat not found.')
     if (ticketKey !== null) {
       // Accept existing groups or a manually typed key; normalize (upper-case, no leading zeros).
@@ -234,25 +240,46 @@ class ChatManager {
       if (!normalized) throw new Error('Enter a ticket number like CLN-1234.')
       ticketKey = normalized
     }
+    await workManager.requireEditableLinks(sessionId)
     const api = openCodeService.api
     const session = await api.session.get({ sessionID: sessionId })
     const metadata = (session.metadata ?? {}) as Record<string, unknown>
     const revva = (metadata.revva ?? {}) as Record<string, unknown>
     await api.session.update({ sessionID: sessionId, metadata: { ...metadata, revva: { ...revva, ticketKey } } })
     getDb().prepare('UPDATE chat SET ticket_key = ? WHERE session_id = ?').run(ticketKey, sessionId)
+    try {
+      await workManager.setTicketProperty(sessionId, ticketKey)
+    } catch (err) {
+      getDb().prepare('UPDATE chat SET ticket_key = ? WHERE session_id = ?').run(row.ticket_key, sessionId)
+      await api.session.update({ sessionID: sessionId, metadata: session.metadata ?? {} })
+      throw err
+    }
   }
 
-  async messages(sessionId: string): Promise<ChatMessage[]> {
+  async messages(sessionId: string, since?: string): Promise<TranscriptPage> {
     const api = openCodeService.api
-    // desc + reverse: limit keeps the NEWEST 200. With asc, long sessions would
-    // silently lose the most recent messages (limit cuts the tail of the order).
-    const res = await api.message.list({ sessionID: sessionId, order: 'desc', limit: 200 })
+    // First load is the newest 200. Refreshes fetch pages of 20 until the
+    // overlap row; never silently skip steps when a run advances between polls.
+    const res = await api.message.list({ sessionID: sessionId, order: 'desc', limit: since ? 20 : 200 })
+    const rows = [...res.data]
+    let cursor = res.cursor.next
+    const seen = new Set<string>()
+    while (since && !rows.some((m) => m.id === since) && cursor && rows.length < 200 && !seen.has(cursor)) {
+      seen.add(cursor)
+      const page = await api.message.list({ sessionID: sessionId, cursor, limit: Math.min(20, 200 - rows.length) })
+      rows.push(...page.data)
+      cursor = page.cursor.next
+    }
+    const overlap = since ? rows.findIndex((m) => m.id === since) : -1
+    const reset = !since || overlap < 0
+    const selected = reset ? rows : rows.slice(0, overlap + 1)
     const out: ChatMessage[] = []
-    for (const m of [...res.data].reverse()) {
+    for (const m of selected.reverse()) {
       if (m.type === 'user') {
         const images = (m.files ?? [])
-          .filter((f) => f.mime.startsWith('image/') && f.data)
-          .map((f) => ({ name: f.name ?? undefined, mime: f.mime, data: `data:${f.mime};base64,${f.data}` }))
+          .flatMap((f, index) => f.data && /^image\/(png|jpeg|gif|webp)$/.test(f.mime)
+            ? [{ name: f.name ?? undefined, mime: f.mime, data: transcriptImage(sessionId, m.id, index, f.mime, f.data) }]
+            : [])
         const text = m.text ?? ''
         if (!text && images.length === 0) continue
         out.push({ id: m.id, role: 'user', text, images: images.length ? images : undefined, createdAt: m.time?.created ?? 0 })
@@ -278,7 +305,7 @@ class ChatManager {
         out.push(msg)
       }
     }
-    return out
+    return { messages: out, reset }
   }
 
   /** Messages waiting in OpenCode's inbox (queued follow-ups). */
@@ -311,6 +338,17 @@ class ChatManager {
   }
 
   async prompt(sessionId: string, text: string, images: PromptImage[] = [], queued = false, refs?: PromptRefs): Promise<void> {
+    const chat = getDb().prepare('SELECT ticket_key, pr_url FROM chat WHERE session_id = ?').get(sessionId) as { ticket_key: string | null; pr_url: string | null } | undefined
+    // Jira and PR links enable the SAME utilities on the SAME conversation.
+    if (chat?.ticket_key || chat?.pr_url || workManager.forSession(sessionId)) {
+      await workManager.conversationContext(sessionId)
+      return workManager.followUp(sessionId, text, images, queued, refs)
+    }
+    return this.sendPrompt(sessionId, text, images, queued, refs)
+  }
+
+  /** Plain transport retained for internal callers without a conversation row. */
+  private async sendPrompt(sessionId: string, text: string, images: PromptImage[] = [], queued = false, refs?: PromptRefs): Promise<void> {
     const api = openCodeService.api
     getDb().prepare('UPDATE chat SET updated_at = ? WHERE session_id = ?').run(Date.now(), sessionId)
     const dir = this.directoryOf(sessionId)
@@ -343,6 +381,7 @@ class ChatManager {
   }
 
   async remove(sessionId: string): Promise<void> {
+    await workManager.forgetConversation(sessionId)
     try {
       await openCodeService.api.session.remove({ sessionID: sessionId })
     } catch {
@@ -372,7 +411,7 @@ class ChatManager {
     const data = (e.data ?? {}) as Record<string, unknown>
     const sessionId = data.sessionID
     if (typeof sessionId !== 'string') return
-    if (sessionIndex.kindOf(sessionId) !== 'chat') return
+    if (sessionIndex.kindOf(sessionId) !== 'chat' && e.type !== 'session.renamed') return
     switch (e.type) {
       case 'session.renamed': {
         // OpenCode auto-titles a session from its first message. Adopt that
@@ -392,10 +431,6 @@ class ChatManager {
           messageId: String(data.assistantMessageID ?? ''),
           text: typeof data.delta === 'string' ? data.delta : ''
         })
-        break
-      }
-      case 'session.tool.called': {
-        pushToWindows({ kind: 'chat.tool', sessionId, tool: String(data.name ?? data.tool ?? 'tool'), state: 'called' })
         break
       }
       case 'session.execution.succeeded':

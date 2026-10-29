@@ -118,6 +118,7 @@ class ReviewManager {
   private sessions = new Map<string, TrackedSession>()
   private settling = new Set<string>()
   private starting = new Set<string>()
+  private stopping = new Set<string>()
   /** Fan-in guard: a round is decided exactly once. */
   private settledRounds = new Set<string>()
 
@@ -167,6 +168,13 @@ class ReviewManager {
     workManager.setReviewState(workId, 'REVIEW')
 
     try {
+      await this.requireStoppedReviews(workId)
+      if (!work.branch) throw new Error('Choose the conversation’s Git worktree and check out a branch before starting review.')
+      const attached = (await exec('git', ['-C', work.worktree_dir, 'branch', '--show-current'])).stdout.trim()
+      if (attached !== work.branch) throw new Error('The checkout branch changed. Re-select the review folder before starting review.')
+      const active = await openCodeService.api.session.active()
+      const build = getDb().prepare('SELECT session_id FROM work WHERE id = ?').get(workId) as { session_id: string | null }
+      if (build.session_id && build.session_id in active) throw new Error('Implementation is still running. Wait for it to finish before starting review.')
       const status = await exec('git', ['-C', work.worktree_dir, 'status', '--porcelain'])
       if (status.stdout.trim()) throw new Error('Commit all worktree changes before starting review.')
       const head = (await exec('git', ['-C', work.worktree_dir, 'rev-parse', 'HEAD'])).stdout.trim()
@@ -249,6 +257,7 @@ class ReviewManager {
 
     this.starting.add(workId)
     try {
+      await this.requireStoppedReviews(workId)
       const [head, status] = await Promise.all([
         exec('git', ['-C', work.worktree_dir, 'rev-parse', 'HEAD']),
         exec('git', ['-C', work.worktree_dir, 'status', '--porcelain'])
@@ -300,7 +309,7 @@ class ReviewManager {
     try {
       const api = openCodeService.api
       const session = await api.session.create({
-        title: `${work.ticket_key} · ${role} (round ${round})`,
+        title: `${work.ticket_key || work.branch} · ${role} (round ${round})`,
         agent: sel.agentID ?? null,
         model: sel.model ? { providerID: sel.model.providerID, id: sel.model.id } : null,
         location: { directory: work.worktree_dir },
@@ -325,7 +334,7 @@ class ReviewManager {
 
   /** workManager calls this when a tracked reviewer/fixer session finished. */
   isBusyReviewing(workId: string): boolean {
-    if (this.starting.has(workId)) return true
+    if (this.starting.has(workId) || this.stopping.has(workId)) return true
     for (const t of this.sessions.values()) if (t.workId === workId) return true
     return false
   }
@@ -334,16 +343,64 @@ class ReviewManager {
     return this.starting.has(workId)
   }
 
-  /** Interrupt everything in flight and mark rows error. Used by abandon(). */
-  async cancelWork(workId: string): Promise<void> {
-    for (const [sessionId, t] of [...this.sessions]) {
-      if (t.workId !== workId) continue
-      clearTimeout(t.timer)
-      this.sessions.delete(sessionId)
-      sessionIndex.forget(sessionId)
-      inboxManager.forgetSession(sessionId)
-      await openCodeService.api.session.interrupt({ sessionID: sessionId }).catch(() => undefined)
-      this.update(t.reviewId, 'error', undefined, 'cancelled')
+  /** Restart recovery must consult the service, not only our in-memory map. */
+  async requireStoppedReviews(workId: string): Promise<void> {
+    const ids = new Set(this.reviewsFor(workId).flatMap((row) => row.sessionId ? [row.sessionId] : []))
+    if (!ids.size) return
+    const active = await openCodeService.api.session.active()
+    const running = [...ids].find((id) => id in active)
+    if (running) throw new Error(`Review/fixer session ${running} is still running in OpenCode. Use Stop review before continuing.`)
+  }
+
+  /** Explicit, non-destructive recovery, including review sessions orphaned by restart. */
+  async stopWork(workId: string): Promise<void> {
+    if (this.starting.has(workId) || this.stopping.has(workId)) throw new Error('Review is starting or stopping; try again once it settles.')
+    if (shipManager.isShipping(workId)) throw new Error('Shipping is in progress; wait before stopping review.')
+    const work = getDb().prepare('SELECT state FROM work WHERE id = ?').get(workId) as { state: string } | undefined
+    if (!work || !['REVIEW', 'FIXING', 'WAITING_HUMAN'].includes(work.state)) throw new Error('Stop review is available during review or when this ticket needs attention.')
+    this.stopping.add(workId)
+    try {
+      const active = await openCodeService.api.session.active()
+      const rows = this.reviewsFor(workId)
+      const tracked = [...this.sessions].filter(([, t]) => t.workId === workId)
+      const ids = new Set([
+        ...rows.flatMap((row) => row.sessionId && row.sessionId in active ? [row.sessionId] : []),
+        ...tracked.map(([id]) => id)
+      ])
+      // Suppress fan-in before interrupt events can arrive. Cancelling reviews
+      // never deletes messages, sessions, branches or files.
+      for (const row of rows) this.settledRounds.add(`${workId}:${row.round}`)
+      for (const [id, t] of tracked) {
+        clearTimeout(t.timer)
+        this.sessions.delete(id)
+        sessionIndex.forget(id)
+        inboxManager.forgetSession(id)
+      }
+      for (const row of rows) {
+        if (row.status === 'pending' || row.status === 'running' || (row.sessionId && ids.has(row.sessionId))) {
+          this.update(row.id, 'error', undefined, 'Review stopped by you; files and transcript kept.')
+        }
+      }
+      const results = await Promise.allSettled([...ids].map((sessionID) => openCodeService.api.session.interrupt({ sessionID })))
+      const failed = results.find((result) => result.status === 'rejected')
+      if (failed?.status === 'rejected') throw failed.reason
+      // Interrupt acceptance is not proof of quiescence; check again, briefly
+      // allowing OpenCode to finish its interruption cleanup.
+      for (let attempt = 0; ; attempt++) {
+        const remaining = await openCodeService.api.session.active()
+        const running = [...ids].find((id) => id in remaining)
+        if (!running) break
+        if (attempt === 10) throw new Error(`Session ${running} has not stopped yet. Retry Stop review; nothing was removed.`)
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+      workManager.setReviewState(workId, 'WAITING_HUMAN', 'Review stopped. Files and transcripts kept — send a follow-up, re-run review, or retry Abandon.')
+      this.audit(workId, this.latestRound(workId), 'review-stopped', `${ids.size} session(s) interrupted; confirmed inactive`)
+    } catch (err) {
+      workManager.setReviewState(workId, 'WAITING_HUMAN', `Could not confirm review stopped: ${describeError(err)}. Retry Stop review; nothing was removed.`)
+      throw err
+    } finally {
+      this.stopping.delete(workId)
+      this.push(workId, this.latestRound(workId))
     }
   }
 
@@ -553,7 +610,7 @@ class ReviewManager {
     try {
       const api = openCodeService.api
       const session = await api.session.create({
-        title: `${work.ticket_key} · fix (after round ${round})`,
+        title: `${work.ticket_key || work.branch} · fix (after round ${round})`,
         agent: sel.agentID ?? null,
         model: sel.model ? { providerID: sel.model.providerID, id: sel.model.id } : null,
         location: { directory: work.worktree_dir },
@@ -664,7 +721,7 @@ function reviewerPrompt(
   scope: ReviewScope
 ): string {
   const common = [
-    `You are Revva's ${role} reviewer for ticket ${work.ticket_key}, round ${round}.`,
+    `You are Revva's ${role} reviewer for ${work.ticket_key || `conversation on ${work.branch}`}, round ${round}.`,
     `Repository worktree: ${work.worktree_dir} (branch ${work.branch}). Review ONLY the changes from base commit ${scope.base} to HEAD (git diff ${scope.base} HEAD).`,
     '',
     'STRICT READ-ONLY: do not edit or create files, do not commit, do not push, do not start subagents or other agents.',
@@ -697,11 +754,11 @@ function fixerPrompt(
     .map((c) => `=== ${c.role} (round ${c.round}) ===\n${c.findings.trim()}`)
     .join('\n\n')
   return [
-    `You are Revva's fixer for ticket ${work.ticket_key} after review round ${round}.`,
+    `You are Revva's fixer for ${work.ticket_key || `conversation on ${work.branch}`} after review round ${round}.`,
     `Worktree: ${work.worktree_dir} (branch ${work.branch}).`,
     '',
     'Independent reviewers found issues. Fix ALL blockers and majors; use judgment on minors and note anything you consciously skip.',
-    'Keep the tree committable and commit your fixes with clear messages referencing ' + work.ticket_key + '. Do not push or open PRs.',
+    `Keep the tree committable and commit your fixes with clear messages${work.ticket_key ? ` referencing ${work.ticket_key}` : ''}. Do not push or open PRs.`,
     'When done, summarize what you changed and what you skipped (with reasons).',
     '',
     findings

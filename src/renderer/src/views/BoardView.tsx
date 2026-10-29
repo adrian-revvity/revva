@@ -642,11 +642,17 @@ function TicketSubtasksDialog({
     // a cached (possibly empty) answer must not shadow the truth.
     staleTime: 0
   })
-  const items = subtasks.data ?? []
+  // Open work first, done at the bottom — a long list opens with what you can start.
+  const items = useMemo(() => {
+    const list = subtasks.data ?? []
+    const isDone = (t: Ticket): boolean => t.statusCategory.toLowerCase() === 'done'
+    return [...list.filter((t) => !isDone(t)), ...list.filter(isDone)]
+  }, [subtasks.data])
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-h-[calc(100vh-2rem)] overflow-y-auto sm:max-w-lg">
-        <DialogHeader>
+      {/* Wide (sub-task summaries are long) and flex-column: header pinned, only the list scrolls. */}
+      <DialogContent className="flex max-h-[calc(100vh-4rem)] flex-col overflow-hidden sm:max-w-3xl">
+        <DialogHeader className="shrink-0 pr-6">
           <DialogTitle className="flex items-center gap-2">
             <a
               href={ticket.url}
@@ -668,18 +674,18 @@ function TicketSubtasksDialog({
           <DialogDescription>{ticket.summary}</DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-1.5">
-          <h3 className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
-            <ListChecks className="size-3.5" /> Sub-tasks
-            {subtasks.data && (
-              <Badge variant="secondary" className="text-[10px]">
-                {items.length}
-              </Badge>
-            )}
-          </h3>
+        <h3 className="flex shrink-0 items-center gap-1.5 text-xs font-semibold text-muted-foreground">
+          <ListChecks className="size-3.5" /> Sub-tasks
+          {subtasks.data && (
+            <Badge variant="secondary" className="text-[10px]">
+              {items.length}
+            </Badge>
+          )}
+        </h3>
+        <div className="-mx-2 min-h-0 flex-1 space-y-1.5 overflow-y-auto px-2 pb-1">
           {subtasks.isLoading && (
             <div className="space-y-1.5">
-              {[0, 1].map((i) => (
+              {[0, 1, 2].map((i) => (
                 <Skeleton key={i} className="h-12" />
               ))}
             </div>
@@ -700,38 +706,37 @@ function TicketSubtasksDialog({
             return (
               <div
                 key={sub.key}
-                className="flex items-center gap-2 rounded-md border px-2.5 py-2"
+                className="flex items-center gap-2 rounded-md border px-2.5 py-1.5"
               >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5">
-                    <a
-                      href={sub.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="font-mono text-[11px] font-medium hover:underline"
-                    >
-                      {sub.key}
-                    </a>
-                    {sub.issueTypeName && (
-                      <Badge variant="outline" className={cn('text-[9px]', jiraTypeClasses(sub.issueTypeName))}>
-                        {sub.issueTypeName}
-                      </Badge>
-                    )}
-                    <Badge variant="outline" className={cn('text-[9px]', jiraStatusClasses(sub.status, sub.statusCategory))}>
-                      {sub.status}
-                    </Badge>
-                  </div>
-                  <p className={cn('truncate text-[12px] leading-snug', done && 'text-muted-foreground line-through')}>
-                    {sub.summary}
-                  </p>
-                </div>
+                <a
+                  href={sub.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="shrink-0 font-mono text-[11px] font-medium hover:underline"
+                >
+                  {sub.key}
+                </a>
+                <Badge variant="outline" className={cn('shrink-0 text-[9px]', jiraStatusClasses(sub.status, sub.statusCategory))}>
+                  {sub.status}
+                </Badge>
+                {sub.issueTypeName && (
+                  <Badge variant="outline" className={cn('shrink-0 text-[9px]', jiraTypeClasses(sub.issueTypeName))}>
+                    {sub.issueTypeName}
+                  </Badge>
+                )}
+                <p
+                  title={sub.summary}
+                  className={cn('min-w-0 flex-1 truncate text-[12px]', done && 'text-muted-foreground line-through')}
+                >
+                  {sub.summary}
+                </p>
                 {active ? (
-                  <Button size="xs" onClick={() => onStartWork(active.id)}>
+                  <Button size="xs" className="shrink-0" onClick={() => onStartWork(active.id)}>
                     <Play className="size-3.5" />
                     {active.state === 'BUILDING' ? 'Watching…' : active.state}
                   </Button>
                 ) : (
-                  <Button size="xs" disabled={done} title={done ? 'Already done' : undefined} onClick={() => onStartSubtask(sub)}>
+                  <Button size="xs" className="shrink-0" disabled={done} title={done ? 'Already done' : undefined} onClick={() => onStartSubtask(sub)}>
                     <Play className="size-3.5" /> Start
                   </Button>
                 )}

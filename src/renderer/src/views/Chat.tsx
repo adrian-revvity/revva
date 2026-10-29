@@ -13,13 +13,16 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from '@/components/ui/popover'
 import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
-import { mergeTranscript, streamKey } from '@/lib/transcript-stream'
+import { EMPTY_STREAM, mergeHistory, mergeTranscript, streamKey, type LiveTranscript } from '@/lib/transcript-stream'
+import { SessionStats } from '@/components/session-stats'
 import { MD_COMPONENTS } from '@/components/message-markdown'
 import { Choice } from './NewChatDialog'
-import type { ChatMessage, ChatToolCall, FileHit, ModelRef, PromptImage, PromptRefs, PushEvent, QueuedMessage, SkillInfo } from '@shared/types'
+import type { ChatMessage, ChatToolCall, FileHit, ModelRef, PromptImage, PromptRefs, QueuedMessage, SkillInfo, WorkSummary, TranscriptPage } from '@shared/types'
 import { FormCard, PermissionCard, useInbox } from './InboxView'
 import { PrConversationActions } from './PrConversationActions'
+import { ConversationEnvironment, ConversationActions, ConversationDetails } from './ConversationEnvironment'
 
 const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp'
 const MAX_IMAGES = 8
@@ -123,7 +126,7 @@ async function filesToImages(files: File[]): Promise<PromptImage[]> {
 export interface TranscriptDrive {
   /** Stable cache key prefix, e.g. ['chat-messages'] or ['work-messages']. */
   queryKey: readonly unknown[]
-  load(sessionId: string): Promise<ChatMessage[]>
+  load(sessionId: string, since?: string): Promise<TranscriptPage>
   /** `queued` = session is busy; park the message in the inbox behind the running turn. */
   send(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs, sentAt?: number): Promise<void>
   interrupt(sessionId: string): Promise<void>
@@ -183,10 +186,6 @@ export function TranscriptView({
   const qc = useQueryClient()
   const pending = useInbox().filter((item) => item.sessionID === sessionId)
   const [sendingSession, setSendingSession] = useState<string | null>(null)
-  const throughputKey = useMemo(() => ['session-throughput', sessionId] as const, [sessionId])
-  const [throughput, setThroughput] = useState<Extract<PushEvent, { kind: 'session.throughput' }> | null>(
-    () => qc.getQueryData<Extract<PushEvent, { kind: 'session.throughput' }>>(throughputKey) ?? null
-  )
   const activity = useQuery({
     queryKey: ['session-activity'],
     queryFn: () => window.revva.session.active(),
@@ -196,14 +195,27 @@ export function TranscriptView({
   const running = sendingSession === sessionId || (activity.data?.includes(sessionId) ?? false)
   const messages = useQuery({
     queryKey: [...drive.queryKey, sessionId],
-    queryFn: () => drive.load(sessionId),
+    queryFn: async ({ signal }) => {
+      const old = qc.getQueryData<ChatMessage[]>([...drive.queryKey, sessionId]) ?? []
+      const resetKey = ['transcript-reset', sessionId] as const
+      const generation = qc.getQueryData<number>(resetKey) ?? 0
+      // Keep unresolved earlier tools inside the overlap window as well as the
+      // last persisted step. Optimistic ids aren't valid server cursors.
+      const anchor = old.find((row) => row.tools?.some((tool) => tool.state === 'running' || tool.state === 'streaming'))
+        ?? old.findLast((row) => !row.id.startsWith('pending-'))
+      const page = await drive.load(sessionId, generation ? undefined : anchor?.id)
+      if (signal.aborted) throw signal.reason
+      if (generation && qc.getQueryData<number>(resetKey) === generation) qc.setQueryData(resetKey, 0)
+      return page.reset ? page.messages : mergeHistory(old, page.messages)
+    },
     refetchOnMount: 'always',
-    refetchInterval: (q) => q.state.status === 'error' ? 5000 : running ? 3000 : false
+    refetchInterval: (q) => q.state.status === 'error' ? 5000 : running ? 10_000 : false
   })
-  const live = useQuery<ChatMessage[]>({
+  const live = useQuery<LiveTranscript>({
     queryKey: streamKey(sessionId),
-    queryFn: () => [],
-    initialData: [],
+    queryFn: () => EMPTY_STREAM,
+    initialData: EMPTY_STREAM,
+    structuralSharing: false,
     enabled: false
   })
   const wasRunning = useRef(running)
@@ -221,12 +233,17 @@ export function TranscriptView({
     if (!messages.data) return
     // Prune only after the snapshot is committed. A cancelled/in-flight fetch
     // must never delete live text that is not yet present in the history cache.
-    qc.setQueryData<ChatMessage[]>(streamKey(sessionId), (current = []) => {
-      const remaining = current.filter((message) => {
-        const saved = messages.data.find((row) => row.id === message.id)
-        return !saved || !saved.text.trim().startsWith(message.text.trim())
-      })
-      return remaining.length === current.length ? current : remaining
+    const savedById = new Map(messages.data.map((row) => [row.id, row]))
+    qc.setQueryData<LiveTranscript>(streamKey(sessionId), (current = EMPTY_STREAM) => {
+      let remaining: LiveTranscript | undefined
+      for (const message of Object.values(current)) {
+        const saved = savedById.get(message.id)
+        if (saved && saved.text.trim().startsWith(message.text.trim())) {
+          remaining ??= { ...current }
+          delete remaining[message.id]
+        }
+      }
+      return remaining ?? current
     })
   }, [messages.data, sessionId, qc])
   const model = useQuery({
@@ -275,59 +292,6 @@ export function TranscriptView({
   const composerRef = useRef<HTMLFormElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const positionedSessionRef = useRef<string | null>(null)
-  const contextUsage = useQuery({
-    queryKey: ['session-context-usage', sessionId],
-    queryFn: () => window.revva.session.contextUsage(sessionId),
-    refetchInterval: running ? 30_000 : false
-  })
-  const usage = contextUsage.data
-  const usageLabel = usage?.limit
-    ? `${Math.round(usage.tokens / usage.limit * 100)}%`
-    : '—'
-  const throughputLabel = throughput && throughput.tokensPerSecond < 10
-    ? throughput.tokensPerSecond.toFixed(1)
-    : Math.round(throughput?.tokensPerSecond ?? 0).toString()
-  const speedValue = throughput
-    ? `${throughput.estimated ? '~' : ''}${throughputLabel} t/s`
-    : running ? '0 t/s' : '—'
-  const speedLabel = throughput && !throughput.running ? 'Last' : 'Speed'
-  const statsCard = (
-    <section aria-label="Context and model speed" className="pointer-events-auto w-36 overflow-hidden rounded-lg border bg-background/95">
-      <div className="grid grid-cols-[0.8fr_1.2fr] divide-x">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button type="button" className="min-w-0 px-1.5 py-1 text-left hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-ring">
-              <span className="block text-[9px] leading-tight text-muted-foreground">Context</span>
-              <span className="block truncate text-[11px] font-normal tabular-nums text-muted-foreground">{usageLabel}</span>
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" className="max-w-xs">
-            {usage
-              ? `${usage.tokens.toLocaleString()} context tokens${usage.limit ? ` of ${usage.limit.toLocaleString()}` : ''}`
-              : contextUsage.isPending ? 'Loading context usage…' : 'Context token count unavailable'}
-          </TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button type="button" className="min-w-0 px-1.5 py-1 text-left hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-ring">
-              <span className="block text-[9px] leading-tight text-muted-foreground">{speedLabel}</span>
-              <span className="block truncate text-[11px] font-normal tabular-nums text-muted-foreground">{speedValue}</span>
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" className="max-w-xs">
-            {throughput
-              ? <>
-                  <div>{throughput.running ? 'Interaction average' : 'Last interaction'}: {throughput.totalTokens.toFixed(0)} {throughput.estimated ? 'estimated ' : ''}output tokens / {(throughput.elapsedMs / 1000).toFixed(1)}s = {throughput.tokensPerSecond.toFixed(1)} tokens/s.</div>
-                  <div>Time starts at Send and includes initial waits, network delays, retries, and tool execution.</div>
-                  <div>Text, reasoning, and tool-call input count. Live output is estimated (~4 characters/token); completed steps use provider token counts.</div>
-                  <div className="mt-1 text-muted-foreground">{shortModelLabel}</div>
-                </>
-              : running ? 'No streamed output received yet; the observed rate is currently 0 tokens/s.' : 'Speed appears after the first response.'}
-          </TooltipContent>
-        </Tooltip>
-      </div>
-    </section>
-  )
 
   const skills = useQuery({
     queryKey: ['skills'],
@@ -376,8 +340,7 @@ export function TranscriptView({
   useEffect(() => {
     setPendingImages([])
     setPreview(false)
-    setThroughput(qc.getQueryData<Extract<PushEvent, { kind: 'session.throughput' }>>(throughputKey) ?? null)
-  }, [sessionId, qc, throughputKey])
+  }, [sessionId])
 
   // Main pushes queue/model changes for every session (bus forwards all sessions, so
   // the TUI and other clients are covered); these pushes are the update channel.
@@ -392,10 +355,6 @@ export function TranscriptView({
       if (event.kind === 'session.agent' && event.sessionId === sessionId) {
         void qc.invalidateQueries({ queryKey: ['session-agent', sessionId] })
       }
-      if (event.kind === 'session.throughput' && event.sessionId === sessionId) {
-        qc.setQueryData(throughputKey, event)
-        setThroughput(event)
-      }
       if (event.kind === 'session.activity' && event.sessionId === sessionId && !event.running) {
         void qc.invalidateQueries({ queryKey: ['session-queue', sessionId] })
         void qc.invalidateQueries({ queryKey: ['session-model', sessionId] })
@@ -403,7 +362,7 @@ export function TranscriptView({
         void qc.invalidateQueries({ queryKey: ['session-context-usage', sessionId] })
       }
     })
-  }, [sessionId, qc, throughputKey])
+  }, [sessionId, qc])
 
   // Stick-to-bottom: jump instantly (smooth animations restart per token and
   // fight the user), and only while the user is already at the bottom.
@@ -543,7 +502,7 @@ export function TranscriptView({
     }
   })
 
-  const rows = useMemo(() => mergeTranscript(messages.data ?? [], live.data ?? []), [messages.data, live.data])
+  const rows = useMemo(() => mergeTranscript(messages.data ?? [], live.data ?? EMPTY_STREAM), [messages.data, live.data])
   /** Consecutive assistant messages are steps of one agent turn — one card each. */
   const groups = useMemo(() => groupRows(rows), [rows])
   const latestGroup = groups.at(-1)
@@ -577,7 +536,7 @@ export function TranscriptView({
       </div>
       <div ref={scrollWrapRef} className="relative flex min-h-0 flex-1 flex-col">
         <div className="pointer-events-none absolute right-3 top-3 z-10 sm:right-6">
-          {statsCard}
+          <SessionStats sessionId={sessionId} running={running} />
         </div>
         <ScrollArea className="min-h-0 flex-1">
           <div className="mx-auto flex max-w-3xl flex-col gap-4 px-6 pb-5 pt-16">
@@ -754,7 +713,6 @@ export function TranscriptView({
                     : 'Message…'
                 }
                 aria-label="Message"
-                aria-describedby="composer-hint"
                 rows={2}
                 hidden={preview}
                 className={cn('max-h-48 min-h-16 resize-none rounded-none border-0 bg-transparent px-4 pb-2 pt-3 shadow-none focus-visible:ring-0 dark:bg-transparent', preview && 'hidden')}
@@ -804,15 +762,12 @@ export function TranscriptView({
                   {preview ? 'Edit' : 'Preview'}
                 </Button>
                 <ComposerRolePickers key={sessionId} sessionId={sessionId} container={composerRef} />
-                <span id="composer-hint" className="min-w-0 flex-1 truncate px-1 text-xs text-muted-foreground">
-                  Enter to send · Shift+Enter for a new line
-                </span>
                 {running && (
-                  <Button type="button" size="icon-sm" variant="outline" aria-label="Stop response" title="Stop response" onClick={() => interrupt.mutate()}>
+                  <Button type="button" size="icon-sm" variant="outline" className="ml-auto" aria-label="Stop response" title="Stop response" onClick={() => interrupt.mutate()}>
                     <Square />
                   </Button>
                 )}
-                <Button type="submit" size="icon-sm" aria-label={running ? 'Queue message' : 'Send message'} title={running ? 'Queue message' : 'Send message'} disabled={!canSend}>
+                <Button type="submit" size="icon-sm" className={!running ? 'ml-auto' : undefined} aria-label={running ? 'Queue message' : 'Send message'} title={running ? 'Queue message' : 'Send message'} disabled={!canSend}>
                   <ArrowUp />
                 </Button>
               </div>
@@ -977,7 +932,9 @@ export const MessageRow = memo(function MessageRow({ message, streaming }: { mes
             {images.map((img, i) => (
               <img
                 key={i}
-                src={img.data}
+                 src={img.data}
+                 loading="lazy"
+                 decoding="async"
                 alt={img.name ?? 'attachment'}
                 className={cn(
                   'rounded-md border border-black/10 object-cover dark:border-white/10',
@@ -1114,6 +1071,10 @@ function ComposerRolePickers({ sessionId, container }: {
   const currentAgent = agent.data
     ? agents.data?.find((a) => a.id === agent.data)?.name || agent.data
     : 'Agent: default'
+  const effortVariants = model.data?.variants ?? []
+  const currentEffort = model.data?.variant && effortVariants.includes(model.data.variant)
+    ? model.data.variant
+    : '__default__'
   const q = search.trim().toLowerCase()
   const modelMatches = (models.data ?? []).filter((m) => !q || `${m.name ?? ''} ${m.id} ${m.providerID}`.toLowerCase().includes(q))
   // Inventory already orders favorites first; group them under a heading so the
@@ -1199,6 +1160,34 @@ function ComposerRolePickers({ sessionId, container }: {
           </div>
         </PopoverContent>
       </Popover>
+      <Select
+        value={currentEffort}
+        onValueChange={(variant) => {
+          if (!model.data) return
+          switchModel.mutate({
+            providerID: model.data.providerID,
+            id: model.data.id,
+            ...(variant && variant !== '__default__' ? { variant } : {})
+          })
+        }}
+        disabled={!model.data || effortVariants.length === 0 || busy}
+      >
+        <SelectTrigger
+          size="sm"
+          aria-label="Set reasoning effort"
+          title={effortVariants.length ? 'Set reasoning effort for this model' : 'This model exposes no effort options'}
+          className="h-6 w-auto max-w-36 gap-1 border-transparent px-1 text-[11px] text-muted-foreground shadow-none hover:bg-accent"
+        >
+          <span>Effort:</span>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent align="start">
+          <SelectItem value="__default__">Default</SelectItem>
+          {effortVariants.map((variant) => (
+            <SelectItem key={variant} value={variant}>{variant}</SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
       {error instanceof Error && (
         <span role="alert" className="max-w-48 truncate text-[11px] text-destructive" title={error.message}>
           {error.message}
@@ -1212,25 +1201,49 @@ function ComposerRolePickers({ sessionId, container }: {
 
 export const chatDrive: TranscriptDrive = {
   queryKey: ['chat-messages'],
-  load: (id) => window.revva.chat.messages(id),
+  load: (id, since) => window.revva.chat.messages(id, since),
   send: (id, text, images, queued, refs, sentAt) => window.revva.chat.prompt(id, text, images, queued, refs, sentAt),
   interrupt: (id) => window.revva.chat.interrupt(id)
 }
 
-export function ChatView({ sessionId, onOpenChat }: { sessionId: string; onOpenChat?: (sessionId: string) => void }): React.JSX.Element {
+export const workDrive: TranscriptDrive = {
+  queryKey: ['work-messages'],
+  load: (id, since) => window.revva.work.messages(id, since),
+  send: (id, text, images, queued, refs, sentAt) => window.revva.work.prompt(id, text, images, queued, refs, sentAt),
+  interrupt: (id) => window.revva.work.interrupt(id)
+}
+
+export function ChatView({ sessionId, onOpenChat, work: providedWork }: { sessionId: string; onOpenChat?: (sessionId: string) => void; work?: WorkSummary }): React.JSX.Element {
   const qc = useQueryClient()
   const chats = useQuery({ queryKey: ['chats'], queryFn: () => window.revva.chat.list() })
   const chat = chats.data?.find((c) => c.sessionId === sessionId)
   const works = useQuery({ queryKey: ['works'], queryFn: () => window.revva.work.list() })
-  /** Pipeline work for this chat's ticket — gives the review action in the header. */
-  const chatWork = (works.data ?? []).find((w) => w.ticketKey === chat?.ticketKey && w.state !== 'ABANDONED' && w.state !== 'SHIPPED')
+  // Load ticket utilities for chats linked before they shared the cockpit.
+  // Session identity is essential: another chat for the same ticket is NOT this run.
+  const chatWork = providedWork ?? (works.data ?? []).find((w) => w.sessionId === sessionId && w.state !== 'ABANDONED')
+  const attachment = useQuery({
+    queryKey: ['conversation-context', sessionId],
+    queryFn: async () => {
+      const work = await window.revva.work.conversationContext(sessionId)
+      void qc.invalidateQueries({ queryKey: ['works'] })
+      return work
+    },
+    enabled: !!(chat?.ticketKey || chat?.prUrl) && !chatWork,
+    retry: false,
+    staleTime: Infinity
+  })
   const ticketKeys = [...new Set([
-    ...(works.data ?? []).filter((work) => work.state !== 'ABANDONED').map((work) => work.ticketKey),
+    ...(works.data ?? []).filter((work) => !!work.ticketKey && work.state !== 'ABANDONED').map((work) => work.ticketKey),
     ...(chats.data ?? []).flatMap((item) => item.ticketKey ? [item.ticketKey] : [])
   ])].sort()
   const tag = useMutation({
     mutationFn: (ticketKey: string | null) => window.revva.chat.setTicket(sessionId, ticketKey),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: ['chats'] })
+    onSuccess: (_result, ticketKey) => {
+      void qc.invalidateQueries({ queryKey: ['chats'] })
+      void qc.invalidateQueries({ queryKey: ['works'] })
+      if (ticketKey || chat?.prUrl) void qc.invalidateQueries({ queryKey: ['conversation-context', sessionId] })
+      if (providedWork) onOpenChat?.(sessionId)
+    }
   })
   const [customTicket, setCustomTicket] = useState('')
   const attachTypedTicket = (): void => {
@@ -1256,19 +1269,26 @@ export function ChatView({ sessionId, onOpenChat }: { sessionId: string; onOpenC
       .catch((err) => console.error('[chat] /new failed:', err))
   }
   return (
+    <ConversationEnvironment work={chatWork}>
+      {(chat?.ticketKey || chat?.prUrl) && !chatWork && <p role={attachment.isError ? 'alert' : 'status'} className="shrink-0 border-b px-3 py-2 text-xs text-muted-foreground">
+        {attachment.error instanceof Error ? `Could not load conversation utilities: ${attachment.error.message}` : 'Loading conversation utilities…'}
+        {attachment.isError && <Button size="sm" variant="outline" onClick={() => void attachment.refetch()}>Retry</Button>}
+      </p>}
+      {tag.error && <p role="alert" className="shrink-0 border-b px-4 py-2 text-sm text-destructive">{tag.error instanceof Error ? tag.error.message : String(tag.error)}</p>}
     <TranscriptView
       key={sessionId}
       sessionId={sessionId}
-      drive={chatDrive}
+      drive={chatWork ? workDrive : chatDrive}
+      hideSessionDetails
       emptyHint={chat?.ticketKey ? `Ask anything about ${chat.ticketKey}.` : 'Ask anything about this project — this chat is not attached to a ticket.'}
       onNewSession={onOpenChat && chat ? newSession : undefined}
       header={
         <>
-          <span className="truncate text-[13px] font-medium">{chat?.title ?? 'Chat'}</span>
+          <span className="min-w-0 flex-1 truncate text-[13px] font-medium" title={chat?.title ?? chatWork?.ticketSummary}>{chat?.title ?? chatWork?.ticketSummary ?? 'Chat'}</span>
           {chat && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button variant="outline" size="sm" disabled={tag.isPending} className="h-6 gap-1 px-2 text-[11px]">
+                <Button variant="outline" size="sm" disabled={tag.isPending} className="shrink-0">
                   <Tag data-icon="inline-start" /> {chat.ticketKey ?? 'Link ticket'} <ChevronDown data-icon="inline-end" />
                 </Button>
               </DropdownMenuTrigger>
@@ -1297,27 +1317,26 @@ export function ChatView({ sessionId, onOpenChat }: { sessionId: string; onOpenC
               </DropdownMenuContent>
             </DropdownMenu>
           )}
-          {chat && (
+          {chatWork && <ConversationActions work={chatWork} />}
+          {(chatWork?.prUrl || chat?.prUrl) && (
             <PrConversationActions
-              prUrl={chat.prUrl ?? chatWork?.prUrl}
-              directory={chat.directory}
+              prUrl={chatWork?.prUrl ?? chat?.prUrl}
+              directory={chatWork?.worktreeDir ?? chat?.directory ?? ''}
               work={chatWork}
               onOpenChat={onOpenChat}
               onAskAgent={async (text) => {
-                await window.revva.chat.prompt(sessionId, text)
+                await (chatWork ? window.revva.work.prompt(sessionId, text) : window.revva.chat.prompt(sessionId, text))
                 void qc.invalidateQueries({ queryKey: ['chat-messages', sessionId] })
                 void qc.invalidateQueries({ queryKey: ['chats'] })
               }}
             />
           )}
-          {tag.error && <span role="alert" className="text-xs text-destructive">{tag.error instanceof Error ? tag.error.message : String(tag.error)}</span>}
-          {chat && (
-            <Badge variant="outline" className="max-w-72 truncate font-mono text-[10px] font-normal">
-              {chat.directory}
-            </Badge>
-          )}
+          <ConversationDetails sessionId={sessionId} directory={chat?.directory} work={chatWork}>
+            <SessionIdButton sessionId={sessionId} />
+          </ConversationDetails>
         </>
       }
     />
+    </ConversationEnvironment>
   )
 }

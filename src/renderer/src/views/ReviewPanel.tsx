@@ -33,6 +33,8 @@ export function ReviewPanel({ workId, state, auto }: { workId: string; state: Wo
   const reviews = useQuery({ queryKey: ['reviews', workId], queryFn: () => window.revva.work.reviews(workId) })
   const models = useQuery({ queryKey: ['models'], queryFn: () => window.revva.inventory.models() })
   const [open, setOpen] = useState<number | null>(null)
+  const [stopping, setStopping] = useState(false)
+  const [stopError, setStopError] = useState<string | null>(null)
 
   useEffect(() => {
     return window.revva.events.on((e: PushEvent) => {
@@ -45,27 +47,61 @@ export function ReviewPanel({ workId, state, auto }: { workId: string; state: Wo
   const current = [...new Map(rows.filter((r) => r.round === round).map((r) => [r.role, r])).values()]
   const fixer = rows.filter((r) => r.role === 'fixer' && r.round === round - 1).at(-1)
   const visible = fixer && current.every((r) => r.status === 'pending') ? [fixer, ...current] : current
-  if (round === 0 && !fixer) return null
+  if (round === 0 && !fixer) return (
+    <div className="flex flex-col gap-4 text-sm">
+      <dl className="divide-y">
+        {(['sol', 'testAudit', 'impeccable', 'fixer'] as const).map((role) => (
+          <div key={role} className="flex items-center justify-between gap-3 py-3">
+            <dt className="flex items-center gap-2">{roleMeta[role]?.icon}{roleMeta[role]?.label}</dt>
+            <dd className="text-muted-foreground">Not started</dd>
+          </div>
+        ))}
+      </dl>
+      <p className="text-muted-foreground">Reviews wait for completed implementation. UI review runs only for UI changes; the fixer runs only when changes are requested.</p>
+    </div>
+  )
 
   const selected = visible.find((r) => r.id === open)
   return (
-    <div className="shrink-0 space-y-1 border-b bg-muted/30 px-3 py-2">
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span className="mr-1 text-[11px] font-medium text-muted-foreground">
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-sm text-muted-foreground">
           {state === 'BUILDING' ? 'Previous review' : 'Review'} · round {round || '—'}
         </span>
+        {(state === 'REVIEW' || state === 'FIXING' || state === 'WAITING_HUMAN') && (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={stopping}
+            title="Interrupt this ticket’s reviewers and fixer, including sessions left running after a restart. Keep all files and transcripts."
+            onClick={async () => {
+              setStopping(true)
+              setStopError(null)
+              try {
+                await window.revva.work.reviewStop(workId)
+              } catch (err) {
+                setStopError(err instanceof Error ? err.message : String(err))
+              } finally {
+                setStopping(false)
+                void qc.invalidateQueries({ queryKey: ['reviews', workId] })
+                void qc.invalidateQueries({ queryKey: ['works'] })
+              }
+            }}
+          >
+            {stopping ? 'Stopping review…' : 'Stop review'}
+          </Button>
+        )}
+      </div>
+      <div className="flex flex-col gap-1">
         {visible.map((r) => (
-          <ReviewChip
-            key={r.id}
-            row={r}
+          <ReviewChip key={r.id} row={r}
             modelName={models.data?.find((m) => m.providerID === r.model?.providerID && m.id === r.model?.id)?.name}
-            active={open === r.id}
-            onClick={() => setOpen(open === r.id ? null : r.id)}
-          />
+            active={open === r.id} onClick={() => setOpen(open === r.id ? null : r.id)} />
         ))}
       </div>
+      {stopError && <p role="alert" className="text-xs text-destructive">{stopError}</p>}
       {state === 'WAITING_HUMAN' && !selected && (
-        <p className="text-[11px] text-muted-foreground">Select an agent to see its result and retry it, or re-run the whole review below.</p>
+        <p className="text-sm text-muted-foreground">Select an agent for its findings, transcript and retry action.</p>
       )}
       {selected && (
         <ReviewDetail
@@ -100,13 +136,12 @@ function ReviewChip({
           onClick={onClick}
           aria-expanded={active}
           className={cn(
-            'flex items-center gap-1.5 rounded-md border bg-background px-2 py-1 text-[11px] transition-colors hover:bg-accent',
-            active && 'border-foreground/40 bg-accent',
-            row.status === 'running' && 'border-sky-500/40'
+            'flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left text-sm transition-colors hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring',
+            active && 'bg-accent'
           )}
         >
           {meta.icon}
-          <span className="font-medium">{meta.label}</span>
+          <span className="min-w-0 flex-1 font-medium">{meta.label}</span>
           {row.status === 'running' ? (
             <Loader2 className={cn('size-3 animate-spin', st.cls)} />
           ) : row.status === 'approved' ? (
@@ -141,7 +176,7 @@ function ReviewDetail({ row, canRetry, auto, onClose }: {
   const label = roleMeta[row.role]?.label ?? row.role
   const retryable = canRetry && row.status !== 'running' && row.status !== 'pending' && row.status !== 'skipped' && (row.role !== 'fixer' || row.status === 'error')
   return (
-    <div className="flex flex-col gap-2 rounded-md border bg-background p-2 text-xs">
+    <div className="flex flex-col gap-3 text-sm">
       {row.error && <p className="text-destructive">{row.error}</p>}
       {!row.sessionId && !row.error && <p className="text-muted-foreground">{row.findings || 'No session was started.'}</p>}
       {retryable && (
@@ -182,7 +217,7 @@ function ReviewTranscript({ row, onClose }: { row: ReviewRow; onClose: () => voi
   const drive = useMemo<TranscriptDrive>(() => {
     return {
       queryKey: ['review-messages'],
-      load: (id) => window.revva.work.messages(id),
+      load: (id, since) => window.revva.work.messages(id, since),
       send: async () => {
         throw new Error('Reviews are read-only.')
       },
@@ -209,6 +244,7 @@ function ReviewTranscript({ row, onClose }: { row: ReviewRow; onClose: () => voi
           </>
         }
         readOnly
+        hideSessionDetails
       />
     </div>
   )
@@ -217,6 +253,7 @@ function ReviewTranscript({ row, onClose }: { row: ReviewRow; onClose: () => voi
 /** "Re-run review" — manual round trigger after resolving a blocker by hand. */
 export function ReviewRerunButton({ workId, disabled }: { workId: string; disabled?: boolean }): React.JSX.Element {
   const qc = useQueryClient()
+  const reviews = useQuery({ queryKey: ['reviews', workId], queryFn: () => window.revva.work.reviews(workId) })
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   return (
@@ -235,7 +272,7 @@ export function ReviewRerunButton({ workId, disabled }: { workId: string; disabl
           .then(() => qc.invalidateQueries({ queryKey: ['reviews', workId] }))
       }}
     >
-      Re-run review
+      {reviews.data?.length ? 'Re-run review' : 'Start review'}
     </Button>
     {error && <span role="alert" className="text-xs text-destructive">{error}</span>}
     </>
