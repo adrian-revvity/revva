@@ -355,15 +355,19 @@ export default function App(): React.JSX.Element {
                         onClick={() => setView({ kind: 'work', workId: w.id })}
                         actions={<NavAction title={w.ownsWorktree === false ? 'Remove ticket link (keeps files and conversation)' : 'Abandon work'} onClick={() => abandonWork(w.id, w.ticketKey)} />} />
                     ))}
-                    {group.chats.map((c) => (
-                      <NavButton key={c.sessionId} icon={c.prUrl ? <Hammer className="size-4 shrink-0" /> : <MessageSquare className="size-4 shrink-0" />} label={c.title}
-                        activity={sessionActivity(c.sessionId)} unread={!!c.unread} active={view.kind === 'chat' && view.sessionId === c.sessionId}
-                        onClick={() => {
-                          setView({ kind: 'chat', sessionId: c.sessionId })
-                          if (c.unread) void window.revva.chat.markSeen(c.sessionId).then(() => chats.refetch())
-                        }}
-                        actions={chatActions(c)} />
-                    ))}
+                    {group.chats.map((c) => {
+                      const linkedWork = ticketWorks.find((w) => w.sessionId === c.sessionId)
+                      return (
+                        <NavButton key={c.sessionId} icon={c.prUrl ? <Hammer className="size-4 shrink-0" /> : <MessageSquare className="size-4 shrink-0" />} label={c.title}
+                          sublabel={linkedWork ? workStateLabels[linkedWork.state] : undefined}
+                          activity={sessionActivity(c.sessionId)} unread={!!c.unread} active={view.kind === 'chat' && view.sessionId === c.sessionId}
+                          onClick={() => {
+                            setView({ kind: 'chat', sessionId: c.sessionId })
+                            if (c.unread) void window.revva.chat.markSeen(c.sessionId).then(() => chats.refetch())
+                          }}
+                          actions={chatActions(c)} />
+                      )
+                    })}
                   </div>
                 </CollapsibleContent>
               </Collapsible>
@@ -641,15 +645,20 @@ function NavButton({
             {badge}
           </span>
         )}
-        {activity && activity !== 'Ready' ? (
-          <span className={cn(
-            'ml-auto shrink-0 text-[10px] font-medium',
-            activity === 'Needs you' ? 'text-amber-700 dark:text-amber-400' :
-              activity === 'Thinking' ? 'text-sky-700 dark:text-sky-400' : 'text-muted-foreground'
-          )}>
-            {activity === 'Thinking' ? 'Thinking…' : activity}
+        {(sublabel || (activity && activity !== 'Ready')) && (
+          <span className="ml-auto flex shrink-0 items-center gap-1.5">
+            {sublabel && <span className="text-[10px] text-muted-foreground">{sublabel}</span>}
+            {activity && activity !== 'Ready' && (
+              <span className={cn(
+                'text-[10px] font-medium',
+                activity === 'Needs you' ? 'text-amber-700 dark:text-amber-400' :
+                  activity === 'Thinking' ? 'text-sky-700 dark:text-sky-400' : 'text-muted-foreground'
+              )}>
+                {activity === 'Thinking' ? 'Thinking…' : activity}
+              </span>
+            )}
           </span>
-        ) : sublabel && <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">{sublabel}</span>}
+        )}
       </button>
       {actions && (
         <span className="mr-1 hidden shrink-0 items-center gap-0.5 group-hover/nav:flex group-focus-within/nav:flex">

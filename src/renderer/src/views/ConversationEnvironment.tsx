@@ -4,11 +4,10 @@ import { ChevronDown, CircleAlert, Info, Loader2, ScanEye } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from '@/components/ui/popover'
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Separator } from '@/components/ui/separator'
 import type { WorkSummary } from '@shared/types'
 import { workStateLabels } from '@/lib/work-state'
-import { ReviewPanel, ReviewRerunButton } from './ReviewPanel'
+import { ReviewPanel } from './ReviewPanel'
 import { ShipDialog, shipBlockReason } from './ShipPanel'
 import { CommentsStrip } from './CommentsStrip'
 
@@ -46,7 +45,6 @@ export function ConversationEnvironment({ work, children }: { work?: WorkSummary
 export function ConversationActions({ work }: { work: WorkSummary }): React.JSX.Element {
   const qc = useQueryClient()
   const [open, setOpen] = useState(false)
-  const [agentsOpen, setAgentsOpen] = useState(false)
   const [shipOpen, setShipOpen] = useState(false)
   const trigger = useRef<HTMLButtonElement>(null)
   const reviews = useQuery({ queryKey: ['reviews', work.id], queryFn: () => window.revva.work.reviews(work.id) })
@@ -58,7 +56,6 @@ export function ConversationActions({ work }: { work: WorkSummary }): React.JSX.
   const required = latest.filter((row) => row.status !== 'skipped')
   const approved = required.filter((row) => row.status === 'approved').length
   const running = work.state === 'REVIEW' || work.state === 'FIXING'
-  const canReview = work.state === 'WAITING_HUMAN' || work.state === 'APPROVED'
   const shippingBlocker = shipBlockReason(work)
   return <>
     <Popover open={open} onOpenChange={setOpen}>
@@ -67,7 +64,7 @@ export function ConversationActions({ work }: { work: WorkSummary }): React.JSX.
         <span className="hidden md:inline">Workflow · </span>{workStateLabels[work.state]}
         <ChevronDown data-icon="inline-end" />
       </PopoverTrigger>
-      <PopoverContent align="end" className="max-h-[75vh] w-80 max-w-[calc(100vw-2rem)] gap-4 overflow-y-auto p-4">
+      <PopoverContent align="end" className="max-h-[80vh] w-[min(48rem,calc(100vw-2rem))] max-w-[calc(100vw-2rem)] gap-4 overflow-y-auto p-4">
         <PopoverHeader>
           <div className="flex items-center justify-between gap-2">
             <PopoverTitle>Review &amp; delivery</PopoverTitle>
@@ -77,30 +74,17 @@ export function ConversationActions({ work }: { work: WorkSummary }): React.JSX.
         </PopoverHeader>
         {work.blocker && <p role="alert" className="break-words text-sm">{work.blocker}</p>}
         <p className="text-sm text-muted-foreground">
-          {reviews.isError ? 'Review status unavailable. Open agents to retry.' : required.length ? `Round ${round}: ${approved} of ${required.length} review gates approved.` : 'Reviews start after implementation is complete.'}
+          {reviews.isError ? 'Review status unavailable. Reopen Workflow to retry.' : required.length ? `Round ${round}: ${approved} of ${required.length} review gates approved.` : 'Reviews start after implementation is complete.'}
         </p>
-        <Button variant="outline" onClick={() => { setOpen(false); setAgentsOpen(true) }}>
-          <ScanEye data-icon="inline-start" /> Agents &amp; reviews
-        </Button>
+        <ReviewPanel workId={work.id} state={work.state} auto={work.mode === 'auto'} />
         <Separator />
         <div className="flex flex-wrap items-center gap-2">
-          {canReview && <ReviewRerunButton workId={work.id} />}
           {!work.prUrl && <Button size="sm" disabled={!!shippingBlocker} onClick={() => { setOpen(false); setShipOpen(true) }}>{work.state === 'APPROVED' ? 'Ship…' : 'Push / PR…'}</Button>}
           {work.prUrl && <span className="text-xs text-muted-foreground">Push and PR actions are in the PR menu.</span>}
         </div>
         {shippingBlocker && <p className="text-xs text-muted-foreground">{shippingBlocker}</p>}
       </PopoverContent>
     </Popover>
-    <Dialog open={agentsOpen} onOpenChange={setAgentsOpen}>
-      <DialogContent className="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-3xl" onCloseAutoFocus={(event) => { event.preventDefault(); trigger.current?.focus() }}>
-        <DialogHeader>
-          <DialogTitle>Agents &amp; reviews</DialogTitle>
-          <DialogDescription>{work.ticketKey || work.ticketSummary} · {workStateLabels[work.state]}</DialogDescription>
-        </DialogHeader>
-        <div className="min-h-0 overflow-y-auto"><ReviewPanel workId={work.id} state={work.state} auto={work.mode === 'auto'} /></div>
-        {canReview && <div className="flex justify-end"><ReviewRerunButton workId={work.id} /></div>}
-      </DialogContent>
-    </Dialog>
     <ShipDialog work={work} open={shipOpen} onClose={() => { setShipOpen(false); trigger.current?.focus() }} />
   </>
 }
