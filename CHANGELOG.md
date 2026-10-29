@@ -7,7 +7,7 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 ## [Unreleased]
 
-- (nothing yet)
+- **Active work in the Inbox meter** — the Inbox’s active meter now includes ticket work in the same active states as the sidebar, even when its background agent sessions are not the ticket’s primary session.
 
 ## [1.1.0] - 2026-10-29
 

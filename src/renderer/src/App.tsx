@@ -27,7 +27,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { ConnectionStatus } from '@/components/ConnectionStatus'
 import { cn } from '@/lib/utils'
 import { subscribeTranscripts } from '@/lib/transcript-stream'
-import { workStateLabels } from '@/lib/work-state'
+import { isActiveWorkState, workStateLabels } from '@/lib/work-state'
 import { parsePrRef } from '@shared/pr-ref'
 import { SetupView } from '@/views/Setup'
 import { ChatView } from '@/views/Chat'
@@ -168,9 +168,7 @@ export default function App(): React.JSX.Element {
     group.push(chat)
     prGroups.set(chat.prUrl, group)
   }
-  const runningWorks = ongoingWorks.filter(
-    (w) => w.id !== activeWork?.id && (w.state === 'BUILDING' || w.state === 'REVIEW' || w.state === 'FIXING' || w.state === 'REWORK' || w.state === 'WAITING_HUMAN')
-  )
+  const runningWorks = ongoingWorks.filter((w) => w.id !== activeWork?.id && isActiveWorkState(w.state))
   // Inbox badge: pending questions/permissions + finished runs nobody has seen.
   const inboxCount =
     pending.length +

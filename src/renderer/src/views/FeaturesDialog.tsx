@@ -45,7 +45,7 @@ const FEATURES: Array<{ title: string; body: string }> = [
   },
   {
     title: 'Triage inbox',
-    body: 'Questions, permissions, finished chats and ticket updates as one card queue you clear like email: answer inline, reply to finished runs, or dismiss with Mark read. One OS notification per burst; a thinking meter counts what is working now.'
+    body: 'Questions, permissions, finished chats and ticket updates as one card queue you clear like email: answer inline, reply to finished runs, or dismiss with Mark read. One OS notification per burst; the active-work meter shows ticket agents alongside active chats.'
   },
   {
     title: 'Parallel review pipeline',

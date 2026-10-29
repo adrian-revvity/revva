@@ -27,7 +27,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Separator } from '@/components/ui/separator'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
-import { workStateLabels } from '@/lib/work-state'
+import { activeWorkLabel, isActiveWorkState, workStateLabels } from '@/lib/work-state'
 import { MD_COMPONENTS } from '@/components/message-markdown'
 import type { FinishedRun, InboxField, PendingItem, TriageEntry, WorkState } from '@shared/types'
 
@@ -151,19 +151,19 @@ export function InboxView({
   const chats = useQuery({ queryKey: ['chats'], queryFn: () => window.revva.chat.list(), enabled: false })
   const activityReady = service.data?.state === 'connected' && !activity.isError && !!activity.data
   const thinking = useMemo<ThinkingSession[]>(() => {
-    if (!activityReady) return []
     const active = new Set(activity.data ?? [])
     const sessions: ThinkingSession[] = []
     for (const w of works.data ?? []) {
-      if (!w.sessionId || !active.has(w.sessionId)) continue
-      if (w.state === 'ABANDONED' || w.state === 'SHIPPED') continue
+      if (!isActiveWorkState(w.state)) continue
       sessions.push({ kind: 'work', id: w.id, label: w.ticketKey, state: w.state })
     }
+    if (!activityReady) return sessions
     for (const c of chats.data ?? []) {
       if (active.has(c.sessionId)) sessions.push({ kind: 'chat', id: c.sessionId, label: c.title })
     }
     return sessions
   }, [activityReady, activity.data, works.data, chats.data])
+  const showThinkingMeter = activityReady || thinking.length > 0
   const [focusMode, setFocusMode] = useState(true)
   const [selection, setSelection] = useState<{ key: string; index: number } | null>(null)
   const selectedIndex = selection ? entries.findIndex((entry) => entryKey(entry) === selection.key) : -1
@@ -191,7 +191,7 @@ export function InboxView({
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-5xl space-y-4 px-4 py-6 sm:px-6">
-        {activityReady && (
+        {showThinkingMeter && (
           <div className="pointer-events-none sticky top-2 z-10 flex h-0 items-start justify-end pr-1">
             <ThinkingMeter sessions={thinking} onOpenWork={onOpenWork} onOpenChat={onOpenChat} />
           </div>
@@ -350,7 +350,7 @@ function ThinkingMeter({
         )}
         <span className="text-[13px] font-semibold tabular-nums">
           {active ? (
-            <>{sessions.length} <span className="font-medium text-muted-foreground">thinking</span></>
+            <>{sessions.length} <span className="font-medium text-muted-foreground">active</span></>
           ) : (
             <span className="font-medium text-muted-foreground">All quiet</span>
           )}
@@ -358,7 +358,7 @@ function ThinkingMeter({
       </div>
       {active && (
         <nav
-          aria-label="Thinking sessions"
+          aria-label="Active sessions and ticket work"
           className="max-h-0 overflow-hidden border-x border-b border-transparent opacity-0 transition-[max-height,opacity,border-color] duration-200 ease-out group-hover/meter:max-h-64 group-hover/meter:border-border group-hover/meter:opacity-100 group-focus-within/meter:max-h-64 group-focus-within/meter:border-border group-focus-within/meter:opacity-100 motion-reduce:transition-none"
         >
           <div className="px-1.5 py-1">
@@ -377,7 +377,7 @@ function ThinkingMeter({
                 <span className="min-w-0 flex-1 truncate font-medium">{s.label}</span>
                 {s.kind === 'work' && (
                   <span className={cn('shrink-0 text-[10px]', THINKING_STATE_STYLES[s.state] ?? 'text-muted-foreground')}>
-                    {workStateLabels[s.state].toLowerCase()}
+                    {activeWorkLabel(s.state)}
                   </span>
                 )}
               </button>
