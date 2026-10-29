@@ -28,20 +28,21 @@ Jira sprint board ──▶ pick tickets ──▶ worktree + branch per ticket
 ## Features
 
 1. **Dashboard** — the landing view summarizes everything: OpenCode health, Jira sprint progress, inbox, active pipeline work, PRs needing attention, script status, recent chats. Every card deep-links into its view.
-2. **Sprint board (Jira)** — fetches Jira issues assigned to you in the current sprint (via the Atlassian MCP server, using Revva's own OAuth connection — never another app's token cache).
-3. **Start work** — creates a git worktree + branch per ticket in a workspace folder you pick (worktree root configurable), optionally **branching from another ticket's branch** (stacked work; the PR base follows the parent's branch, gh-stack-compatible). A **worktree cleanup** dialog lists every worktree across your repos, flags live ones, and removes stale ones safely (branches only deleted when git agrees they're merged).
+2. **Sprint board (Jira)** — fetches Jira issues assigned to you in the current sprint (via the Atlassian MCP server, using Revva's own OAuth connection — never another app's token cache). Tickets are compact drag-and-drop tiles: pin the ones that matter to **Important**, park the rest in the **Not right now** shelf.
+3. **Start work** — creates a git worktree + branch per ticket in a workspace folder you pick (worktree root configurable), optionally **branching from another ticket's branch** (stacked work; the PR base follows the parent's branch, gh-stack-compatible). A **worktree cleanup** dialog lists every worktree across your repos, flags live ones, and removes stale ones safely — deletion previews exactly what it destroys and needs an explicit confirmation bound to the worktree's contents.
 4. **Optional `/grill-me` phase** — before coding, the agent grills you about the ticket until the plan is solid; its output seeds the build.
-5. **Agent/model selection everywhere** — every agent and model exposed by your OpenCode service is eligible. Per-role defaults (Sol-loop, test audit, UI review, fixer) live in Setup; any run can override each reviewer and the fixer individually. Models whose provider needs a local endpoint are marked until that port is listening.
+5. **Agent/model selection everywhere** — every agent and model exposed by your OpenCode service is eligible. Per-role defaults (Sol-loop, test audit, UI review, fixer) live in Setup; any run can override each reviewer and the fixer individually. You can even **switch model or agent mid-conversation** — the next turn runs with the new pick, same history. Models whose provider needs a local endpoint are marked until that port is listening.
 6. **Scripts** — add your own one-click shell scripts (aliases work; runs in interactive zsh), e.g. your `morning` AWS/SSO/proxy routine. Revva just runs them, streams output, and can probe a local port they open; it ships no AWS-specific logic.
-7. **General chat** — a global **New Chat** action starts a normal OpenCode session with a chosen workspace directory, agent, and model — no Jira ticket or pipeline required.
-8. **Ticket cockpit** — live agent output (streaming text, tool calls), follow-up composer, interrupt, and a shared transcript view. Agent messages render full markdown (GFM: tables, task lists, code blocks; links open in your browser).
-9. **Question inbox** — global view of every **pending question (form)** and **permission request** across Revva sessions; answer inline without leaving the app. Every answer is audited.
+7. **General chat** — a global **New Chat** action starts a normal OpenCode session with a chosen workspace directory, agent, and model — no Jira ticket or pipeline required. Chats are auto-titled from your first message, group under their ticket, and markdown renders while the answer streams. Chats show live context usage and streamed tokens/sec.
+8. **Ticket cockpit** — live agent output (streaming text, tool calls collapsed per turn), follow-up composer, interrupt, and a shared transcript view. Agent messages render full markdown (GFM: tables, task lists, code blocks; links open in your browser).
+9. **Triage inbox** — pending questions, permission requests, finished chats and ticket updates arrive as one queue you clear card by card, like email. Answer inline, reply to finished runs directly, or dismiss with Mark read. Near-simultaneous events raise a single OS notification, and a thinking meter counts what the agents are working on right now.
 10. **Parallel review pipeline** — when the build finishes, revva fans out **concurrent read-only reviewers**: sol-loop protocol, test audit, and UI review (impeccable) only when UI files changed. Verdict protocol per reviewer; incomplete/errored reviewers block approval and skipped ≠ approved. Findings fan in to **one fixer** session, then bounded parallel re-review rounds (default 3, max 5). Live read-only transcripts per reviewer.
 11. **Ship** — pre-flight checks (gh present/auth, GitHub remote, clean tree, commits ahead), `git push` (never force), `gh pr create` with a review-gate summary, opens the PR in your browser, then transitions Jira to a review-ish status and post a summary comment. revva never merges. Pushing/shipping is **opt-in per run** ("Push when changes are done"): when approved with a PR already linked, revva pushes to that PR; otherwise it opens one. In an ad-hoc session you can also just tell the agent "push when the changes are done".
 12. **AUTO mode** — opt-in per run: the agent picks recommended/safe options, minimizes routine questions, and after all review gates pass revva pushes + opens the PR by itself. Genuine blockers park the work in WAITING_HUMAN with the reason; gates are never skipped and decisions are logged to an audit ledger.
 13. **Comment watcher** — polls Jira for new comments on shipped tickets (excluding revva's own); a **"Tackle comments"** button runs a rework agent on the branch, pushes the fixes onto the open PR, and posts the agent's reply back to Jira.
-14. **GitHub tab** — your open PRs (authored / review-requested) across all your projects via the `gh` CLI; a **Review** button checks out the PR head into a worktree and starts a review agent session with a tunable prompt.
-15. **Prompt tuning + favorites** — Setup holds per-role agent/model defaults (build, reviewers, fixer, PR review), editable prompt templates for every one-click button, and starred favorite models that pin to the top of every picker.
+14. **GitHub tab** — your open PRs (authored / review-requested) across all your projects via the `gh` CLI, as action-first tiles. **Chat with this PR** opens a conversation in a fitting folder without cloning; the **PR menu** carries review, conflict resolution, push, rebase, merge (GitHub still enforces its rules) and AI-updated PR descriptions; stacked PRs read as stacks (gh-stack-compatible). Alerts track only PRs you authored, with an unseen-updates strip that jumps to the card.
+15. **Prompt tuning + favorites** — Setup holds per-role agent/model defaults (build, reviewers, fixer, PR review, PR description), editable prompt templates for every one-click button, and starred favorite models that pin to the top of every picker.
+16. **Made for long runs** — a keep-awake toggle holds off Mac sleep while agents work; conversation switching never loses live output; idle chats clear in one sweep; abandoned work can be removed safely, merged branches included.
 
 The same list is available in-app: **Setup → Features**.
 
@@ -49,20 +50,28 @@ The same list is available in-app: **Setup → Features**.
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/images/jira.png" alt="Jira sprint board with per-ticket Start flow"></td>
-    <td width="50%"><img src="docs/images/cockpit.png" alt="Ticket cockpit with live streaming transcript and tool calls"></td>
+    <td width="50%"><img src="docs/images/inbox.png" alt="Triage inbox: finished run ready to answer, thinking meter, inline reply composer"></td>
+    <td width="50%"><img src="docs/images/github.png" alt="GitHub tab as drag-and-drop PR tiles with Chat with this PR, review stack badges and merge actions"></td>
+  </tr>
+  <tr>
+    <td><b>Triage inbox</b> — questions, finished runs and PR updates as one card queue; answer or dismiss without leaving the view.</td>
+    <td><b>GitHub</b> — open PRs as tiles you can pin, <i>Chat with this PR</i>, review, rebase and merge from Revva.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/jira.png" alt="Jira sprint board as ticket tiles with Start buttons and pin/park controls"></td>
+    <td><img src="docs/images/cockpit.png" alt="PR-linked conversation with grouped tool steps, PR menu and model switcher"></td>
   </tr>
   <tr>
     <td><b>Jira sprint board</b> — your tickets, one <i>Start flow</i> click from worktree + branch + agent.</td>
-    <td><b>Ticket cockpit</b> — live transcript, tool calls, follow-up composer, per-reviewer pipeline state.</td>
+    <td><b>Conversations</b> — grouped tool steps, live model/agent switcher, one <code>PR #n</code> menu beside the transcript.</td>
   </tr>
   <tr>
-    <td><img src="docs/images/github.png" alt="GitHub tab listing open PRs across projects with one-click review"></td>
     <td><img src="docs/images/scripts.png" alt="Scripts tab with one-click shell scripts and port probes"></td>
+    <td></td>
   </tr>
   <tr>
-    <td><b>GitHub</b> — open PRs across all your repos; <i>Review</i> spins up a read-only agent on the PR head.</td>
     <td><b>Scripts</b> — your shell routines (e.g. <code>morning</code>) as one-click buttons with live output.</td>
+    <td></td>
   </tr>
 </table>
 
