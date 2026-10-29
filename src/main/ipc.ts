@@ -39,6 +39,7 @@ import {
   promptImageSchema,
   promptRefsSchema,
   worktreeRemoveInputSchema,
+  workAbandonInputSchema,
   type PromptImage,
   type PromptRefs
 } from '@shared/types'
@@ -256,9 +257,13 @@ export function registerIpc(): void {
 
   /* ---------- worktree cleanup ---------- */
   ipcMain.handle(IPC.worktreeList, () => worktreeManager.list())
+  ipcMain.handle(IPC.worktreePreflight, (_e, input: unknown) => {
+    const { repoDir, directory } = worktreeRemoveInputSchema.parse(input)
+    return worktreeManager.preflight(repoDir, directory)
+  })
   ipcMain.handle(IPC.worktreeRemove, (_e, input: unknown) => {
     const parsed = worktreeRemoveInputSchema.parse(input)
-    return worktreeManager.remove(parsed.repoDir, parsed.directory, parsed.force)
+    return worktreeManager.remove(parsed.repoDir, parsed.directory, parsed.confirmedSignature, parsed.confirmed)
   })
 
   /* ---------- jira ---------- */
@@ -288,7 +293,11 @@ export function registerIpc(): void {
   /* ---------- works (ticket pipeline) ---------- */
   ipcMain.handle(IPC.workStart, (_e, input: unknown) => workManager.start(startWorkInputSchema.parse(input)))
   ipcMain.handle(IPC.workList, () => workManager.list())
-  ipcMain.handle(IPC.workAbandon, (_e, id: string) => workManager.abandon(String(id)))
+  ipcMain.handle(IPC.workAbandonPreflight, (_e, id: string) => workManager.abandonPreflight(String(id)))
+  ipcMain.handle(IPC.workAbandon, (_e, input: unknown) => {
+    const parsed = workAbandonInputSchema.parse(input)
+    return workManager.abandon(parsed.id, parsed.confirmedSignature, parsed.confirmed)
+  })
   ipcMain.handle(IPC.workMessages, (_e, sessionId: string) => chatManager.messages(String(sessionId)))
   ipcMain.handle(IPC.workPrompt, (_e, sessionId: string, text: string, images?: unknown, queued?: unknown, refs?: unknown) =>
     workManager.followUp(String(sessionId), String(text), promptImageList(images), Boolean(queued), promptRefs(refs))

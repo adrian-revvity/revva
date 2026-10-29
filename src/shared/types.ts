@@ -202,12 +202,77 @@ export const worktreeInfoSchema = z.object({
 })
 export type WorktreeInfo = z.infer<typeof worktreeInfoSchema>
 
+/**
+ * Read-only proof gathered before any removal (main process, `worktrees.preflight`).
+ * A throw means the path must not be touched at all (unprovable or forbidden:
+ * main checkout, unregistered — no exceptions, nested, locked, over-limit or
+ * unreadable state). A return describes reality: a `missing` folder means at
+ * most one stale git registration is cleared (inert); an existing folder means
+ * removal destroys files, and `confirmationReasons` counts exactly what
+ * (contents are never shown) — `requiresConfirmation` then demands the user's
+ * explicit per-worktree confirmation before execution. The `signature` binds
+ * not just the porcelain status but the raw Git index state (`diff --cached
+ * --raw -z` entries with blob OIDs — staged contents can change while status
+ * and disk look untouched) and a per-path content fingerprint (size, mode,
+ * inode, mtimeNs, ctimeNs, symlink target strings, nested ignored/untracked
+ * content scanned under hard caps), so staging different content or editing an
+ * already-dirty or already untracked file between preview and execution voids
+ * the confirmation. Removal
+ * is still NOT race-free (an exact-mtime rewrite passes the fingerprint, and
+ * nothing can stop a writer between the last check and the unlink) — the UI
+ * must warn. Execution re-proves everything immediately before acting and
+ * refuses on any drift or uncheckable state.
+ */
+export const worktreeRemovalPreflightSchema = z.object({
+  /** Canonical repository root the registration was proven against. */
+  repoDir: z.string(),
+  /** Canonical worktree path. */
+  directory: z.string(),
+  branch: z.string().optional(),
+  detached: z.boolean(),
+  /** The folder provably does not exist; only git's registration may linger. */
+  missing: z.boolean(),
+  /** Counts of what removal would destroy — every category, contents never shown. */
+  trackedDirty: z.number().int().min(0),
+  untracked: z.number().int().min(0),
+  ignored: z.number().int().min(0),
+  /** True when the folder exists and holds anything (tracked / untracked / ignored / detached HEAD) — explicit confirmation required. */
+  requiresConfirmation: z.boolean(),
+  /** Human-readable destruction warnings shown verbatim, per worktree. */
+  confirmationReasons: z.array(z.string()),
+  /** Content-bound optimistic-concurrency token; execution re-proves and refuses on any drift. */
+  signature: z.string()
+})
+export type WorktreeRemovalPreflight = z.infer<typeof worktreeRemovalPreflightSchema>
+
 export const worktreeRemoveInputSchema = z.object({
   repoDir: z.string().min(1),
   directory: z.string().min(1),
-  force: z.boolean().default(true)
+  /** Must equal the preflight signature the user was shown; any drift voids it. */
+  confirmedSignature: z.string().default(''),
+  /** The user explicitly confirmed THIS worktree (checked against a fresh requiresConfirmation). */
+  confirmed: z.boolean().default(false)
 })
 export type WorktreeRemoveInput = z.infer<typeof worktreeRemoveInputSchema>
+
+export const workAbandonInputSchema = z.object({
+  id: z.string().min(1),
+  /** Must equal `work.abandonPreflight().worktree.signature` when it required confirmation. */
+  confirmedSignature: z.string().default(''),
+  /** The user explicitly confirmed this ticket's worktree removal (checked against a fresh requiresConfirmation). */
+  confirmed: z.boolean().default(false)
+})
+export type WorkAbandonInput = z.infer<typeof workAbandonInputSchema>
+
+/** Everything the abandon confirmation needs: work identity + the worktree proof. */
+export const workAbandonPreflightSchema = z.object({
+  workId: z.string(),
+  ticketKey: z.string(),
+  branch: z.string(),
+  worktreeDir: z.string(),
+  worktree: worktreeRemovalPreflightSchema
+})
+export type WorkAbandonPreflight = z.infer<typeof workAbandonPreflightSchema>
 
 /* ---------- Composer autocomplete ---------- */
 
@@ -743,6 +808,8 @@ export interface RevvaApi {
   worktrees: {
     /** Linked worktrees across known repos (revva-created or not). */
     list(): Promise<WorktreeInfo[]>
+    /** Read-only safety proof for one removal path; throws a refusal when the path is not safe. */
+    preflight(input: { repoDir: string; directory: string }): Promise<WorktreeRemovalPreflight>
     /** Removes the worktree; deletes its branch only when git allows (`-d`). Returns a note. */
     remove(input: WorktreeRemoveInput): Promise<string | undefined>
   }
@@ -756,7 +823,9 @@ export interface RevvaApi {
   work: {
     start(input: StartWorkInput): Promise<WorkSummary>
     list(): Promise<WorkSummary[]>
-    abandon(id: string): Promise<string | undefined>
+    /** Read-only proof of what abandoning would destroy (worktree safety + notes). */
+    abandonPreflight(id: string): Promise<WorkAbandonPreflight>
+    abandon(input: WorkAbandonInput): Promise<string | undefined>
     messages(sessionId: string): Promise<ChatMessage[]>
     prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs): Promise<void>
     interrupt(sessionId: string): Promise<void>

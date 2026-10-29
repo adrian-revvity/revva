@@ -61,6 +61,7 @@ const api: RevvaApi = {
   },
   worktrees: {
     list: () => ipcRenderer.invoke(IPC.worktreeList),
+    preflight: (input) => ipcRenderer.invoke(IPC.worktreePreflight, input),
     remove: (input) => ipcRenderer.invoke(IPC.worktreeRemove, input)
   },
   jira: {
@@ -73,7 +74,8 @@ const api: RevvaApi = {
   work: {
     start: (input) => ipcRenderer.invoke(IPC.workStart, input),
     list: () => ipcRenderer.invoke(IPC.workList),
-    abandon: (id) => ipcRenderer.invoke(IPC.workAbandon, id),
+    abandonPreflight: (id) => ipcRenderer.invoke(IPC.workAbandonPreflight, id),
+    abandon: (input) => ipcRenderer.invoke(IPC.workAbandon, input),
     messages: (sessionId) => ipcRenderer.invoke(IPC.workMessages, sessionId),
     prompt: (sessionId, text, images, queued, refs) => ipcRenderer.invoke(IPC.workPrompt, sessionId, text, images, queued, refs),
     interrupt: (sessionId) => ipcRenderer.invoke(IPC.workInterrupt, sessionId),
