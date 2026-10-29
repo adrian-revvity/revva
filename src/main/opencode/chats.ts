@@ -291,7 +291,8 @@ class ChatManager {
           id: i.id,
           text: i.payload.text ?? '',
           imageCount: (i.payload.files ?? []).length,
-          createdAt: i.time?.created ?? 0
+          createdAt: i.time?.created ?? 0,
+          delivery: i.delivery
         }))
     } catch {
       return []
@@ -300,6 +301,13 @@ class ChatManager {
 
   async cancelQueued(sessionId: string, inboxId: string): Promise<void> {
     await openCodeService.api.session.inbox.cancel({ sessionID: sessionId, inboxID: inboxId })
+  }
+
+  /** Force a waiting message through: switch it to steer delivery so the
+   *  running agent reads it at the next step boundary instead of waiting
+   *  behind the queue. Throws (409) if the item was already delivered. */
+  async promoteQueued(sessionId: string, inboxId: string): Promise<void> {
+    await openCodeService.api.session.inbox.update({ sessionID: sessionId, inboxID: inboxId, delivery: 'steer' })
   }
 
   async prompt(sessionId: string, text: string, images: PromptImage[] = [], queued = false, refs?: PromptRefs): Promise<void> {

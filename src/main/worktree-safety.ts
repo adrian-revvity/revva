@@ -85,6 +85,7 @@ import { createHash } from 'node:crypto'
 import { lstat, readdir, readlink, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { isAbsolute, join, parse, resolve, sep } from 'node:path'
+import { isLocationNotFoundError } from '@opencode/client'
 import { openCodeService } from './opencode/service'
 import type { WorktreeRemovalPreflight } from '@shared/types'
 
@@ -749,7 +750,23 @@ export async function probeActiveAgentsInside(canonicalDirectory: string): Promi
     }
     // Interactive terminals are writers too. PTY listing is location-scoped by
     // design; a location the service does not know hosts no service PTYs.
-    const res = await api.pty.list({ location: { directory: canonicalDirectory } })
+    let res: Awaited<ReturnType<typeof api.pty.list>>
+    try {
+      res = await api.pty.list({ location: { directory: canonicalDirectory } })
+    } catch (err) {
+      // The service answers LocationNotFoundError (404) for a directory it cannot
+      // resolve — in practice one that no longer exists. Absence of the folder is
+      // provable here, and a folder that is gone hosts no running terminal, so
+      // this specific failure proves rather than hides occupancy (a live session
+      // inside a gone folder would already have been caught above). Any other
+      // error, or a 404 for a folder that still exists (the service contradicts
+      // the filesystem — uncheckable), keeps failing closed.
+      if (!isLocationNotFoundError(err)) throw err
+      if (!(await pathGone(canonicalDirectory))) {
+        throw new Error(`the service reports ${canonicalDirectory} as an unknown location while the folder exists`)
+      }
+      return { free: true, reason: '' }
+    }
     for (const pty of res.data) {
       if (pty.status !== 'running') continue
       if (typeof pty.cwd !== 'string' || !pty.cwd) {

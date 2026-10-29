@@ -14,6 +14,7 @@ import {
   Loader2,
   MessageSquareDot,
   MessageSquareText,
+  MessageSquareWarning,
   Pin,
   PinOff,
   RefreshCw,
@@ -105,6 +106,20 @@ export function GitHubView({
     mutationFn: (prUrl: string) => window.revva.github.solveConflicts(prUrl),
     onSuccess: (res) => {
       void qc.invalidateQueries({ queryKey: ['chats'] })
+      onOpenChat(res.sessionId)
+    },
+    onError: (e: Error) => {
+      void qc.invalidateQueries({ queryKey: ['chats'] })
+      setActionError(e.message)
+    }
+  })
+  const solveComments = useMutation({
+    mutationFn: (prUrl: string) => window.revva.github.solveComments(prUrl),
+    onSuccess: (res) => {
+      setActionError(null)
+      void qc.invalidateQueries({ queryKey: ['chats'] })
+      void qc.invalidateQueries({ queryKey: ['gh-prs'] })
+      void qc.invalidateQueries({ queryKey: ['gh-alerts'] })
       onOpenChat(res.sessionId)
     },
     onError: (e: Error) => {
@@ -204,6 +219,7 @@ export function GitHubView({
                       {a.kinds.includes('conflict') && <AlertTriangle className="size-3.5 text-red-500" />}
                       {a.kinds.includes('approval') && <Check className="size-3.5 text-green-600 dark:text-green-400" />}
                       {a.kinds.includes('comment') && <MessageSquareDot className="size-3.5 text-muted-foreground" />}
+                      {a.kinds.includes('review') && <MessageSquareWarning className="size-3.5 text-amber-600 dark:text-amber-400" />}
                     </span>
                     <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
                       {a.repo}#{a.number}
@@ -252,6 +268,7 @@ export function GitHubView({
             mergingUrl={merge.isPending ? (merge.variables?.prUrl ?? null) : null}
             rebasingUrl={rebase.isPending ? rebase.variables : null}
             solvingUrl={solveConflicts.isPending ? solveConflicts.variables : null}
+            answeringUrl={solveComments.isPending ? solveComments.variables : null}
             reviewing={review.isPending}
             onMarkSeen={(url) => {
               void window.revva.github.markSeen(url)
@@ -263,6 +280,10 @@ export function GitHubView({
             onSolve={(url) => {
               setActionError(null)
               solveConflicts.mutate(url)
+            }}
+            onAnswerComments={(url) => {
+              setActionError(null)
+              solveComments.mutate(url)
             }}
             onReview={(url) => {
               setBusyUrl(url)
@@ -290,11 +311,13 @@ function PrBoard({
   mergingUrl,
   rebasingUrl,
   solvingUrl,
+  answeringUrl,
   reviewing,
   onMarkSeen,
   onMerge,
   onRebase,
   onSolve,
+  onAnswerComments,
   onReview,
   onOpenChat,
   onChat,
@@ -306,11 +329,13 @@ function PrBoard({
   mergingUrl: string | null
   rebasingUrl: string | null
   solvingUrl: string | null
+  answeringUrl: string | null
   reviewing: boolean
   onMarkSeen: (url: string) => void
   onMerge: (method: PrMergeMethod, url: string) => void
   onRebase: (url: string) => void
   onSolve: (url: string) => void
+  onAnswerComments: (url: string) => void
   onReview: (url: string) => void
   onOpenChat: (sessionId: string) => void
   onChat: (url: string) => void
@@ -396,6 +421,7 @@ function PrBoard({
         merging={mergingUrl === url}
         rebasing={rebasingUrl === url}
         solving={solvingUrl === url}
+        answering={answeringUrl === url}
         reviewing={reviewing}
         chainKey={chains.get(url)}
         chainHighlighted={!!chains.get(url) && chains.get(url) !== url && hoveredChain === chains.get(url)}
@@ -404,6 +430,7 @@ function PrBoard({
         onMerge={(method) => onMerge(method, url)}
         onRebase={() => onRebase(url)}
         onSolve={() => onSolve(url)}
+        onAnswerComments={() => onAnswerComments(url)}
         onReview={() => onReview(url)}
         onMove={(to) => commit(moveToZone(zones, url, to))}
         onChat={() => onChat(url)}
@@ -465,6 +492,7 @@ function PrCard({
   merging,
   rebasing,
   solving,
+  answering,
   reviewing,
   chainKey,
   chainHighlighted,
@@ -473,6 +501,7 @@ function PrCard({
   onMerge,
   onRebase,
   onSolve,
+  onAnswerComments,
   onReview,
   onMove,
   onChat,
@@ -485,6 +514,7 @@ function PrCard({
   merging: boolean
   rebasing: boolean
   solving: boolean
+  answering: boolean
   reviewing: boolean
   /** Stack chain identity (repo + root branch); equals the PR's own url when unstacked. */
   chainKey?: string
@@ -495,6 +525,7 @@ function PrCard({
   onMerge: (method: PrMergeMethod) => void
   onRebase: () => void
   onSolve: () => void
+  onAnswerComments: () => void
   onReview: () => void
   onMove: (to: 'important' | 'main' | 'later') => void
   onChat: () => void
@@ -502,7 +533,7 @@ function PrCard({
   /** Alert-strip jump landed on this card — pulse it. */
   flash: boolean
 }): React.JSX.Element {
-  const unseen = pr.hasNewComments || pr.hasNewConflicts || pr.hasNewApproval
+  const unseen = pr.hasNewComments || pr.hasNewConflicts || pr.hasNewApproval || pr.hasNewReviewThreads
   // gh only lists open PRs; a closed row can only come from a stale cache.
   const open = pr.state.toLowerCase() === 'open'
   // Based on something other than the repo's default branch → a layer of a stack.
@@ -575,6 +606,34 @@ function PrCard({
             <MessageSquareDot className="size-2.5" />
             {pr.latestOtherCommentAuthor}
           </Badge>
+        )}
+        {!!pr.unresolvedThreads && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="shrink-0 disabled:opacity-60"
+                disabled={answering}
+                onClick={onAnswerComments}
+              >
+                <Badge
+                  variant="secondary"
+                  className={cn(
+                    'cursor-pointer gap-0.5 border-transparent text-[9px]',
+                    pr.hasNewReviewThreads
+                      ? 'bg-amber-500/15 text-amber-600 hover:bg-amber-500/25 dark:text-amber-400'
+                      : 'text-muted-foreground hover:bg-muted'
+                  )}
+                >
+                  <MessageSquareWarning className="size-2.5" />
+                  {answering ? 'Starting…' : `${pr.unresolvedThreads} unresolved`}
+                </Badge>
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>
+              Review threads waiting on you — starts a chat that fixes, answers and resolves them
+            </TooltipContent>
+          </Tooltip>
         )}
       </div>
 

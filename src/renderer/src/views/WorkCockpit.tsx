@@ -61,7 +61,7 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
     return {
       queryKey: ['work-messages'],
       load: (id) => window.revva.work.messages(id),
-      send: (id, text, images, queued, refs) => window.revva.work.prompt(id, text, images, queued, refs),
+      send: (id, text, images, queued, refs, sentAt) => window.revva.work.prompt(id, text, images, queued, refs, sentAt),
       interrupt: (id) => window.revva.work.interrupt(id)
     }
   }, [work.id])

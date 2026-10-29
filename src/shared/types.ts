@@ -172,12 +172,14 @@ export const promptImageSchema = z.object({
 })
 export type PromptImage = z.infer<typeof promptImageSchema>
 
-/** One message waiting in OpenCode's session inbox. */
+/** One message waiting in OpenCode's session inbox. `steer` items are already
+ *  injected into the running turn at the next step boundary; `queue` waits idle. */
 export const queuedMessageSchema = z.object({
   id: z.string(),
   text: z.string(),
   imageCount: z.number(),
-  createdAt: z.number()
+  createdAt: z.number(),
+  delivery: z.enum(['queue', 'steer'])
 })
 export type QueuedMessage = z.infer<typeof queuedMessageSchema>
 
@@ -255,6 +257,12 @@ export const worktreeRemoveInputSchema = z.object({
 })
 export type WorktreeRemoveInput = z.infer<typeof worktreeRemoveInputSchema>
 
+export const worktreeInspectInputSchema = z.object({
+  repoDir: z.string().min(1),
+  directory: z.string().min(1)
+})
+export type WorktreeInspectInput = z.infer<typeof worktreeInspectInputSchema>
+
 export const workAbandonInputSchema = z.object({
   id: z.string().min(1),
   /** Must equal `work.abandonPreflight().worktree.signature` when it required confirmation. */
@@ -306,8 +314,12 @@ export const ticketSchema = z.object({
   statusCategory: z.string(),
   storyPoints: z.number().optional(),
   issueTypeName: z.string().optional(),
+  subtaskCount: z.number().optional(),
+  parentKey: z.string().optional(),
   dependsOn: z.array(z.string()),
-  url: z.string().optional()
+  url: z.string().optional(),
+  /** The raw MCP payload, for fields the DTO does not model yet. */
+  raw: z.unknown().optional()
 })
 export type Ticket = z.infer<typeof ticketSchema>
 
@@ -495,7 +507,9 @@ export const pullRequestSchema = z.object({
   /** Repository default branch (enriched) — base !== this means the PR stacks on something. */
   defaultBranch: z.string().optional(),
   /** Open review threads the user still has to answer (enriched). */
-  unresolvedThreads: z.number().optional()
+  unresolvedThreads: z.number().optional(),
+  /** More unresolved threads than when the user last looked. */
+  hasNewReviewThreads: z.boolean().optional()
 })
 export type PullRequest = z.infer<typeof pullRequestSchema>
 
@@ -508,7 +522,7 @@ export const prAlertSchema = z.object({
   repo: z.string(),
   number: z.number(),
   title: z.string(),
-  kinds: z.array(z.enum(['comment', 'conflict', 'approval']))
+  kinds: z.array(z.enum(['comment', 'conflict', 'approval', 'review']))
 })
 export type PrAlert = z.infer<typeof prAlertSchema>
 
@@ -708,12 +722,13 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('session.model'), sessionId: z.string() }),
   z.object({ kind: z.literal('session.agent'), sessionId: z.string() }),
   z.object({ kind: z.literal('session.activity'), sessionId: z.string(), running: z.boolean() }),
-  /** Estimated streamed output rate; pauses remain in the wall-clock window. */
+  /** Output tokens / elapsed time since Send; frozen when the interaction ends. */
   z.object({
     kind: z.literal('session.throughput'),
     sessionId: z.string(),
     tokensPerSecond: z.number(),
-    windowTokens: z.number(),
+    totalTokens: z.number(),
+    estimated: z.boolean(),
     elapsedMs: z.number(),
     msSinceOutput: z.number().nullable(),
     running: z.boolean()
@@ -782,7 +797,7 @@ export interface RevvaApi {
     create(input: ChatCreateInput): Promise<ChatSummary>
     messages(sessionId: string): Promise<ChatMessage[]>
     /** `queued` = park in the inbox behind the running turn instead of steering into it. */
-    prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs): Promise<void>
+    prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs, sentAt?: number): Promise<void>
     interrupt(sessionId: string): Promise<void>
     rename(sessionId: string, title: string): Promise<void>
     setTicket(sessionId: string, ticketKey: string | null): Promise<void>
@@ -804,6 +819,8 @@ export interface RevvaApi {
     /** Messages waiting in OpenCode's inbox for this session. */
     queue(sessionId: string): Promise<QueuedMessage[]>
     cancelQueued(sessionId: string, inboxId: string): Promise<void>
+    /** Promote a queued message to steer delivery — the running agent reads it at the next step boundary. */
+    promoteQueued(sessionId: string, inboxId: string): Promise<void>
   }
   worktrees: {
     /** Linked worktrees across known repos (revva-created or not). */
@@ -812,6 +829,8 @@ export interface RevvaApi {
     preflight(input: { repoDir: string; directory: string }): Promise<WorktreeRemovalPreflight>
     /** Removes the worktree; deletes its branch only when git allows (`-d`). Returns a note. */
     remove(input: WorktreeRemoveInput): Promise<string | undefined>
+    /** Opens an audit chat answering "can this worktree be removed, or is uncommitted/unpushed work in it?". */
+    inspect(input: WorktreeInspectInput): Promise<TaskSessionResult>
   }
   jira: {
     status(): Promise<JiraStatus>
@@ -819,6 +838,8 @@ export interface RevvaApi {
     reconnect(): Promise<void>
     disconnect(): Promise<{ connected: boolean; expired: boolean; expiresAt?: number }>
     board(): Promise<Ticket[]>
+    /** Sub-tickets of one issue, in board order. */
+    subtasks(key: string): Promise<Ticket[]>
   }
   work: {
     start(input: StartWorkInput): Promise<WorkSummary>
@@ -827,7 +848,7 @@ export interface RevvaApi {
     abandonPreflight(id: string): Promise<WorkAbandonPreflight>
     abandon(input: WorkAbandonInput): Promise<string | undefined>
     messages(sessionId: string): Promise<ChatMessage[]>
-    prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs): Promise<void>
+    prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs, sentAt?: number): Promise<void>
     interrupt(sessionId: string): Promise<void>
     /** Review ledger for one work (all rounds). */
     reviews(workId: string): Promise<ReviewRow[]>
@@ -859,6 +880,8 @@ export interface RevvaApi {
     chat(prUrl: string): Promise<TaskSessionResult>
     /** Start a writable chat in an isolated worktree to resolve PR conflicts. */
     solveConflicts(prUrl: string): Promise<TaskSessionResult>
+    /** Chat on the PR's branch that fixes, answers and resolves unresolved review threads. */
+    solveComments(prUrl: string): Promise<TaskSessionResult>
     /** Clear the "new comment/conflict/approval" flags for a PR. */
     markSeen(prUrl: string): Promise<void>
     /** New comments/conflicts/approvals across both scopes (poller-maintained). */

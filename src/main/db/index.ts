@@ -126,6 +126,15 @@ function migrate(db: Database.Database): void {
     addColumnIfMissing(db, 'work', 'review_base', 'TEXT')
     db.exec('PRAGMA user_version = 4;')
   }
+  if (version < 5) {
+    addColumnIfMissing(db, 'ticket', 'issue_type', 'TEXT')
+    addColumnIfMissing(db, 'ticket', 'subtask_count', 'INTEGER')
+    db.exec('PRAGMA user_version = 5;')
+  }
+  if (version < 6) {
+    addColumnIfMissing(db, 'ticket', 'parent_key', 'TEXT')
+    db.exec('PRAGMA user_version = 6;')
+  }
 }
 
 function addColumnIfMissing(db: Database.Database, table: string, column: string, decl: string): boolean {

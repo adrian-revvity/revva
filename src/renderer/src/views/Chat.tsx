@@ -125,7 +125,7 @@ export interface TranscriptDrive {
   queryKey: readonly unknown[]
   load(sessionId: string): Promise<ChatMessage[]>
   /** `queued` = session is busy; park the message in the inbox behind the running turn. */
-  send(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs): Promise<void>
+  send(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs, sentAt?: number): Promise<void>
   interrupt(sessionId: string): Promise<void>
 }
 
@@ -288,17 +288,17 @@ export function TranscriptView({
     ? throughput.tokensPerSecond.toFixed(1)
     : Math.round(throughput?.tokensPerSecond ?? 0).toString()
   const speedValue = throughput
-    ? `~${throughputLabel} t/s`
-    : running ? 'Waiting' : '—'
+    ? `${throughput.estimated ? '~' : ''}${throughputLabel} t/s`
+    : running ? '0 t/s' : '—'
   const speedLabel = throughput && !throughput.running ? 'Last' : 'Speed'
   const statsCard = (
-    <section aria-label="Context and model speed" className="pointer-events-auto w-40 overflow-hidden rounded-xl border bg-background/95 shadow-lg shadow-black/10 backdrop-blur-sm dark:shadow-black/40">
+    <section aria-label="Context and model speed" className="pointer-events-auto w-36 overflow-hidden rounded-lg border bg-background/95">
       <div className="grid grid-cols-[0.8fr_1.2fr] divide-x">
         <Tooltip>
           <TooltipTrigger asChild>
-            <button type="button" className="min-w-0 px-2 py-1.5 text-left hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring">
-              <span className="block text-[10px] text-muted-foreground">Context</span>
-              <span className="block truncate text-sm font-medium tabular-nums">{usageLabel}</span>
+            <button type="button" className="min-w-0 px-1.5 py-1 text-left hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-ring">
+              <span className="block text-[9px] leading-tight text-muted-foreground">Context</span>
+              <span className="block truncate text-[11px] font-normal tabular-nums text-muted-foreground">{usageLabel}</span>
             </button>
           </TooltipTrigger>
           <TooltipContent side="bottom" className="max-w-xs">
@@ -309,20 +309,20 @@ export function TranscriptView({
         </Tooltip>
         <Tooltip>
           <TooltipTrigger asChild>
-            <button type="button" className="min-w-0 px-2 py-1.5 text-left hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring">
-              <span className="block text-[10px] text-muted-foreground">{speedLabel}</span>
-              <span className="block truncate text-sm font-semibold tabular-nums text-foreground">{speedValue}</span>
+            <button type="button" className="min-w-0 px-1.5 py-1 text-left hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-ring">
+              <span className="block text-[9px] leading-tight text-muted-foreground">{speedLabel}</span>
+              <span className="block truncate text-[11px] font-normal tabular-nums text-muted-foreground">{speedValue}</span>
             </button>
           </TooltipTrigger>
           <TooltipContent side="bottom" className="max-w-xs">
             {throughput
               ? <>
-                  <div>{throughput.running ? 'Current estimate' : 'Last response'}: {throughput.windowTokens.toFixed(0)} estimated tokens in the last {throughput.elapsedMs < 1000 ? 'under 1s' : `${Math.round(throughput.elapsedMs / 1000)}s`} ({throughput.tokensPerSecond.toFixed(1)} tokens/s).</div>
-                  <div>Includes time with no streamed output; estimated from text and reasoning (~4 characters/token).</div>
-                  <div>{throughput.msSinceOutput === null ? 'Waiting for the first output.' : `Last output ${Math.max(0, throughput.msSinceOutput / 1000).toFixed(1)}s ago.`}</div>
+                  <div>{throughput.running ? 'Interaction average' : 'Last interaction'}: {throughput.totalTokens.toFixed(0)} {throughput.estimated ? 'estimated ' : ''}output tokens / {(throughput.elapsedMs / 1000).toFixed(1)}s = {throughput.tokensPerSecond.toFixed(1)} tokens/s.</div>
+                  <div>Time starts at Send and includes initial waits, network delays, retries, and tool execution.</div>
+                  <div>Text, reasoning, and tool-call input count. Live output is estimated (~4 characters/token); completed steps use provider token counts.</div>
                   <div className="mt-1 text-muted-foreground">{shortModelLabel}</div>
                 </>
-              : running ? 'Waiting for the first streamed output.' : 'Speed appears after the first response.'}
+              : running ? 'No streamed output received yet; the observed rate is currently 0 tokens/s.' : 'Speed appears after the first response.'}
           </TooltipContent>
         </Tooltip>
       </div>
@@ -472,6 +472,7 @@ export function TranscriptView({
 
   const send = useMutation({
     mutationFn: async () => {
+      const sentAt = Date.now()
       const text = input.trim()
       const images = pendingImages
       // '/new' on its own is a command, not a message.
@@ -499,7 +500,7 @@ export function TranscriptView({
       // Start before awaiting IPC: completion may arrive before prompt() resolves.
       setSendingSession(sessionId)
       try {
-        await drive.send(sessionId, text, images.length ? images : undefined, running, refs)
+        await drive.send(sessionId, text, images.length ? images : undefined, running, refs, sentAt)
       } catch (error) {
         qc.setQueryData<ChatMessage[]>(messageKey, (old = []) => old.filter((message) => message.id !== optimisticId))
         throw error
@@ -526,6 +527,11 @@ export function TranscriptView({
 
   const cancelQueued = useMutation({
     mutationFn: (inboxId: string) => window.revva.session.cancelQueued(sessionId, inboxId),
+    onSettled: () => void qc.invalidateQueries({ queryKey: ['session-queue', sessionId] })
+  })
+
+  const promoteQueued = useMutation({
+    mutationFn: (inboxId: string) => window.revva.session.promoteQueued(sessionId, inboxId),
     onSettled: () => void qc.invalidateQueries({ queryKey: ['session-queue', sessionId] })
   })
 
@@ -608,7 +614,14 @@ export function TranscriptView({
           {queued.length > 0 && (
             <div className="mx-auto mb-2 flex max-w-3xl flex-col gap-1">
               {queued.map((q, i) => (
-                <QueuedRow key={q.id} item={q} position={i + 1} onCancel={() => cancelQueued.mutate(q.id)} />
+                <QueuedRow
+                  key={q.id}
+                  item={q}
+                  position={i + 1}
+                  onCancel={() => cancelQueued.mutate(q.id)}
+                  onSteer={() => promoteQueued.mutate(q.id)}
+                  steering={promoteQueued.isPending && promoteQueued.variables === q.id}
+                />
               ))}
             </div>
           )}
@@ -789,13 +802,41 @@ export function TranscriptView({
   )
 }
 
-/** One waiting inbox message with its position and a cancel affordance. */
-function QueuedRow({ item, position, onCancel }: { item: QueuedMessage; position: number; onCancel: () => void }): React.JSX.Element {
+/** One waiting inbox message with its position, a steer-now affordance for
+ *  queued items, and a cancel button. Steered items show their injected state. */
+function QueuedRow({ item, position, onCancel, onSteer, steering }: {
+  item: QueuedMessage
+  position: number
+  onCancel: () => void
+  onSteer: () => void
+  steering: boolean
+}): React.JSX.Element {
+  const steered = item.delivery === 'steer'
   return (
     <div className="flex items-center gap-2 rounded-md border border-dashed bg-muted/40 px-2.5 py-1.5 text-[11px] text-muted-foreground">
-      <span className="shrink-0 font-medium">#{position} queued</span>
+      <span className="shrink-0 font-medium">
+        {steered ? 'Steering into this turn' : `#${position} queued`}
+      </span>
       <span className="truncate">{item.text || (item.imageCount > 0 ? `${item.imageCount} image(s)` : '(empty)')}</span>
-      <button type="button" aria-label="Remove queued message" className="ml-auto shrink-0 rounded p-0.5 hover:bg-black/10 hover:text-foreground dark:hover:bg-white/10" onClick={onCancel}>
+      {!steered && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label="Steer the running agent with this message now"
+              className="ml-auto shrink-0 rounded px-1.5 py-0.5 font-medium text-foreground hover:bg-black/10 hover:text-foreground dark:hover:bg-white/10"
+              disabled={steering}
+              onClick={onSteer}
+            >
+              {steering ? 'Steering…' : 'Steer now'}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="max-w-xs">
+            Send this message into the current run at the next step boundary instead of waiting for the queue.
+          </TooltipContent>
+        </Tooltip>
+      )}
+      <button type="button" aria-label="Remove queued message" className={cn('shrink-0 rounded p-0.5 hover:bg-black/10 hover:text-foreground dark:hover:bg-white/10', !steered && 'ml-auto')} onClick={onCancel}>
         <X className="size-3" />
       </button>
     </div>
@@ -1150,7 +1191,7 @@ function ComposerRolePickers({ sessionId, container }: {
 export const chatDrive: TranscriptDrive = {
   queryKey: ['chat-messages'],
   load: (id) => window.revva.chat.messages(id),
-  send: (id, text, images, queued, refs) => window.revva.chat.prompt(id, text, images, queued, refs),
+  send: (id, text, images, queued, refs, sentAt) => window.revva.chat.prompt(id, text, images, queued, refs, sentAt),
   interrupt: (id) => window.revva.chat.interrupt(id)
 }
 

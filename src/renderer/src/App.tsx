@@ -531,7 +531,11 @@ export default function App(): React.JSX.Element {
         onCreated={(sessionId) => setView({ kind: 'chat', sessionId })}
       />
 
-      <WorktreesDialog open={worktreesOpen} onOpenChange={setWorktreesOpen} />
+      <WorktreesDialog
+        open={worktreesOpen}
+        onOpenChange={setWorktreesOpen}
+        onOpenChat={(sessionId) => setView({ kind: 'chat', sessionId })}
+      />
 
       <WorktreeRemovalDialog
         open={abandonTarget !== null}

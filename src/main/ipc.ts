@@ -10,12 +10,13 @@ import { IPC, settingsKeySchema, chatCreateInputSchema, modelRefSchema, type Wor
 import { keepAwake } from './keep-awake'
 import { openCodeService } from './opencode/service'
 import { chatManager } from './opencode/chats'
+import { throughputMeter } from './opencode/throughput'
 import { inboxManager } from './opencode/inbox'
 import { triageManager } from './opencode/triage'
 import { listAgents, listModels, listSkills } from './opencode/inventory'
 import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
-import { fetchBoard } from './jira/board'
+import { fetchBoard, fetchSubtasks } from './jira/board'
 import { commentWatcher } from './jira/watch'
 import { workManager } from './pipeline/works'
 import { worktreeManager } from './worktrees'
@@ -39,6 +40,7 @@ import {
   promptImageSchema,
   promptRefsSchema,
   worktreeRemoveInputSchema,
+  worktreeInspectInputSchema,
   workAbandonInputSchema,
   type PromptImage,
   type PromptRefs
@@ -188,8 +190,9 @@ export function registerIpc(): void {
   ipcMain.handle(IPC.chatList, () => chatManager.list())
   ipcMain.handle(IPC.chatCreate, (_e, input: unknown) => chatManager.create(chatCreateInputSchema.parse(input)))
   ipcMain.handle(IPC.chatMessages, (_e, sessionId: string) => chatManager.messages(String(sessionId)))
-  ipcMain.handle(IPC.chatPrompt, (_e, sessionId: string, text: string, images?: unknown, queued?: unknown, refs?: unknown) =>
-    chatManager.prompt(String(sessionId), String(text), promptImageList(images), Boolean(queued), promptRefs(refs))
+  ipcMain.handle(IPC.chatPrompt, (_e, sessionId: string, text: string, images?: unknown, queued?: unknown, refs?: unknown, sentAt?: unknown) =>
+    throughputMeter.measurePrompt(String(sessionId), sentAt, () =>
+      chatManager.prompt(String(sessionId), String(text), promptImageList(images), Boolean(queued), promptRefs(refs)))
   )
   ipcMain.handle(IPC.chatInterrupt, (_e, sessionId: string) => chatManager.interrupt(String(sessionId)))
   ipcMain.handle(IPC.chatSeen, (_e, sessionId: string) => {
@@ -254,6 +257,9 @@ export function registerIpc(): void {
   ipcMain.handle(IPC.sessionQueueCancel, (_e, sessionId: string, inboxId: string) =>
     chatManager.cancelQueued(String(sessionId), String(inboxId))
   )
+  ipcMain.handle(IPC.sessionQueuePromote, (_e, sessionId: string, inboxId: string) =>
+    chatManager.promoteQueued(String(sessionId), String(inboxId))
+  )
 
   /* ---------- worktree cleanup ---------- */
   ipcMain.handle(IPC.worktreeList, () => worktreeManager.list())
@@ -264,6 +270,10 @@ export function registerIpc(): void {
   ipcMain.handle(IPC.worktreeRemove, (_e, input: unknown) => {
     const parsed = worktreeRemoveInputSchema.parse(input)
     return worktreeManager.remove(parsed.repoDir, parsed.directory, parsed.confirmedSignature, parsed.confirmed)
+  })
+  ipcMain.handle(IPC.worktreeInspect, (_e, input: unknown) => {
+    const parsed = worktreeInspectInputSchema.parse(input)
+    return worktreeManager.inspect(parsed.repoDir, parsed.directory)
   })
 
   /* ---------- jira ---------- */
@@ -289,6 +299,7 @@ export function registerIpc(): void {
     return jiraAuth.status()
   })
   ipcMain.handle(IPC.boardFetch, () => fetchBoard())
+  ipcMain.handle(IPC.jiraSubtasks, (_e, key: string) => fetchSubtasks(String(key)))
 
   /* ---------- works (ticket pipeline) ---------- */
   ipcMain.handle(IPC.workStart, (_e, input: unknown) => workManager.start(startWorkInputSchema.parse(input)))
@@ -299,8 +310,9 @@ export function registerIpc(): void {
     return workManager.abandon(parsed.id, parsed.confirmedSignature, parsed.confirmed)
   })
   ipcMain.handle(IPC.workMessages, (_e, sessionId: string) => chatManager.messages(String(sessionId)))
-  ipcMain.handle(IPC.workPrompt, (_e, sessionId: string, text: string, images?: unknown, queued?: unknown, refs?: unknown) =>
-    workManager.followUp(String(sessionId), String(text), promptImageList(images), Boolean(queued), promptRefs(refs))
+  ipcMain.handle(IPC.workPrompt, (_e, sessionId: string, text: string, images?: unknown, queued?: unknown, refs?: unknown, sentAt?: unknown) =>
+    throughputMeter.measurePrompt(String(sessionId), sentAt, () =>
+      workManager.followUp(String(sessionId), String(text), promptImageList(images), Boolean(queued), promptRefs(refs)))
   )
   ipcMain.handle(IPC.workInterrupt, (_e, sessionId: string) => workManager.interrupt(String(sessionId)))
   ipcMain.handle(IPC.workReviews, (_e, workId: string) => reviewManager.reviewsFor(String(workId)))
@@ -355,6 +367,11 @@ export function registerIpc(): void {
     const parsed = parsePrRef(String(ref))
     if (!parsed?.url) throw new Error('Pass a full PR URL.')
     return githubManager.solveConflicts(parsed.url)
+  })
+  ipcMain.handle(IPC.githubSolveComments, (_e, ref: unknown) => {
+    const parsed = parsePrRef(String(ref))
+    if (!parsed?.url) throw new Error('Pass a full PR URL.')
+    return githubManager.solveComments(parsed.url)
   })
   ipcMain.handle(IPC.githubSeen, (_e, prUrl: string) => githubManager.markSeen(String(prUrl)))
   ipcMain.handle(IPC.githubAlerts, () => githubManager.alerts())

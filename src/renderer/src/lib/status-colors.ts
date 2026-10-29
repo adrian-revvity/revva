@@ -28,6 +28,23 @@ const HASH_POOL = Object.values(CATEGORY_CLASSES).concat(
   'bg-orange-500/15 text-orange-700 dark:text-orange-300 border-orange-500/30'
 )
 
+const TYPE_CLASSES: Array<{ re: RegExp; cls: string }> = [
+  { re: /^stor(y|ies)$/i, cls: 'bg-violet-500/15 text-violet-700 dark:text-violet-300 border-violet-500/30' },
+  { re: /epic/i, cls: 'bg-purple-500/15 text-purple-700 dark:text-purple-300 border-purple-500/30' },
+  { re: /bug|defect/i, cls: 'bg-red-500/15 text-red-700 dark:text-red-300 border-red-500/30' },
+  { re: /sub-?task/i, cls: 'bg-sky-500/15 text-sky-700 dark:text-sky-300 border-sky-500/30' },
+  { re: /^task$/i, cls: 'bg-slate-500/15 text-slate-700 dark:text-slate-300 border-slate-500/30' },
+  { re: /spike|tech/i, cls: 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30' }
+]
+
+/** Issue-type badge palette (Story / Bug / Sub-task…); hash fallback keeps custom types distinct. */
+export function jiraTypeClasses(typeName: string): string {
+  for (const { re, cls } of TYPE_CLASSES) if (re.test(typeName)) return cls
+  let h = 0
+  for (const ch of typeName) h = (h * 31 + ch.charCodeAt(0)) >>> 0
+  return HASH_POOL[h % HASH_POOL.length]!
+}
+
 export function jiraStatusClasses(status: string, category?: string): string {
   for (const { re, cls } of NAME_CLASSES) if (re.test(status)) return cls
   // board.ts stores the category *name* ("To Do", "In Progress"); some feeds give the *key* ("todo").

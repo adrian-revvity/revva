@@ -16,8 +16,9 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { lstat } from 'node:fs/promises'
-import { basename, join } from 'node:path'
+import { basename, isAbsolute, join } from 'node:path'
 import { openCodeService } from './opencode/service'
+import { chatManager } from './opencode/chats'
 import { getDb, settingGet } from './db'
 import {
   listRegisteredWorktrees,
@@ -26,7 +27,7 @@ import {
   requireAbsenceOfAgents,
   staleConfirmationError
 } from './worktree-safety'
-import type { WorktreeInfo, WorktreeRemovalPreflight } from '@shared/types'
+import type { TaskSessionResult, WorktreeInfo, WorktreeRemovalPreflight } from '@shared/types'
 
 const exec = promisify(execFile)
 
@@ -161,6 +162,52 @@ class WorktreeManager {
    */
   preflight(repoDir: string, directory: string): Promise<WorktreeRemovalPreflight> {
     return preflightWorktreeRemoval(repoDir, directory)
+  }
+
+  /**
+   * "Can I remove this?": a chat primed to audit the worktree's removability
+   * before anything is deleted — uncommitted/untracked/ignored work, whether
+   * its commits and branches live safely elsewhere (merged, pushed), and what
+   * must be committed, pushed or is simply safe to lose. Read-only by
+   * instruction: the chat advises, revva's confirmation gate still does the
+   * deleting. The chat sits in the main checkout (which always exists — the
+   * worktree folder may already be gone) and inspects the worktree via
+   * `git -C <worktree>` so a stale registration is auditable too.
+   */
+  async inspect(repoDir: string, directory: string): Promise<TaskSessionResult> {
+    const repoInput = repoDir.trim()
+    const dirInput = directory.trim()
+    if (!repoInput || !dirInput) throw new Error('The check needs both a repository and a worktree path.')
+    if (!isAbsolute(repoInput) || !isAbsolute(dirInput)) throw new Error('Both paths must be absolute.')
+    let registered = false
+    try {
+      registered = (await listRegisteredWorktrees(repoInput)).some((w) => w.path === dirInput)
+    } catch (err) {
+      throw new Error(`Cannot check ${dirInput}: ${(err as Error).message}`)
+    }
+    if (!registered) {
+      throw new Error(
+        `${dirInput} is not a registered linked worktree of ${repoInput} — revva cannot check a path git has no registration for.`
+      )
+    }
+    const work = getDb().prepare('SELECT ticket_key, state FROM work WHERE worktree_dir = ?').get(dirInput) as WorkRow | undefined
+    const label = dirInput.split('/').slice(-1)[0] ?? dirInput
+    const chat = await chatManager.create({
+      directory: repoInput,
+      title: `Can I remove ${label}?`.slice(0, 80),
+      ticketKey: work?.ticket_key
+    })
+    const text = [
+      `Check whether the git worktree at ${dirInput} can be removed easily, or whether work would be lost — the user wants to delete it and asks: can I remove this worktree safely, or are we missing commits that should be committed first?`,
+      `The worktree belongs to the repository whose main checkout is ${repoInput} (run ordinary git commands there; reach the worktree itself with \`git -C ${dirInput} …\`).${work ? ` Revva tracks it as ${work.ticket_key} (state ${work.state}).` : ''} If \`git -C\` fails because the folder is already gone, say so plainly — then only the stale registration remains and nothing on disk can be lost.`,
+      'Inspect, read-only, exactly this worktree: `git -C <worktree> status --porcelain -uall --ignored`, `git -C <worktree> diff --stat` and `--cached --stat`, the branch it carries (`git -C <worktree> branch --show-current`), whether that branch is pushed and equal to its remote, and whether its commits are merged into the repository\'s main/master (or otherwise contained in another branch or an open PR — `git branch --contains`, `git log <base>..<branch> --oneline`, `gh pr list --head <branch>`). Never inspect other worktrees\' contents.',
+      'Do NOT change anything: no commits, stashes, pushes, merges, branch or worktree deletions. The user deletes through Revva\'s confirmation dialog, which re-proves the state anyway.',
+      'Finish with a short verdict, one of: (1) "Safe to remove — nothing would be lost"; (2) "Remove after saving X" — list precisely what is uncommitted, untracked (excluding pure build output/dependencies like node_modules), unpushed or unmerged, with a suggested action for each (commit+push on <branch>, merge, or discard); or (3) "Do not remove yet" with the reasons. Quantify each category (file counts, commit counts) rather than pasting diffs.'
+    ].join('\n\n')
+    await openCodeService.api.session.prompt({ sessionID: chat.sessionId, text }).catch((err) => {
+      throw new Error(`Chat created, but the check prompt failed: ${(err as Error).message}`)
+    })
+    return { sessionId: chat.sessionId, title: chat.title, directory: chat.directory }
   }
 
   /**

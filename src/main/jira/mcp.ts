@@ -18,6 +18,10 @@ export type JiraTicket = {
   statusCategory: string
   storyPoints?: number
   issueTypeName?: string
+  /** Number of sub-tasks reported on the issue (0 ⇒ none). */
+  subtaskCount?: number
+  /** Sub-task's parent issue key (unset for non-subtasks). */
+  parentKey?: string
   dependsOn: string[]
   url?: string
   raw: unknown
@@ -154,9 +158,14 @@ export class JiraMcp {
     })
   }
 
-  async getIssue(key: string): Promise<unknown> {
+  async getIssue(key: string, fields?: string[]): Promise<unknown> {
     const cloudId = await this.resolveCloudId()
-    return this.call('getIssue', { cloudId, issueIdOrKey: key, responseContentFormat: 'markdown' })
+    return this.call('getIssue', {
+      cloudId,
+      issueIdOrKey: key,
+      ...(fields ? { fields } : {}),
+      responseContentFormat: 'markdown'
+    })
   }
 
   async addComment(key: string, body: string): Promise<unknown> {

@@ -1,10 +1,12 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ChevronDown,
   Clock4,
+  CornerDownRight,
   CornerUpLeft,
   ExternalLink,
+  ListChecks,
   MessageSquare,
   Pin,
   PinOff,
@@ -18,6 +20,13 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle
+} from '@/components/ui/dialog'
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -28,7 +37,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { CardBoard, CardZone, moveToZone } from '@/components/CardBoard'
 import { useCardOrder } from '@/lib/use-card-order'
 import { cn } from '@/lib/utils'
-import { jiraStatusClasses } from '@/lib/status-colors'
+import { jiraStatusClasses, jiraTypeClasses } from '@/lib/status-colors'
 import type { Ticket, WorkSummary } from '@shared/types'
 import { StartWorkDialog } from './StartWorkDialog'
 
@@ -55,6 +64,7 @@ export function BoardView({
     staleTime: 30_000
   })
   const [startTicket, setStartTicket] = useState<Ticket | null>(null)
+  const [detailsTicket, setDetailsTicket] = useState<Ticket | null>(null)
   const [statusFilter, setStatusFilter] = useState(ALL_STATUSES)
   const [search, setSearch] = useState('')
   const [sessionBusy, setSessionBusy] = useState<string | null>(null)
@@ -167,7 +177,7 @@ export function BoardView({
         {board.isLoading && (
           <div className="grid grid-cols-[repeat(auto-fill,minmax(230px,1fr))] gap-2.5">
             {[0, 1, 2, 3, 4, 5].map((i) => (
-              <Skeleton key={i} className="h-28" />
+              <Skeleton key={i} className="h-32" />
             ))}
           </div>
         )}
@@ -194,9 +204,26 @@ export function BoardView({
             }}
             onStartTicket={setStartTicket}
             onStartWork={onStart}
+            onDetails={setDetailsTicket}
           />
         )}
       </div>
+
+      {detailsTicket && (
+        <TicketSubtasksDialog
+          ticket={detailsTicket}
+          activeByTicket={activeByTicket}
+          onClose={() => setDetailsTicket(null)}
+          onStartSubtask={(sub) => {
+            setDetailsTicket(null)
+            setStartTicket(sub)
+          }}
+          onStartWork={(workId) => {
+            setDetailsTicket(null)
+            onStart(workId)
+          }}
+        />
+      )}
 
       {startTicket && (
         <StartWorkDialog
@@ -226,7 +253,8 @@ function TicketBoard({
   sessionBusy,
   onSession,
   onStartTicket,
-  onStartWork
+  onStartWork,
+  onDetails
 }: {
   visible: Ticket[]
   boardData: Ticket[]
@@ -235,16 +263,60 @@ function TicketBoard({
   onSession: (key: string) => void
   onStartTicket: (t: Ticket) => void
   onStartWork: (workId: string) => void
+  onDetails: (t: Ticket) => void
 }): React.JSX.Element {
   const liveIds = useMemo(() => visible.map((t) => t.key), [visible])
   const { zones, commit } = useCardOrder('jira', liveIds)
   const [laterOpen, setLaterOpen] = useState(false)
   const byKey = useMemo(() => new Map(visible.map((t) => [t.key, t])), [visible])
+  /**
+   * Parent ↔ sub-task chain per ticket, keyed on the chain's root (the parent
+   * card's own key), so the parent and its sub-tasks light up together on hover
+   * — the same trick as the PR board's stack chains. Chains walk up through
+   * parents that are themselves visible (custom hierarchies); a member filtered
+   * out of the visible set just isn't part of the chain.
+   */
+  const chains = useMemo(() => {
+    const rootOf = (t: Ticket): string => {
+      let key = t.parentKey ?? t.key
+      const seen = new Set([t.key])
+      while (!seen.has(key)) {
+        seen.add(key)
+        const next = byKey.get(key)?.parentKey
+        if (!next) break
+        key = next
+      }
+      return key
+    }
+    const keys = new Map<string, string>()
+    for (const t of visible) keys.set(t.key, rootOf(t))
+    const size = new Map<string, number>()
+    for (const k of keys.values()) size.set(k, (size.get(k) ?? 0) + 1)
+    return { keys, size }
+  }, [visible, byKey])
+  const [hoveredChain, setHoveredChain] = useState<string | null>(null)
+  /** Parent-badge click: scroll to that card and pulse it (like the PR alert jump). */
+  const [flashKey, setFlashKey] = useState<string | null>(null)
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const jumpToCard = (key: string): void => {
+    if (zones.later.includes(key)) setLaterOpen(true)
+    const scroll = (tries: number): void => {
+      const el = document.querySelector(`[data-ticket-key="${CSS.escape(key)}"]`)
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      // Filters and zone moves re-render first — retry while the list settles.
+      else if (tries > 0) setTimeout(() => scroll(tries - 1), 350)
+    }
+    requestAnimationFrame(() => scroll(6))
+    clearTimeout(flashTimer.current)
+    setFlashKey(key)
+    flashTimer.current = setTimeout(() => setFlashKey(null), 2200)
+  }
 
   const renderCard = (key: string): React.ReactNode => {
     const t = byKey.get(key)
     if (!t) return null
     const zone = zones.important.includes(key) ? 'important' : zones.later.includes(key) ? 'later' : 'main'
+    const chain = chains.keys.get(key)
     return (
       <TicketCard
         t={t}
@@ -252,9 +324,19 @@ function TicketBoard({
         active={activeByTicket.get(t.key)}
         sessionBusy={sessionBusy === t.key}
         zone={zone}
+        chainKey={chain}
+        chainHighlighted={!!chain && (chains.size.get(chain) ?? 0) > 1 && hoveredChain === chain}
+        onChainHover={setHoveredChain}
+        flash={flashKey === key}
+        onJumpToParent={
+          t.parentKey && byKey.has(t.parentKey) && t.parentKey !== t.key
+            ? () => jumpToCard(t.parentKey!)
+            : undefined
+        }
         onSession={() => onSession(t.key)}
         onStartTicket={() => onStartTicket(t)}
         onStartWork={onStartWork}
+        onDetails={() => onDetails(t)}
         onMove={(to) => commit(moveToZone(zones, t.key, to))}
       />
     )
@@ -318,49 +400,125 @@ function TicketCard({
   active,
   sessionBusy,
   zone,
+  chainKey,
+  chainHighlighted,
+  onChainHover,
+  flash,
+  onJumpToParent,
   onSession,
   onStartTicket,
   onStartWork,
+  onDetails,
   onMove
 }: {
   t: Ticket
   boardData: Ticket[]
+  /** Parent/sub-task chain identity (the chain root's key); own key when unrelated. */
+  chainKey?: string
+  /** Another card of the same chain is hovered — light this one up. */
+  chainHighlighted: boolean
+  onChainHover: (chain: string | null) => void
+  /** A chain jump landed on this card — pulse it. */
+  flash: boolean
+  /** Jump to the parent card; absent when the parent is not on the board. */
+  onJumpToParent?: () => void
   active: WorkSummary | undefined
   sessionBusy: boolean
   zone: 'important' | 'main' | 'later'
   onSession: () => void
   onStartTicket: () => void
   onStartWork: (workId: string) => void
+  onDetails: () => void
   onMove: (to: 'important' | 'main' | 'later') => void
 }): React.JSX.Element {
   const parentsMissing = t.dependsOn.filter((d) => !boardData.some((x) => x.key === d))
+  const parentSummary = t.parentKey ? boardData.find((x) => x.key === t.parentKey)?.summary : undefined
   return (
     <div
+      data-ticket-key={t.key}
+      className={cn('relative flex h-full flex-col transition-shadow', (chainHighlighted || flash) && 'z-10')}
+      onMouseEnter={() => onChainHover(chainKey ?? null)}
+      onMouseLeave={() => onChainHover(null)}
+    >
+    <div
       className={cn(
-        'flex h-full flex-col gap-1.5 rounded-lg border p-2.5 pt-2 transition-colors',
-        zone === 'important' && 'border-amber-500/40 bg-amber-500/[0.04]'
+        'relative flex min-h-0 flex-1 flex-col gap-1.5 rounded-lg border bg-card p-2.5 transition-colors',
+        zone === 'important' && 'border-amber-500/40 bg-amber-500/[0.04]',
+        zone === 'later' && 'opacity-80',
+        chainHighlighted && 'border-violet-500/50 ring-1 ring-violet-500/30',
+        flash && 'border-amber-500/70 ring-2 ring-amber-500/40 animate-pulse'
       )}
     >
-      <div className="flex items-center gap-1.5 pr-5">
-        <a
-          href={t.url}
-          target="_blank"
-          rel="noreferrer"
-          className="font-mono text-[11px] font-medium hover:underline"
+      <div className="min-w-0 pr-5">
+        <button
+          type="button"
+          title="Ticket details"
+          onClick={onDetails}
+          className="line-clamp-2 text-left text-[13px] font-medium leading-snug hover:underline"
         >
+          {t.summary}
+        </button>
+        <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">
           {t.key}
-          {t.url && <ExternalLink className="ml-1 inline size-2.5 opacity-60" />}
-        </a>
+          {t.storyPoints !== undefined ? ` · ${t.storyPoints} points` : ''}
+        </p>
+      </div>
+
+      <div className="flex min-h-4 flex-wrap items-center gap-1">
         <Badge variant="outline" className={cn('shrink-0 text-[9px]', jiraStatusClasses(t.status, t.statusCategory))}>
           {t.status}
         </Badge>
-        {t.storyPoints !== undefined && (
-          <Badge variant="secondary" className="shrink-0 px-1 text-[9px]">
-            {t.storyPoints}p
+        {t.issueTypeName && (
+          <Badge variant="outline" className={cn('shrink-0 text-[9px]', jiraTypeClasses(t.issueTypeName))}>
+            {t.issueTypeName}
           </Badge>
         )}
+        {(t.subtaskCount ?? 0) > 0 && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button type="button" className="shrink-0" onClick={onDetails}>
+                <Badge
+                  variant="secondary"
+                  className="cursor-pointer gap-0.5 border-transparent text-[9px] text-muted-foreground hover:bg-muted"
+                >
+                  <ListChecks className="size-2.5" />
+                  {t.subtaskCount} sub-task{t.subtaskCount === 1 ? '' : 's'}
+                </Badge>
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>Sub-tasks with a Start button on each</TooltipContent>
+          </Tooltip>
+        )}
+        {t.parentKey && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="shrink-0 disabled:cursor-default"
+                disabled={!onJumpToParent}
+                onClick={onJumpToParent}
+              >
+                <Badge
+                  variant="outline"
+                  className={cn(
+                    'shrink-0 gap-0.5 border-violet-500/40 text-[9px] text-violet-600 dark:text-violet-400',
+                    onJumpToParent && 'cursor-pointer hover:bg-violet-500/10'
+                  )}
+                >
+                  <CornerDownRight className="size-2.5" />
+                  <span className="max-w-28 truncate">on {t.parentKey}</span>
+                </Badge>
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {onJumpToParent
+                ? `Child of ${t.parentKey}${parentSummary ? ` — ${parentSummary}` : ''} · click to jump to it`
+                : `Child of ${t.parentKey} — not in your open tickets`}
+            </TooltipContent>
+          </Tooltip>
+        )}
       </div>
-      <p className="line-clamp-2 min-w-0 text-[13px] leading-snug">{t.summary}</p>
+
       {t.dependsOn.length > 0 && (
         <p className="flex items-center gap-1 text-[10px] text-muted-foreground">
           <Link2 className="size-2.5 shrink-0" /> depends on{' '}
@@ -380,57 +538,208 @@ function TicketCard({
           )}
         </p>
       )}
-      <div className="mt-auto flex items-center gap-1 pt-0.5">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              size="xs"
-              variant="ghost"
-              className="text-muted-foreground"
-              title={zone === 'important' ? 'Unpin' : 'Pin to Important'}
-              onClick={() => onMove(zone === 'important' ? 'main' : 'important')}
-            >
-              {zone === 'important' ? <PinOff className="size-3.5" /> : <Pin className="size-3.5" />}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>{zone === 'important' ? 'Unpin' : 'Pin to Important'}</TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              size="xs"
-              variant="ghost"
-              className="text-muted-foreground"
-              title={zone === 'later' ? 'Back to the list' : 'Not right now'}
-              onClick={() => onMove(zone === 'later' ? 'main' : 'later')}
-            >
-              {zone === 'later' ? <CornerUpLeft className="size-3.5" /> : <Clock4 className="size-3.5" />}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>{zone === 'later' ? 'Back to the list' : 'Not right now'}</TooltipContent>
-        </Tooltip>
-        <div className="ml-auto flex items-center gap-1">
-          <Button
-            size="xs"
-            variant="outline"
-            title="Open a plain agent session linked to this ticket (no pipeline)"
-            disabled={sessionBusy}
-            onClick={onSession}
-          >
-            <MessageSquare className="size-3.5" />
-          </Button>
-          {active ? (
-            <Button size="xs" onClick={() => onStartWork(active.id)}>
-              <Play className="size-3.5" />
-              {active.state === 'BUILDING' ? 'Watching…' : active.state}
-            </Button>
-          ) : (
-            <Button size="xs" onClick={onStartTicket}>
-              <Play className="size-3.5" /> Start
-            </Button>
+
+      <div className="mt-auto space-y-1.5 border-t pt-1.5">
+        <Button
+          size="sm"
+          variant={active ? 'default' : 'outline'}
+          className={cn('h-7 w-full gap-1.5 text-xs', !active && 'border-primary/40 hover:border-primary/70')}
+          onClick={active ? () => onStartWork(active.id) : onStartTicket}
+        >
+          <Play className="size-3.5" />
+          {active ? (active.state === 'BUILDING' ? 'Watching…' : active.state) : 'Start'}
+        </Button>
+        <div className="flex flex-wrap items-center gap-1">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="xs"
+                variant="ghost"
+                className="h-6 px-1.5 text-muted-foreground"
+                title={zone === 'important' ? 'Unpin' : 'Pin to Important'}
+                onClick={() => onMove(zone === 'important' ? 'main' : 'important')}
+              >
+                {zone === 'important' ? <PinOff className="size-3.5" /> : <Pin className="size-3.5" />}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{zone === 'important' ? 'Unpin' : 'Pin to Important'}</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="xs"
+                variant="ghost"
+                className="h-6 px-1.5 text-muted-foreground"
+                title={zone === 'later' ? 'Back to the list' : 'Not right now'}
+                onClick={() => onMove(zone === 'later' ? 'main' : 'later')}
+              >
+                {zone === 'later' ? <CornerUpLeft className="size-3.5" /> : <Clock4 className="size-3.5" />}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{zone === 'later' ? 'Back to the list' : 'Not right now'}</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="xs"
+                variant="ghost"
+                className="h-6 px-1.5 text-muted-foreground"
+                title="Open a plain agent session linked to this ticket (no pipeline)"
+                disabled={sessionBusy}
+                onClick={onSession}
+              >
+                <MessageSquare className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Open a plain agent session linked to this ticket (no pipeline)</TooltipContent>
+          </Tooltip>
+          {t.url && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  size="icon-xs"
+                  variant="outline"
+                  className="ml-auto"
+                  title="Open on Jira"
+                  onClick={() => void window.revva.shell.openExternal(t.url!)}
+                >
+                  <ExternalLink className="size-3" />
+                  <span className="sr-only">Open on Jira</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Open on Jira</TooltipContent>
+            </Tooltip>
           )}
         </div>
       </div>
     </div>
+    </div>
+  )
+}
+
+/**
+ * Ticket details: the parent card opened from the board, listing its sub-tasks
+ * with a Start button on each — starting a sub-task opens the same Start flow
+ * as starting the ticket itself, scoped to that sub-task.
+ */
+function TicketSubtasksDialog({
+  ticket,
+  activeByTicket,
+  onClose,
+  onStartSubtask,
+  onStartWork
+}: {
+  ticket: Ticket
+  activeByTicket: Map<string, WorkSummary>
+  onClose: () => void
+  onStartSubtask: (sub: Ticket) => void
+  onStartWork: (workId: string) => void
+}): React.JSX.Element {
+  const subtasks = useQuery({
+    queryKey: ['subtasks', ticket.key],
+    queryFn: () => window.revva.jira.subtasks(ticket.key),
+    // Every deliberate open refetches: sub-task status changes server-side, and
+    // a cached (possibly empty) answer must not shadow the truth.
+    staleTime: 0
+  })
+  const items = subtasks.data ?? []
+  return (
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="max-h-[calc(100vh-2rem)] overflow-y-auto sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <a
+              href={ticket.url}
+              target="_blank"
+              rel="noreferrer"
+              className="font-mono hover:underline"
+            >
+              {ticket.key}
+            </a>
+            {ticket.issueTypeName && (
+              <Badge variant="outline" className={cn('text-[10px]', jiraTypeClasses(ticket.issueTypeName))}>
+                {ticket.issueTypeName}
+              </Badge>
+            )}
+            <Badge variant="outline" className={cn('text-[10px]', jiraStatusClasses(ticket.status, ticket.statusCategory))}>
+              {ticket.status}
+            </Badge>
+          </DialogTitle>
+          <DialogDescription>{ticket.summary}</DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-1.5">
+          <h3 className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
+            <ListChecks className="size-3.5" /> Sub-tasks
+            {subtasks.data && (
+              <Badge variant="secondary" className="text-[10px]">
+                {items.length}
+              </Badge>
+            )}
+          </h3>
+          {subtasks.isLoading && (
+            <div className="space-y-1.5">
+              {[0, 1].map((i) => (
+                <Skeleton key={i} className="h-12" />
+              ))}
+            </div>
+          )}
+          {subtasks.isError && (
+            <p className="rounded-md border border-destructive/40 px-3 py-2 text-xs text-destructive">
+              {subtasks.error.message}
+            </p>
+          )}
+          {subtasks.data && items.length === 0 && (
+            <p className="rounded-md border border-dashed px-3 py-3 text-center text-xs text-muted-foreground">
+              This ticket has no sub-tasks.
+            </p>
+          )}
+          {items.map((sub) => {
+            const active = activeByTicket.get(sub.key)
+            const done = sub.statusCategory.toLowerCase() === 'done'
+            return (
+              <div
+                key={sub.key}
+                className="flex items-center gap-2 rounded-md border px-2.5 py-2"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5">
+                    <a
+                      href={sub.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-mono text-[11px] font-medium hover:underline"
+                    >
+                      {sub.key}
+                    </a>
+                    {sub.issueTypeName && (
+                      <Badge variant="outline" className={cn('text-[9px]', jiraTypeClasses(sub.issueTypeName))}>
+                        {sub.issueTypeName}
+                      </Badge>
+                    )}
+                    <Badge variant="outline" className={cn('text-[9px]', jiraStatusClasses(sub.status, sub.statusCategory))}>
+                      {sub.status}
+                    </Badge>
+                  </div>
+                  <p className={cn('truncate text-[12px] leading-snug', done && 'text-muted-foreground line-through')}>
+                    {sub.summary}
+                  </p>
+                </div>
+                {active ? (
+                  <Button size="xs" onClick={() => onStartWork(active.id)}>
+                    <Play className="size-3.5" />
+                    {active.state === 'BUILDING' ? 'Watching…' : active.state}
+                  </Button>
+                ) : (
+                  <Button size="xs" disabled={done} title={done ? 'Already done' : undefined} onClick={() => onStartSubtask(sub)}>
+                    <Play className="size-3.5" /> Start
+                  </Button>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </DialogContent>
+    </Dialog>
   )
 }

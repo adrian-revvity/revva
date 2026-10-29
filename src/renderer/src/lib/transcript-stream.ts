@@ -27,6 +27,11 @@ export function subscribeTranscripts(qc: QueryClient): () => void {
     }
   }
   return window.revva.events.on((event) => {
+    if (event.kind === 'session.throughput') {
+      // Keep the final measurement even when another conversation is on screen.
+      qc.setQueryData(['session-throughput', event.sessionId], event)
+      return
+    }
     if (event.kind === 'chat.delta' || event.kind === 'work.delta' || event.kind === 'review.delta') {
       if (!event.messageId) return
       qc.setQueryData<ChatMessage[]>(streamKey(event.sessionId), (old = []) => {

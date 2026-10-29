@@ -61,6 +61,8 @@ type PrSeen = {
   conflicting?: boolean
   /** Review decision the user last saw (none = first sighting baseline). */
   decision?: string
+  /** Unresolved review threads the user last saw (none = first sighting baseline). */
+  threads?: number
 }
 const SEEN_KEY = 'githubPrSeen'
 const POLL_INTERVAL_MS = 5 * 60_000
@@ -136,6 +138,7 @@ class GitHubManager {
       if (pr.hasNewComments) kinds.push('comment')
       if (pr.hasNewConflicts) kinds.push('conflict')
       if (pr.hasNewApproval) kinds.push('approval')
+      if (pr.hasNewReviewThreads) kinds.push('review')
       if (kinds.length === 0) continue
       byUrl.set(pr.url, { url: pr.url, repo: pr.repo, number: pr.number, title: pr.title, kinds })
     }
@@ -232,6 +235,7 @@ class GitHubManager {
       mergeStateStatus?: string
       headRefName?: string
       baseRefName?: string
+      reviewThreads?: { totalCount?: number; nodes?: Array<{ isResolved?: boolean }> }
       comments?: { totalCount?: number; nodes?: Node[] }
     }
     type RepoNode = { defaultBranchRef?: { name?: string } | null; [alias: string]: unknown }
@@ -263,13 +267,15 @@ class GitHubManager {
       const total = node.comments?.totalCount ?? pr.commentsCount ?? 0
       pr.commentsCount = total
       const latest = others[0]
-      this.lastInfo.set(pr.url, { latestOtherAt: latest?.at ?? 0, total, conflicting, decision: pr.reviewDecision })
+      const unresolved = (node.reviewThreads?.nodes ?? []).filter((t) => !t.isResolved).length
+      pr.unresolvedThreads = unresolved
+      this.lastInfo.set(pr.url, { latestOtherAt: latest?.at ?? 0, total, conflicting, decision: pr.reviewDecision, threads: unresolved })
       pr.latestOtherCommentAuthor = latest?.author
       pr.latestOtherCommentAt = latest?.at
       const seen = seenMap[pr.url]
       if (!seen) {
         // First sighting: set the baseline — no false "new" for pre-existing state.
-        seenMap[pr.url] = { latestOtherAt: latest?.at ?? 0, total, conflicting, decision: pr.reviewDecision }
+        seenMap[pr.url] = { latestOtherAt: latest?.at ?? 0, total, conflicting, decision: pr.reviewDecision, threads: unresolved }
         seenDirty = true
         pr.hasNewComments = false
         pr.hasNewConflicts = false
@@ -279,6 +285,9 @@ class GitHubManager {
         // Conflict and approval flags fire on the *transition* into the state.
         pr.hasNewConflicts = conflicting && !seen.conflicting
         pr.hasNewApproval = pr.reviewDecision === 'APPROVED' && seen.decision !== 'APPROVED'
+        // New review feedback: thread count rose since the user last looked
+        // (old threads staying unresolved must not nag).
+        pr.hasNewReviewThreads = unresolved > (seen.threads ?? 0)
       }
       // Merged PRs cannot be conflicted; the merged lookback listing still shows them.
       if (pr.merged) {
@@ -380,6 +389,74 @@ class GitHubManager {
       throw new Error(`Chat created at ${worktreeDir}, but the prompt failed: ${describeError(err)}`)
     })
     return { sessionId: chat.sessionId, title: chat.title, directory: worktreeDir }
+  }
+
+  /**
+   * "Answer the review comments": a chat checked out on the PR's branch, primed
+   * to read every unresolved review thread, fix what is valid, push, reply to
+   * each thread and resolve it. Prefers the ticket's own worktree so the fixes
+   * land on the real branch; otherwise a fresh branch worktree at the PR head.
+   */
+  async solveComments(prUrl: string): Promise<TaskSessionResult> {
+    const pr = await this.detail(prUrl)
+    if (pr.state.toLowerCase() !== 'open') throw new Error('Only open PRs have review threads to answer.')
+    const [owner, name] = pr.repo.split('/')
+    if (!owner || !name) throw new Error('Could not determine the PR repository.')
+    const ticketKey = this.ticketForPr(pr)
+
+    let directory: string | undefined
+    let branchNote = `the PR head branch ${pr.headRefName}`
+    if (ticketKey) {
+      const row = getDb()
+        .prepare(`SELECT worktree_dir FROM work WHERE ticket_key = ? AND branch = ? ORDER BY created_at DESC LIMIT 1`)
+        .get(ticketKey, pr.headRefName) as { worktree_dir: string } | undefined
+      if (row && existsSync(row.worktree_dir)) directory = row.worktree_dir
+    }
+    if (!directory) {
+      const root = settingGet<string>('worktreeRoot') || join(app.getPath('home'), `${basename(app.getPath('home'))}-worktrees`)
+      const reposDir = join(root, 'gh-reviews', owner)
+      mkdirSync(reposDir, { recursive: true })
+      const repoDir = join(reposDir, name)
+      if (!existsSync(join(repoDir, '.git'))) {
+        const clone = await gh(['repo', 'clone', pr.repo, repoDir, '--', '--quiet'])
+        if (!clone.ok) throw new Error(`git clone failed: ${(clone.err || clone.out).slice(0, 300)}`)
+      }
+      const id = randomUUID()
+      const ref = `refs/revva/comments/${id}`
+      const fetch = await git(repoDir, ['fetch', '--no-tags', 'origin', `pull/${pr.number}/head:${ref}`])
+      if (!fetch.ok) throw new Error(`Could not fetch PR head: ${(fetch.err || fetch.out).slice(0, 300)}`)
+      const branch = `revva/comments-pr${pr.number}-${id}`
+      const worktreeDir = join(reposDir, `${name}-comments-pr${pr.number}-${id}`)
+      const add = await git(repoDir, ['worktree', 'add', '-b', branch, worktreeDir, ref])
+      if (!add.ok) throw new Error(`Could not create comments worktree: ${(add.err || add.out).slice(0, 300)}`)
+      directory = worktreeDir
+      branchNote = `local branch ${branch}, fetched from the PR head — push it with \`git push origin HEAD:refs/heads/${pr.headRefName}\``
+    }
+
+    const chat = await chatManager.create({
+      directory,
+      title: `${pr.repo}#${pr.number} review comments`.slice(0, 80),
+      ticketKey,
+      prUrl: pr.url
+    }).catch((err) => {
+      throw new Error(`Worktree ready at ${directory}, but the chat could not start: ${describeError(err)}`)
+    })
+    const gqlThreads = `{ r: repository(owner: "${owner}", name: "${name}") { p: pullRequest(number: ${pr.number}) { reviewThreads(first: 100) { nodes { id isResolved path comments(first: 20) { nodes { author { login } body databaseId } } } } } } }`
+    const text = [
+      `Answer the unresolved review threads of PR ${pr.url} (${pr.repo}#${pr.number}: ${pr.title}). You are in the checkout of ${branchNote}.`,
+      `1. List every thread and keep the unresolved ones — note each thread's node id and each first comment's databaseId:\n   \`gh api graphql -f query='${gqlThreads}'\`\n   Treat every isResolved=false thread as your worklist.`,
+      '2. For each thread: verify the reviewer\'s claim against the code before touching anything. Fix valid feedback properly (root cause, not symptom-patching); where a comment is mistaken or out of scope, prepare a short factual reply instead of a change. Follow the repository\'s instructions and run the checks the changes touch.',
+      directory.includes('-comments-pr')
+        ? '3. Commit the fixes on this branch, then push them to the PR: `git push origin ' + `HEAD:refs/heads/${pr.headRefName}` + '`. Plain push only — never force.'
+        : '3. Commit the fixes on this branch and push them to the PR head (`git push origin HEAD`). If the checkout carries unrelated uncommitted changes, do not touch or commit them.',
+      `4. For every thread, reply under its first comment — \`gh api repos/${owner}/${name}/pulls/${pr.number}/comments -f body="<reply>" -F in_reply_to=<comment databaseId>\` — stating what you changed (with file:line) or why the comment does not apply. Then resolve it — \`gh api graphql -f query='mutation { resolveReviewThread(input: { threadId: "<thread node id>" }) { thread { isResolved } } }'\`.`,
+      'Never force-push, never merge the PR, never touch other worktrees. Finish with a one-line-per-thread summary: fixed or answered.'
+    ].join('\n\n')
+    await openCodeService.api.session.prompt({ sessionID: chat.sessionId, text }).catch((err) => {
+      throw new Error(`Chat created at ${directory}, but the prompt failed: ${describeError(err)}`)
+    })
+    this.markSeen(pr.url)
+    return { sessionId: chat.sessionId, title: chat.title, directory }
   }
 
   /**

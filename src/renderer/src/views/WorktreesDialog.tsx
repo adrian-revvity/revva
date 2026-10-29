@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, FolderX, GitBranch, RefreshCw, Trash2, TriangleAlert } from 'lucide-react'
+import { AlertTriangle, FolderX, GitBranch, MessageSquareText, RefreshCw, Trash2, TriangleAlert } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -163,10 +163,12 @@ export function WorktreeRemovalDialog({
  */
 export function WorktreesDialog({
   open,
-  onOpenChange
+  onOpenChange,
+  onOpenChat
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
+  onOpenChat: (sessionId: string) => void
 }): React.JSX.Element {
   const qc = useQueryClient()
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -262,6 +264,21 @@ export function WorktreesDialog({
       setConfirming(null)
       setError((err as Error).message)
     }
+  })
+
+  /**
+   * "Can I remove this?" — opens an audit chat that reads the worktree (dirty
+   * files, unpushed/unmerged commits) and answers whether removal is safe or
+   * work must be committed first. Read-only; the chat only advises.
+   */
+  const inspect = useMutation({
+    mutationFn: (w: WorktreeInfo) => window.revva.worktrees.inspect({ repoDir: w.repoDir, directory: w.directory }),
+    onSuccess: (res) => {
+      void qc.invalidateQueries({ queryKey: ['chats'] })
+      onOpenChange(false)
+      onOpenChat(res.sessionId)
+    },
+    onError: (err) => setError(`Could not start the check: ${(err as Error).message}`)
   })
 
   const targets = items.filter((w) => selected.has(keyOf(w)))
@@ -374,6 +391,25 @@ export function WorktreesDialog({
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 gap-1 px-2 text-[11px]"
+                    title="Open a chat that checks whether this worktree can be removed, or whether commits are missing first"
+                    disabled={inspect.isPending}
+                    onClick={(e) => {
+                      e.preventDefault() // the row is a label — don't toggle selection
+                      e.stopPropagation()
+                      inspect.mutate(w)
+                    }}
+                  >
+                    {inspect.isPending && inspect.variables?.directory === w.directory ? (
+                      <RefreshCw className="size-3.5 animate-spin" />
+                    ) : (
+                      <MessageSquareText className="size-3.5" />
+                    )}
+                    Can I remove this?
+                  </Button>
                   {w.busy && (
                     <Badge variant="outline" className="border-amber-500/40 text-amber-600 dark:text-amber-400">
                       {w.ticketKey ?? 'live work'}
