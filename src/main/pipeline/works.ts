@@ -461,6 +461,7 @@ class WorkManager {
     switch (e.type) {
       case 'session.execution.started': {
         this.buildRevisions.set(sessionId, (this.buildRevisions.get(sessionId) ?? 0) + 1)
+        if (work.owns_worktree === 0 && work.state !== 'BUILDING') this.setState(work.id, 'BUILDING')
         break
       }
       case 'session.text.delta': {
@@ -477,13 +478,28 @@ class WorkManager {
       case 'session.execution.succeeded': {
         if (work.state !== 'BUILDING') return
         streamBuffer.flush(sessionId)
+        // Ticket-linked conversations reuse a work row for workflow utilities,
+        // but only Revva-owned worktrees are implementation builds that should
+        // automatically enter review when the agent finishes.
+        if (work.owns_worktree === 0) {
+          this.setState(work.id, 'READY')
+          break
+        }
         void this.finishBuildTurn(work, this.buildRevisions.get(sessionId) ?? 0)
         break
       }
       case 'session.execution.failed':
       case 'session.execution.interrupted': {
         streamBuffer.flush(sessionId)
-        if (work.state === 'BUILDING') this.setState(work.id, 'WAITING_HUMAN', `Build ${e.type === 'session.execution.failed' ? 'failed' : 'was interrupted'}.`)
+        if (work.state === 'BUILDING') {
+          this.setState(
+            work.id,
+            'WAITING_HUMAN',
+            work.owns_worktree === 0
+              ? `Conversation ${e.type === 'session.execution.failed' ? 'failed' : 'was interrupted'}.`
+              : `Build ${e.type === 'session.execution.failed' ? 'failed' : 'was interrupted'}.`
+          )
+        }
         break
       }
     }
@@ -678,7 +694,7 @@ class WorkManager {
     const skills = refs ? skillAttachments(refs) : []
     const payload = {
       sessionID: sessionId,
-      text: work ? `${text}\n\n${BUILD_COMPLETION_INSTRUCTIONS}` : text,
+      text: work && work.owns_worktree !== 0 ? `${text}\n\n${BUILD_COMPLETION_INSTRUCTIONS}` : text,
       ...(files.length ? { files } : {}),
       ...(skills.length ? { skills } : {}),
       delivery: (queued ? 'queue' : 'steer') as 'queue' | 'steer'

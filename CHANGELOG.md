@@ -8,6 +8,7 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 ## [Unreleased]
 
 - **Active work in the Inbox meter** — the Inbox’s active meter now includes ticket work in the same active states as the sidebar, even when its background agent sessions are not the ticket’s primary session.
+- **Ticket-linked chats stay ordinary chats** — existing conversations still get ticket workflow controls, but no longer receive build-completion instructions or trigger automatic review/fixer rounds just because they are linked to a ticket.
 
 ## [1.1.0] - 2026-10-29
 
