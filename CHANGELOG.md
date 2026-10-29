@@ -7,6 +7,8 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 ## [Unreleased]
 
+Revva 1.1 — one conversation chrome for Jira, PRs and tagging; reviews that wait for a real *done*; and honest speed. PR review threads can be answered from the card, queued follow-ups can steer the running turn, the sprint board grew issue types, sub-task launching and family linking, worktree removal grew an audit chat, and conversations got quieter, faster and more precise (since-Send tok/s, effort picker, quiet-since timer).
+
 - **Quieter conversation header** — Jira and PR conversations now use one compact Workflow control for status, review and delivery actions. Agents and their transcripts open in a floating review window; folder, branch, model and session details move into Details. The title appears once; permanent idle-agent and review-folder bars, duplicate status badges and repeated model/session pills are gone, without changing the underlying flows.
 
 - **Lighter live conversations** — session metrics share one IPC batch per second and update only the stats card; their single clock stops when no runs remain. Transcript recovery polls every 10 seconds instead of 3, fetches newest pages with overlap, and preserves cached history; reconnects and edits still reload an authoritative snapshot. Tool refresh bursts and streamed text each use one shared coalescer, with indexed live-message updates and linear snapshot pruning. Images are lazy-loaded through a bounded 32 MiB attachment cache instead of repeatedly copying base64 over transcript IPC. Stats have no tooltips and show tool/other phase totals inline. Removed the unused, unwired stale-session watchdog.
