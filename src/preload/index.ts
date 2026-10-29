@@ -41,6 +41,7 @@ const api: RevvaApi = {
   },
   session: {
     model: (sessionId) => ipcRenderer.invoke(IPC.sessionModel, sessionId),
+    copyId: (sessionId) => ipcRenderer.invoke(IPC.sessionCopyId, sessionId),
     contextUsage: (sessionId) => ipcRenderer.invoke(IPC.sessionContextUsage, sessionId),
     active: () => ipcRenderer.invoke(IPC.sessionActive),
     queue: (sessionId) => ipcRenderer.invoke(IPC.sessionQueue, sessionId),
@@ -48,6 +49,7 @@ const api: RevvaApi = {
   },
   worktrees: {
     list: () => ipcRenderer.invoke(IPC.worktreeList),
+    preflight: (input) => ipcRenderer.invoke(IPC.worktreePreflight, input),
     remove: (input) => ipcRenderer.invoke(IPC.worktreeRemove, input)
   },
   jira: {
@@ -59,7 +61,8 @@ const api: RevvaApi = {
   work: {
     start: (input) => ipcRenderer.invoke(IPC.workStart, input),
     list: () => ipcRenderer.invoke(IPC.workList),
-    abandon: (id) => ipcRenderer.invoke(IPC.workAbandon, id),
+    abandonPreflight: (id) => ipcRenderer.invoke(IPC.workAbandonPreflight, id),
+    abandon: (input) => ipcRenderer.invoke(IPC.workAbandon, input),
     messages: (sessionId) => ipcRenderer.invoke(IPC.workMessages, sessionId),
     prompt: (sessionId, text, images, queued, refs) => ipcRenderer.invoke(IPC.workPrompt, sessionId, text, images, queued, refs),
     interrupt: (sessionId) => ipcRenderer.invoke(IPC.workInterrupt, sessionId),
@@ -95,6 +98,10 @@ const api: RevvaApi = {
     list: () => ipcRenderer.invoke(IPC.inboxList),
     replyForm: (sessionId, formId, answer) => ipcRenderer.invoke(IPC.inboxReplyForm, sessionId, formId, answer),
     replyPermission: (sessionId, requestId, decision) => ipcRenderer.invoke(IPC.inboxReplyPermission, sessionId, requestId, decision)
+  },
+  triage: {
+    list: () => ipcRenderer.invoke(IPC.triageList),
+    markRead: (source, id) => ipcRenderer.invoke(IPC.triageMarkRead, source, id)
   },
   scripts: {
     list: () => ipcRenderer.invoke(IPC.scriptList),

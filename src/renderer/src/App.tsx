@@ -24,7 +24,7 @@ import { cn } from '@/lib/utils'
 import { SetupView } from '@/views/Setup'
 import { ChatView } from '@/views/Chat'
 import { NewChatDialog } from '@/views/NewChatDialog'
-import { WorktreesDialog } from '@/views/WorktreesDialog'
+import { WorktreesDialog, WorktreeRemovalDialog, type WorktreeRemovalRow } from '@/views/WorktreesDialog'
 import { DashboardView } from '@/views/DashboardView'
 import { BoardView } from '@/views/BoardView'
 import { WorkCockpit } from '@/views/WorkCockpit'
@@ -56,6 +56,8 @@ export default function App(): React.JSX.Element {
   const [view, setView] = useState<View>({ kind: 'dashboard' })
   const [newChatOpen, setNewChatOpen] = useState(false)
   const [worktreesOpen, setWorktreesOpen] = useState(false)
+  const [abandonTarget, setAbandonTarget] = useState<{ workId: string; row: WorktreeRemovalRow } | null>(null)
+  const [abandonBusy, setAbandonBusy] = useState(false)
 
   const status = useQuery({
     queryKey: ['service-status'],
@@ -81,7 +83,7 @@ export default function App(): React.JSX.Element {
           void qc.invalidateQueries({ queryKey: ['session-activity'] })
         }
       }
-      if (event.kind === 'chat.idle' || event.kind === 'chat.message') void chats.refetch()
+      if (event.kind === 'chat.idle' || event.kind === 'chat.message' || event.kind === 'chat.renamed') void chats.refetch()
       if (event.kind === 'chat.idle' && event.sessionId === '*') void qc.invalidateQueries({ queryKey: ['session-activity'] })
       if (event.kind === 'session.activity') {
         if (!qc.getQueryData<string[]>(['session-activity'])) {
@@ -115,9 +117,14 @@ export default function App(): React.JSX.Element {
   const selectedSessionId = view.kind === 'chat' ? view.sessionId : activeWork?.sessionId
   const selectedActivity = selectedSessionId ? sessionActivity(selectedSessionId) : undefined
   const runningWorks = (works.data ?? []).filter(
-    (w) => w.state === 'BUILDING' || w.state === 'REVIEW' || w.state === 'FIXING' || w.state === 'REWORK' || w.state === 'WAITING_HUMAN'
+    (w) => w.id !== activeWork?.id && (w.state === 'BUILDING' || w.state === 'REVIEW' || w.state === 'FIXING' || w.state === 'REWORK' || w.state === 'WAITING_HUMAN')
   )
-  const waitingCount = pending.length
+  // Inbox badge: pending questions/permissions + finished runs nobody has seen.
+  const inboxCount =
+    pending.length +
+    (chats.data ?? []).filter((c) => c.unread).length +
+    (works.data ?? []).filter((w) => w.unread).length
+  const waitingCount = inboxCount
 
   const deleteChat = (sessionId: string, title: string): void => {
     if (!confirm(`Delete chat "${title}"? The OpenCode session is removed too.`)) return
@@ -127,12 +134,49 @@ export default function App(): React.JSX.Element {
     })
   }
   const abandonWork = (workId: string, ticketKey: string): void => {
-    if (!confirm(`Abandon ${ticketKey}? The worktree is removed and the build session deleted. The branch is only deleted if fully merged — otherwise revva keeps it.`)) return
-    void window.revva.work.abandon(workId).then((note) => {
-      if (note) alert(note)
-      qc.invalidateQueries({ queryKey: ['works'] })
-      if (view.kind === 'work' && view.workId === workId) setView({ kind: 'dashboard' })
-    })
+    // Preview first (read-only): the dialog shows exactly what removal destroys
+    // and demands a per-worktree tick whenever files would go. A thrown refusal
+    // (locked, unregistered, unreadable state) means nothing may be touched.
+    void window.revva.work
+      .abandonPreflight(workId)
+      .then((p) => {
+        const row: WorktreeRemovalRow = {
+          label: p.ticketKey,
+          directory: p.worktreeDir,
+          branch: p.branch,
+          preflight: p.worktree
+        }
+        setAbandonTarget({ workId, row })
+      })
+      .catch((err) =>
+        alert(`Cannot abandon ${ticketKey} yet: ${(err as Error).message}\nNothing was removed.`)
+      )
+  }
+  const confirmAbandon = (workId: string, confirmedDirs: Set<string>): void => {
+    const row = abandonTarget?.row
+    setAbandonBusy(true)
+    void window.revva.work
+      .abandon({
+        id: workId,
+        confirmedSignature: row?.preflight.signature ?? '',
+        confirmed: row ? confirmedDirs.has(row.preflight.directory) : false
+      })
+      .then((note) => {
+        setAbandonTarget(null)
+        if (note) alert(note)
+        qc.invalidateQueries({ queryKey: ['works'] })
+        if (view.kind === 'work' && view.workId === workId) setView({ kind: 'dashboard' })
+      })
+      .catch((err) => {
+        // Refused or failed: the work keeps its state, files, session and
+        // review rounds — abandon never cancels anything, so a refusal (an
+        // in-flight review, drift from the confirmed state, a locked or
+        // unregistered path) changes nothing and the user can retry.
+        setAbandonTarget(null)
+        alert(`Abandon failed: ${(err as Error).message}`)
+        qc.invalidateQueries({ queryKey: ['works'] })
+      })
+      .finally(() => setAbandonBusy(false))
   }
 
   return (
@@ -150,9 +194,9 @@ export default function App(): React.JSX.Element {
             onClick={() => setView({ kind: 'dashboard' })}
           />
           <NavButton
-            icon={<InboxIcon className={cn('size-4', pending.length > 0 && 'text-amber-500')} />}
+            icon={<InboxIcon className={cn('size-4', inboxCount > 0 && 'text-amber-500')} />}
             label="Inbox"
-            badge={pending.length > 0 ? pending.length : undefined}
+            badge={inboxCount > 0 ? inboxCount : undefined}
             active={view.kind === 'inbox'}
             onClick={() => setView({ kind: 'inbox' })}
           />
@@ -355,7 +399,10 @@ export default function App(): React.JSX.Element {
             onOpenChat={(sessionId) => setView({ kind: 'chat', sessionId })}
           />
         ) : view.kind === 'inbox' ? (
-          <InboxView />
+          <InboxView
+            onOpenChat={(sessionId) => setView({ kind: 'chat', sessionId })}
+            onOpenWork={(workId) => setView({ kind: 'work', workId })}
+          />
         ) : view.kind === 'scripts' ? (
           <ScriptsView />
         ) : view.kind === 'github' ? (
@@ -380,6 +427,17 @@ export default function App(): React.JSX.Element {
       />
 
       <WorktreesDialog open={worktreesOpen} onOpenChange={setWorktreesOpen} />
+
+      <WorktreeRemovalDialog
+        open={abandonTarget !== null}
+        onOpenChange={(next) => !next && !abandonBusy && setAbandonTarget(null)}
+        title={`Abandon ${abandonTarget?.row.label ?? ''}?`}
+        intro="Removal re-fingerprints staged contents and files right before deleting and aborts when content was staged, added, removed, or normally edited since this preview — a same-size rewrite with restored timestamps, or writes after the last check, cannot be caught. Tick the worktree if its files would be destroyed. Unmerged branches are always kept."
+        rows={abandonTarget ? [abandonTarget.row] : []}
+        confirmLabel="Abandon"
+        busy={abandonBusy}
+        onConfirm={(confirmedDirs) => abandonTarget && confirmAbandon(abandonTarget.workId, confirmedDirs)}
+      />
     </div>
   )
 }

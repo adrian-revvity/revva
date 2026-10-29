@@ -1,6 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Inbox as InboxIcon, ShieldAlert, MessageCircleQuestion, FolderOpen } from 'lucide-react'
+import {
+  Inbox as InboxIcon,
+  ShieldAlert,
+  MessageCircleQuestion,
+  FolderOpen,
+  CheckCheck,
+  List,
+  Layers,
+  ArrowLeftRight
+} from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -8,8 +17,9 @@ import { Textarea } from '@/components/ui/textarea'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Separator } from '@/components/ui/separator'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
-import type { InboxField, PendingItem } from '@shared/types'
+import type { FinishedRun, InboxField, PendingItem, TriageEntry } from '@shared/types'
 
 /** Raw FormInfo.fields come across IPC untyped; normalize to InboxField[]. */
 function normalizeFields(raw: unknown): InboxField[] {
@@ -36,7 +46,7 @@ function normalizeFields(raw: unknown): InboxField[] {
     .filter((f) => f.key)
 }
 
-export function useInbox(): PendingItem[] {
+function useInboxQuery() {
   const qc = useQueryClient()
   const q = useQuery({ queryKey: ['inbox'], queryFn: () => window.revva.inbox.list() })
   // Main pushes the authoritative snapshot; keep the cache in sync.
@@ -45,26 +55,238 @@ export function useInbox(): PendingItem[] {
       if (e.kind === 'inbox') qc.setQueryData(['inbox'], e.items)
     })
   }, [qc])
-  return q.data ?? []
+  return q
 }
 
-export function InboxView(): React.JSX.Element {
-  const items = useInbox()
+export function useInbox(): PendingItem[] {
+  return useInboxQuery().data ?? []
+}
+
+/** Pending items stay available even if the newer finished-run feed fails to load. */
+function useTriageState(): { entries: TriageEntry[]; loading: boolean; error: boolean; unavailable: boolean; pendingError: boolean; retry: () => void } {
+  const qc = useQueryClient()
+  const pending = useInboxQuery()
+  // During development the renderer can reload before the Electron preload does.
+  const unavailable = !window.revva.triage
+  const q = useQuery({
+    queryKey: ['triage'],
+    queryFn: () => window.revva.triage.list(),
+    enabled: !unavailable
+  })
+  useEffect(() => {
+    return window.revva.events.on((e) => {
+      if (e.kind === 'triage') qc.setQueryData(['triage'], e.entries)
+      // Any pending-item or completion change invalidates the merged feed.
+      else if (e.kind === 'inbox' || e.kind === 'chat.idle' || e.kind === 'work.updated')
+        void qc.invalidateQueries({ queryKey: ['triage'] })
+    })
+  }, [qc])
+  return {
+    entries: [
+      ...(pending.data ?? []).map((item): TriageEntry => ({ type: 'pending', item })),
+      ...(q.data ?? []).filter((entry) => entry.type === 'finished')
+    ],
+    loading: pending.isLoading || (!unavailable && q.isLoading),
+    error: q.isError,
+    unavailable,
+    pendingError: pending.isError,
+    retry: () => {
+      if (pending.isError) void pending.refetch()
+      if (!unavailable && q.isError) void q.refetch()
+    }
+  }
+}
+
+export function useTriage(): TriageEntry[] {
+  return useTriageState().entries
+}
+
+/**
+ * Email-style triage: cards ordered needs-you → finished-unseen, the top one
+ * focused. Acting on it (answer / open / mark read) removes it and the next
+ * card slides into place. "All" switches to the full stacked list.
+ */
+export function InboxView({
+  onOpenChat,
+  onOpenWork
+}: {
+  onOpenChat: (sessionId: string) => void
+  onOpenWork: (workId: string) => void
+}): React.JSX.Element {
+  const qc = useQueryClient()
+  const { entries, loading, error, unavailable, pendingError, retry } = useTriageState()
+  const [focusMode, setFocusMode] = useState(true)
+  const top = entries[0]
+
+  const markRead = (entry: TriageEntry): void => {
+    if (entry.type !== 'finished') return
+    void window.revva.triage.markRead(entry.item.source, entry.item.workId ?? entry.item.sessionID).then(() => {
+      void qc.invalidateQueries({ queryKey: ['triage'] })
+      void qc.invalidateQueries({ queryKey: ['chats'], refetchType: 'all' })
+    })
+  }
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-2xl space-y-4 px-6 py-6">
-        <header>
-          <h2 className="flex items-center gap-2 text-lg font-semibold">
-            <InboxIcon className="size-5" /> Inbox
-          </h2>
-          <p className="text-xs text-muted-foreground">
-            Pending questions and permission requests from all chats and ticket runs.
-          </p>
+        <header className="flex items-start gap-2">
+          <div className="min-w-0 flex-1">
+            <h2 className="flex items-center gap-2 text-lg font-semibold">
+              <InboxIcon className="size-5" /> Inbox
+              {entries.length > 0 && (
+                <Badge variant="secondary" className="text-[10px]">
+                  {entries.length}
+                </Badge>
+              )}
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              Questions, permissions, and finished runs you haven’t seen. Deal with one, the next slides in.
+            </p>
+          </div>
+          {entries.length > 1 && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="outline" size="sm" onClick={() => setFocusMode((f) => !f)}>
+                  {focusMode ? <List className="size-3.5" /> : <Layers className="size-3.5" />}
+                  {focusMode ? 'All' : 'Focus'}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {focusMode ? 'Show every card at once' : 'One card at a time'}
+              </TooltipContent>
+            </Tooltip>
+          )}
         </header>
-        {items.length === 0 && (
+
+        {(error || unavailable || pendingError) && (
+          <div role="alert" className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-400">
+            <div className="flex items-center justify-between gap-3">
+              <span>
+                {pendingError && 'Couldn’t load pending questions. '}
+                {unavailable
+                  ? 'Finished runs are unavailable. Restart Revva to load the latest app update.'
+                  : error ? 'Couldn’t load finished runs.' : null}
+              </span>
+              {(pendingError || error) && (
+                <Button size="sm" variant="outline" onClick={retry}>Retry</Button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {entries.length === 0 && loading && (
+          <p className="py-14 text-center text-sm text-muted-foreground">Loading inbox…</p>
+        )}
+        {entries.length === 0 && !loading && !error && !unavailable && !pendingError && (
           <p className="py-14 text-center text-sm text-muted-foreground">Nothing waiting on you.</p>
         )}
-        {items.map((item) => (item.kind === 'form' ? <FormCard key={item.id} item={item} /> : <PermissionCard key={item.id} item={item} />))}
+
+        {focusMode && top ? (
+          <div key={entryKey(top)} className="animate-in fade-in-0 slide-in-from-right-4 duration-200">
+            <TriageCard entry={top} position={entries.length} onOpenChat={onOpenChat} onOpenWork={onOpenWork} onMarkRead={markRead} />
+          </div>
+        ) : (
+          entries.map((entry) => (
+            <div key={entryKey(entry)}>
+              <TriageCard entry={entry} position={1} onOpenChat={onOpenChat} onOpenWork={onOpenWork} onMarkRead={markRead} />
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
+function entryKey(entry: TriageEntry): string {
+  return entry.type === 'pending'
+    ? `pending:${entry.item.kind}:${entry.item.id}`
+    : `finished:${entry.item.source}:${entry.item.sessionID}`
+}
+
+/** One card in the feed: a pending question/permission or a finished-unseen run. */
+function TriageCard({
+  entry,
+  position,
+  onOpenChat,
+  onOpenWork,
+  onMarkRead
+}: {
+  entry: TriageEntry
+  position: number
+  onOpenChat: (sessionId: string) => void
+  onOpenWork: (workId: string) => void
+  onMarkRead: (entry: TriageEntry) => void
+}): React.JSX.Element {
+  if (entry.type === 'pending') {
+    return entry.item.kind === 'form' ? <FormCard item={entry.item} /> : <PermissionCard item={entry.item} />
+  }
+  return (
+    <FinishedRunCard
+      item={entry.item}
+      position={position}
+      onOpenChat={onOpenChat}
+      onOpenWork={onOpenWork}
+      onMarkRead={() => onMarkRead(entry)}
+    />
+  )
+}
+
+function FinishedRunCard({
+  item,
+  position,
+  onOpenChat,
+  onOpenWork,
+  onMarkRead
+}: {
+  item: FinishedRun
+  position: number
+  onOpenChat: (sessionId: string) => void
+  onOpenWork: (workId: string) => void
+  onMarkRead: () => void
+}): React.JSX.Element {
+  const open = (): void => {
+    if (item.source === 'work' && item.workId) onOpenWork(item.workId)
+    else onOpenChat(item.sessionID)
+    onMarkRead()
+  }
+  return (
+    <div className="rounded-lg border p-4 shadow-sm">
+      <div className="flex items-start gap-2">
+        <ArrowLeftRight className="mt-0.5 size-4 shrink-0 text-emerald-500" />
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium">
+            {item.source === 'work' ? `${item.owner} finished` : item.owner}
+          </div>
+          <p className="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <span className="font-medium">{item.owner}</span>
+            <Separator orientation="vertical" className="h-3" />
+            <FolderOpen className="size-3" />
+            <span className="truncate font-mono">{item.directory}</span>
+          </p>
+          {item.preview && (
+            <p className="mt-2 line-clamp-3 border-l-2 border-muted-foreground/30 pl-2 text-[11px] italic leading-relaxed text-muted-foreground">
+              {item.preview}
+            </p>
+          )}
+        </div>
+        {item.workState ? (
+          <Badge variant="outline" className="border-emerald-500/40 text-[10px]">
+            {item.workState.toLowerCase()}
+          </Badge>
+        ) : (
+          <Badge variant="secondary" className="text-[10px]">unread</Badge>
+        )}
+      </div>
+      <div className="mt-3 flex items-center justify-end gap-2">
+        {position > 1 && (
+          <span className="mr-auto text-[11px] text-muted-foreground">+{position - 1} more in the queue</span>
+        )}
+        <Button size="sm" variant="ghost" onClick={onMarkRead}>
+          <CheckCheck className="size-3.5" /> Mark read
+        </Button>
+        <Button size="sm" onClick={open}>
+          {item.source === 'work' ? 'Open cockpit' : 'Open chat'}
+        </Button>
       </div>
     </div>
   )
@@ -111,7 +333,7 @@ export function FormCard({ item }: { item: PendingItem }): React.JSX.Element {
           {reply.isPending ? 'Sending…' : 'Answer & continue'}
         </Button>
       </div>
-      {reply.error instanceof Error && <p className="mt-2 text-xs text-destructive">{reply.error.message}</p>}
+      {reply.error instanceof Error && <p role="alert" className="mt-2 text-xs text-destructive">{reply.error.message}</p>}
     </div>
   )
 }
@@ -223,16 +445,17 @@ export function PermissionCard({ item }: { item: PendingItem }): React.JSX.Eleme
         <Badge variant="outline" className="border-amber-500/40 text-[10px]">permission</Badge>
       </div>
       <div className={cn('mt-3 flex justify-end gap-2')}>
-        <Button size="sm" variant="outline" onClick={() => reply.mutate('reject')}>
+        <Button size="sm" variant="outline" disabled={reply.isPending} onClick={() => reply.mutate('reject')}>
           Reject
         </Button>
-        <Button size="sm" variant="secondary" onClick={() => reply.mutate('once')}>
+        <Button size="sm" variant="secondary" disabled={reply.isPending} onClick={() => reply.mutate('once')}>
           Allow once
         </Button>
-        <Button size="sm" onClick={() => reply.mutate('always')}>
+        <Button size="sm" disabled={reply.isPending} onClick={() => reply.mutate('always')}>
           Always allow
         </Button>
       </div>
+      {reply.error instanceof Error && <p role="alert" className="mt-2 text-xs text-destructive">{reply.error.message}</p>}
     </div>
   )
 }

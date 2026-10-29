@@ -7,7 +7,17 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 ## [Unreleased]
 
-- (nothing yet)
+- **Safer worktree removal** — abandoning a ticket or removing worktrees now previews exactly what deletion destroys (uncommitted, staged, untracked and ignored files are counted, never shown) and needs your explicit tick per worktree whenever files would go; the main checkout, unregistered folders, nested or locked worktrees are off-limits, active agents (or their absence being unprovable) block removal, and the confirmation is bound to a fingerprint of the actual contents — staged contents (full blob hashes), sizes, times, inodes, nested ignored content included: content staged, added, removed, or normally edited between preview and deletion aborts with nothing touched, and trees too large to fully verify are refused. `git worktree remove --force` is used only for content you confirmed destroying; branches still go through `branch -d` only. Abandoning while a review round is in flight now refuses instead of cancelling it — if a removal is refused or fails, nothing (not even review rounds) was changed. Removal is not race-free (a same-size rewrite that restores exact timestamps slips past the fingerprint, and writes after the last check cannot be caught) — the dialog says so.
+- **Ticket conversations** — reduce duplicate header information and pin branch, worktree, model and session details beside the chat.
+- **Questions in conversations** — answer pending questions and permission requests directly in their chat or ticket transcript, as well as in the inbox.
+- **Question inbox** — pending questions remain visible if the finished-run feed can’t load; the inbox now explains when Revva needs a restart or a retry.
+- **Ticket review and shipping** — follow-ups and retries start fresh review rounds, review blockers are visible, and AUTO ships after required gates pass.
+- **Conversation composer** — streamlined message entry, controls, and image previews into one compact layout.
+- **Session IDs** — copy a conversation's session ID from its header to reference it in another chat.
+- **Conversation context** — show context usage as a compact percentage beside the composer, with the token count in a tooltip.
+- **Auto-titled chats** — starting a chat no longer asks for a title; OpenCode generates one from your first message and it appears in the sidebar as soon as the reply starts. Manual rename still wins.
+- **Grouped agent turns** — a chain of tool calls (patches, shells, greps…) now renders as one card per turn with the steps collapsed inside ("Worked through N steps"), instead of a separate bubble per step. Applies to chats, the work cockpit and review transcripts.
+- **Fixed messages vanishing** — transcripts were loading only the 200 *oldest* messages, so long chats silently stopped showing your newest messages (and pipeline verdicts/Jira replies read from the wrong message). Long sessions now show their newest 200.
 
 ## [0.3.0] - 2026-10-28
 

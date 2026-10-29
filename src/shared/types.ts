@@ -186,12 +186,77 @@ export const worktreeInfoSchema = z.object({
 })
 export type WorktreeInfo = z.infer<typeof worktreeInfoSchema>
 
+/**
+ * Read-only proof gathered before any removal (main process, `worktrees.preflight`).
+ * A throw means the path must not be touched at all (unprovable or forbidden:
+ * main checkout, unregistered — no exceptions, nested, locked, over-limit or
+ * unreadable state). A return describes reality: a `missing` folder means at
+ * most one stale git registration is cleared (inert); an existing folder means
+ * removal destroys files, and `confirmationReasons` counts exactly what
+ * (contents are never shown) — `requiresConfirmation` then demands the user's
+ * explicit per-worktree confirmation before execution. The `signature` binds
+ * not just the porcelain status but the raw Git index state (`diff --cached
+ * --raw -z` entries with blob OIDs — staged contents can change while status
+ * and disk look untouched) and a per-path content fingerprint (size, mode,
+ * inode, mtimeNs, ctimeNs, symlink target strings, nested ignored/untracked
+ * content scanned under hard caps), so staging different content or editing an
+ * already-dirty or already untracked file between preview and execution voids
+ * the confirmation. Removal
+ * is still NOT race-free (an exact-mtime rewrite passes the fingerprint, and
+ * nothing can stop a writer between the last check and the unlink) — the UI
+ * must warn. Execution re-proves everything immediately before acting and
+ * refuses on any drift or uncheckable state.
+ */
+export const worktreeRemovalPreflightSchema = z.object({
+  /** Canonical repository root the registration was proven against. */
+  repoDir: z.string(),
+  /** Canonical worktree path. */
+  directory: z.string(),
+  branch: z.string().optional(),
+  detached: z.boolean(),
+  /** The folder provably does not exist; only git's registration may linger. */
+  missing: z.boolean(),
+  /** Counts of what removal would destroy — every category, contents never shown. */
+  trackedDirty: z.number().int().min(0),
+  untracked: z.number().int().min(0),
+  ignored: z.number().int().min(0),
+  /** True when the folder exists and holds anything (tracked / untracked / ignored / detached HEAD) — explicit confirmation required. */
+  requiresConfirmation: z.boolean(),
+  /** Human-readable destruction warnings shown verbatim, per worktree. */
+  confirmationReasons: z.array(z.string()),
+  /** Content-bound optimistic-concurrency token; execution re-proves and refuses on any drift. */
+  signature: z.string()
+})
+export type WorktreeRemovalPreflight = z.infer<typeof worktreeRemovalPreflightSchema>
+
 export const worktreeRemoveInputSchema = z.object({
   repoDir: z.string().min(1),
   directory: z.string().min(1),
-  force: z.boolean().default(true)
+  /** Must equal the preflight signature the user was shown; any drift voids it. */
+  confirmedSignature: z.string().default(''),
+  /** The user explicitly confirmed THIS worktree (checked against a fresh requiresConfirmation). */
+  confirmed: z.boolean().default(false)
 })
 export type WorktreeRemoveInput = z.infer<typeof worktreeRemoveInputSchema>
+
+export const workAbandonInputSchema = z.object({
+  id: z.string().min(1),
+  /** Must equal `work.abandonPreflight().worktree.signature` when it required confirmation. */
+  confirmedSignature: z.string().default(''),
+  /** The user explicitly confirmed this ticket's worktree removal (checked against a fresh requiresConfirmation). */
+  confirmed: z.boolean().default(false)
+})
+export type WorkAbandonInput = z.infer<typeof workAbandonInputSchema>
+
+/** Everything the abandon confirmation needs: work identity + the worktree proof. */
+export const workAbandonPreflightSchema = z.object({
+  workId: z.string(),
+  ticketKey: z.string(),
+  branch: z.string(),
+  worktreeDir: z.string(),
+  worktree: worktreeRemovalPreflightSchema
+})
+export type WorkAbandonPreflight = z.infer<typeof workAbandonPreflightSchema>
 
 /* ---------- Composer autocomplete ---------- */
 
@@ -320,7 +385,10 @@ export const workSummarySchema = z.object({
   state: workStateSchema,
   sessionId: z.string().optional(),
   prUrl: z.string().optional(),
-  updatedAt: z.number()
+  blocker: z.string().optional(),
+  updatedAt: z.number(),
+  /** Pipeline reached a human-relevant state since the user last opened the cockpit. */
+  unread: z.boolean().optional()
 })
 export type WorkSummary = z.infer<typeof workSummarySchema>
 
@@ -332,7 +400,7 @@ export const startWorkInputSchema = z.object({
   model: modelRefSchema.optional(),
   parentWorkId: z.string().optional(),
   grill: z.boolean().default(false),
-  /** Push + PR automatically once all review gates approve (opt-in per run). */
+  /** Also ship automatically in interactive mode; AUTO always ships after approval. */
   shipOnApprove: z.boolean().default(false),
   /** Per-run reviewer/fixer selections; fall back to role defaults when omitted. */
   reviewSel: z
@@ -455,6 +523,35 @@ export type PendingItem = z.infer<typeof pendingItemSchema>
 export const inboxAnswerSchema = z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.array(z.string())]))
 export const permissionDecisionSchema = z.enum(['once', 'always', 'reject'])
 
+/* ---------- Triage inbox (email-style: everything waiting on you) ---------- */
+
+/**
+ * A finished run the user has not looked at yet (chat reply or ticket-work
+ * outcome). Sits in the triage feed beside pending forms/permissions, ranked
+ * below them; dismissed by opening the session or marking it read.
+ */
+export const finishedRunSchema = z.object({
+  sessionID: z.string(),
+  source: z.enum(['chat', 'work']),
+  /** Ticket works only: cockpit target and pipeline state for the badge. */
+  workId: z.string().optional(),
+  workState: workStateSchema.optional(),
+  /** Chat title or ticket key. */
+  owner: z.string(),
+  directory: z.string(),
+  updatedAt: z.number(),
+  /** Tail of the last assistant message (best-effort preview). */
+  preview: z.string().optional()
+})
+export type FinishedRun = z.infer<typeof finishedRunSchema>
+
+/** One card in the triage feed: an agent needing an answer, or a finished unread run. */
+export const triageEntrySchema = z.union([
+  z.object({ type: z.literal('pending'), item: pendingItemSchema }),
+  z.object({ type: z.literal('finished'), item: finishedRunSchema })
+])
+export type TriageEntry = z.infer<typeof triageEntrySchema>
+
 /* ---------- Scripts (user one-click commands, e.g. "morning") ---------- */
 
 export const scriptDefSchema = z.object({
@@ -505,6 +602,8 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('chat.message'), sessionId: z.string(), message: chatMessageSchema }),
   z.object({ kind: z.literal('chat.idle'), sessionId: z.string() }),
   z.object({ kind: z.literal('chat.tool'), sessionId: z.string(), tool: z.string(), state: z.string() }),
+  /** OpenCode auto-titled the session from its first message. */
+  z.object({ kind: z.literal('chat.renamed'), sessionId: z.string(), title: z.string() }),
   /** Queue contents or the session's selected model changed — renderer refetches. */
   z.object({ kind: z.literal('session.queue'), sessionId: z.string() }),
   z.object({ kind: z.literal('session.model'), sessionId: z.string() }),
@@ -512,6 +611,8 @@ export const pushEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('work.updated'), workId: z.string(), state: workStateSchema }),
   z.object({ kind: z.literal('work.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
   z.object({ kind: z.literal('inbox'), items: z.array(pendingItemSchema) }),
+  /** Ranked triage feed: pending items + finished-unseen runs (pushed on dismissal). */
+  z.object({ kind: z.literal('triage'), entries: z.array(triageEntrySchema) }),
   z.object({ kind: z.literal('review.updated'), workId: z.string(), round: z.number(), reviews: z.array(reviewRowSchema) }),
   /** Live streamed text from a reviewer/fixer session. */
   z.object({ kind: z.literal('review.delta'), workId: z.string(), sessionId: z.string(), messageId: z.string(), text: z.string() }),
@@ -567,6 +668,7 @@ export interface RevvaApi {
   }
   session: {
     model(sessionId: string): Promise<(ModelRef & { variant?: string }) | null>
+    copyId(sessionId: string): Promise<void>
     contextUsage(sessionId: string): Promise<{ tokens: number; limit?: number; providerID: string; modelID: string } | null>
     active(): Promise<string[]>
     /** Messages waiting in OpenCode's inbox for this session. */
@@ -576,6 +678,8 @@ export interface RevvaApi {
   worktrees: {
     /** Linked worktrees across known repos (revva-created or not). */
     list(): Promise<WorktreeInfo[]>
+    /** Read-only safety proof for one removal path; throws a refusal when the path is not safe. */
+    preflight(input: { repoDir: string; directory: string }): Promise<WorktreeRemovalPreflight>
     /** Removes the worktree; deletes its branch only when git allows (`-d`). Returns a note. */
     remove(input: WorktreeRemoveInput): Promise<string | undefined>
   }
@@ -588,7 +692,9 @@ export interface RevvaApi {
   work: {
     start(input: StartWorkInput): Promise<WorkSummary>
     list(): Promise<WorkSummary[]>
-    abandon(id: string): Promise<string | undefined>
+    /** Read-only proof of what abandoning would destroy (worktree safety + notes). */
+    abandonPreflight(id: string): Promise<WorkAbandonPreflight>
+    abandon(input: WorkAbandonInput): Promise<string | undefined>
     messages(sessionId: string): Promise<ChatMessage[]>
     prompt(sessionId: string, text: string, images?: PromptImage[], queued?: boolean, refs?: PromptRefs): Promise<void>
     interrupt(sessionId: string): Promise<void>
@@ -636,6 +742,12 @@ export interface RevvaApi {
     list(): Promise<PendingItem[]>
     replyForm(sessionId: string, formId: string, answer: Record<string, string | number | boolean | string[]>): Promise<void>
     replyPermission(sessionId: string, requestId: string, decision: 'once' | 'always' | 'reject'): Promise<void>
+  }
+  triage: {
+    /** Ranked feed: pending forms/permissions first, then finished-unseen chats/works. */
+    list(): Promise<TriageEntry[]>
+    /** Archive a finished-unseen card without opening the session. */
+    markRead(source: 'chat' | 'work', id: string): Promise<void>
   }
   scripts: {
     list(): Promise<ScriptDef[]>

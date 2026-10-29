@@ -16,6 +16,10 @@ import { fileAttachments, skillAttachments } from './prompt-refs'
 
 const exec = promisify(execFile)
 
+/** Placeholder title for chats the user did not name; replaced by OpenCode's
+ *  auto-generated title (from the first message) via `session.renamed`. */
+const AUTO_TITLE = 'New chat'
+
 /** The SDK error for "session busy" / conflicts carries status 409. */
 function isConflict(err: unknown): boolean {
   const e = err as { status?: unknown; name?: unknown; message?: unknown }
@@ -171,9 +175,12 @@ class ChatManager {
     ensureSchema()
     const prUrl = await resolvePrLink(input.prUrl, input.directory)
     const api = openCodeService.api
-    const title = input.title?.trim() || 'New chat'
+    // Only force a title on the session when the user typed one — otherwise
+    // OpenCode auto-titles from the first message and we adopt it via session.renamed.
+    const custom = input.title?.trim()
+    const title = custom || AUTO_TITLE
     const session = await api.session.create({
-      title,
+      ...(custom ? { title: custom } : {}),
       agent: input.agentID ?? null,
       model: input.model ? { providerID: input.model.providerID, id: input.model.id } : null,
       location: { directory: input.directory },
@@ -233,9 +240,11 @@ class ChatManager {
 
   async messages(sessionId: string): Promise<ChatMessage[]> {
     const api = openCodeService.api
-    const res = await api.message.list({ sessionID: sessionId, order: 'asc', limit: 200 })
+    // desc + reverse: limit keeps the NEWEST 200. With asc, long sessions would
+    // silently lose the most recent messages (limit cuts the tail of the order).
+    const res = await api.message.list({ sessionID: sessionId, order: 'desc', limit: 200 })
     const out: ChatMessage[] = []
-    for (const m of res.data) {
+    for (const m of [...res.data].reverse()) {
       if (m.type === 'user') {
         const images = (m.files ?? [])
           .filter((f) => f.mime.startsWith('image/') && f.data)
@@ -362,6 +371,17 @@ class ChatManager {
     if (typeof sessionId !== 'string') return
     if (!this.isChat(sessionId)) return
     switch (e.type) {
+      case 'session.renamed': {
+        // OpenCode auto-titles a session from its first message. Adopt that
+        // title only while ours is still the placeholder, so a manual rename wins.
+        const title = typeof data.title === 'string' ? data.title.trim() : ''
+        if (!title) break
+        const row = getDb().prepare('SELECT title FROM chat WHERE session_id = ?').get(sessionId) as { title: string } | undefined
+        if (!row || row.title !== AUTO_TITLE) break
+        getDb().prepare('UPDATE chat SET title = ? WHERE session_id = ?').run(title.slice(0, 100), sessionId)
+        send({ kind: 'chat.renamed', sessionId, title: title.slice(0, 100) })
+        break
+      }
       case 'session.text.delta': {
         const msgId = String(data.assistantMessageID ?? '')
         const entry = this.streaming.get(msgId) ?? { sessionId, text: '' }

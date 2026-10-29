@@ -18,8 +18,18 @@ import { eventBus, type RawEvent } from '../opencode/bus'
 import { getTicket } from '../jira/board'
 import { getDb, settingGet } from '../db'
 import { reviewManager } from '../review'
+import { shipManager } from '../ship'
+import { performRemoval, preflightWorktreeRemoval, requireAbsenceOfAgents, staleConfirmationError } from '../worktree-safety'
 import { renderPrompt, DEFAULT_START_PROMPT } from '@shared/prompts'
-import { IPC, type PromptImage, type PromptRefs, type StartWorkInput, type WorkState, type WorkSummary } from '@shared/types'
+import {
+  IPC,
+  type PromptImage,
+  type PromptRefs,
+  type StartWorkInput,
+  type WorkAbandonPreflight,
+  type WorkState,
+  type WorkSummary
+} from '@shared/types'
 import { fileAttachments, skillAttachments } from '../opencode/prompt-refs'
 
 const exec = promisify(execFile)
@@ -37,7 +47,9 @@ interface WorkRow {
   session_id: string | null
   review_sel: string | null
   ship_on_approve: number | null
+  blocker: string | null
   pr_url: string | null
+  seen_at: number | null
   created_at: number
   updated_at: number
 }
@@ -60,11 +72,28 @@ function ensureSchema(): void {
   if (!cols.some((c) => c.name === 'pr_url')) {
     getDb().exec('ALTER TABLE work ADD COLUMN pr_url TEXT')
   }
+  if (!cols.some((c) => c.name === 'blocker')) {
+    getDb().exec('ALTER TABLE work ADD COLUMN blocker TEXT')
+  }
+  if (!cols.some((c) => c.name === 'review_cycle_start')) {
+    getDb().exec('ALTER TABLE work ADD COLUMN review_cycle_start INTEGER')
+  }
+  if (!cols.some((c) => c.name === 'review_head')) {
+    getDb().exec('ALTER TABLE work ADD COLUMN review_head TEXT')
+  }
+  if (!cols.some((c) => c.name === 'seen_at')) {
+    getDb().exec('ALTER TABLE work ADD COLUMN seen_at INTEGER')
+    // Existing works count as "last seen now", so upgrading doesn't flood the inbox.
+    getDb().exec('UPDATE work SET seen_at = updated_at WHERE seen_at IS NULL')
+  }
 }
 
 function slugBranch(key: string): string {
   return `revva/${key.toLowerCase()}`
 }
+
+/** States where the last move came from the pipeline, not from you — these flag unread. */
+export const UNREAD_WORTHY_STATES = new Set(['APPROVED', 'WAITING_HUMAN', 'REWORK', 'SHIPPED'])
 
 class WorkManager {
   private wired = false
@@ -98,7 +127,9 @@ class WorkManager {
       state: r.state as WorkSummary['state'],
       sessionId: r.session_id ?? undefined,
       prUrl: r.pr_url ?? undefined,
-      updatedAt: r.updated_at
+      blocker: r.blocker ?? undefined,
+      updatedAt: r.updated_at,
+      unread: (r.seen_at ?? 0) < r.updated_at && UNREAD_WORTHY_STATES.has(r.state)
     }
   }
 
@@ -144,7 +175,7 @@ class WorkManager {
         state,
         null,
         input.reviewSel ? JSON.stringify(input.reviewSel) : null,
-        input.shipOnApprove ? 1 : 0,
+        input.mode === 'auto' || input.shipOnApprove ? 1 : 0,
         now,
         now
       )
@@ -280,17 +311,23 @@ class WorkManager {
     return target
   }
 
-  private setState(id: string, state: WorkState): void {
-    getDb().prepare('UPDATE work SET state = ?, updated_at = ? WHERE id = ?').run(state, Date.now(), id)
+  /** "I've looked at it": clears the finished-unread inbox card. MAX() so a
+   *  state change landing in the same millisecond does not immediately re-flag it. */
+  markSeen(id: string): void {
+    getDb().prepare('UPDATE work SET seen_at = MAX(?, updated_at) WHERE id = ?').run(Date.now(), id)
+  }
+
+  private setState(id: string, state: WorkState, blocker?: string): void {
+    getDb().prepare('UPDATE work SET state = ?, blocker = ?, updated_at = ? WHERE id = ?').run(state, blocker ?? null, Date.now(), id)
     this.emit(id, state)
   }
 
   /** Called by the review pipeline (REVIEW/FIXING/APPROVED/WAITING_HUMAN). */
-  setReviewState(id: string, state: WorkState): void {
+  setReviewState(id: string, state: WorkState, blocker?: string): void {
     const work = getDb().prepare('SELECT state FROM work WHERE id = ?').get(id) as { state: string } | undefined
     if (!work || work.state === 'ABANDONED' || work.state === 'SHIPPED') return
-    if (work.state === state) return
-    this.setState(id, state)
+    if (work.state === state && !blocker) return
+    this.setState(id, state, blocker)
   }
 
   private emit(id: string, state: WorkState): void {
@@ -329,32 +366,134 @@ class WorkManager {
         if (work.state !== 'BUILDING') return
         // M4: build finished → concurrent read-only reviewer fan-out (no more auto-approve).
         this.setState(work.id, 'REVIEW')
-        void reviewManager.startRound(work.id, 1).catch((err) => {
+        void reviewManager.startRound(work.id, reviewManager.latestRound(work.id) + 1, true).catch((err) => {
           console.warn('[work] review fan-out failed:', describeError(err))
-          this.setState(work.id, 'WAITING_HUMAN')
+          this.setReviewState(work.id, 'WAITING_HUMAN', `Could not start review: ${describeError(err)}`)
         })
         break
       }
       case 'session.execution.failed':
       case 'session.execution.interrupted': {
-        if (work.state === 'BUILDING') this.setState(work.id, 'WAITING_HUMAN')
+        if (work.state === 'BUILDING') this.setState(work.id, 'WAITING_HUMAN', `Build ${e.type === 'session.execution.failed' ? 'failed' : 'was interrupted'}.`)
         break
       }
     }
   }
 
-  /** Removes the worktree and tries to delete the branch — with `branch -d` only,
-   *  never `-D`: unmerged work is never discarded silently. Returns a note when the
-   *  branch was preserved. */
-  async abandon(id: string): Promise<string | undefined> {
+  /**
+   * Read-only preview of Abandon: what the worktree holds that removal would destroy.
+   * Touches nothing — deleting the session happens only in `abandon`, and only
+   * after the user's confirmation matches a fresh revalidation. An in-flight
+   * review makes `abandon` refuse without cancelling anything.
+   */
+  async abandonPreflight(id: string): Promise<WorkAbandonPreflight> {
+    const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(id) as WorkRow | undefined
+    if (!work) throw new Error('Work not found.')
+    const preflight = await preflightWorktreeRemoval(work.repo_dir, work.worktree_dir)
+    return {
+      workId: work.id,
+      ticketKey: work.ticket_key,
+      branch: work.branch,
+      worktreeDir: work.worktree_dir,
+      worktree: preflight
+    }
+  }
+
+  /**
+   * Remove the worktree (only with the confirmation the preview asked for —
+   * never silently destructive), then delete the session and try to delete the
+   * branch with `-d` only: unmerged work is never discarded silently.
+   *
+   * Cancellation is deliberately NOT part of this flow: an in-flight review
+   * round (or a review/ship starting) makes abandon REFUSE with nothing
+   * cancelled, deleted, or changed — cancelling first would leave interrupted
+   * review rows behind when the removal then fails, and cancelWork awaits I/O,
+   * which would let cancellation interleave with the confirmed preview. Safe
+   * cancel-then-rollback coordination would need to live in ReviewManager and
+   * does not exist, so abandon waits instead of gambling.
+   *
+   * Immediately before the deletion the guards run a final time — fresh
+   * review/ship activity checks, a fresh agent-occupancy probe, then a fresh
+   * full preflight (contents + index + path identity) landing directly before
+   * the unlink. This narrows the window to the git subprocess itself; it does
+   * NOT make deletion race-free — a round starting inside that final window is
+   * possible in principle, and git's own deletion-time check plus the honest
+   * UI warning are the remaining guards. Every refusal leaves the work row,
+   * its files, its session and its reviews untouched and retryable. Returns a
+   * note when the branch was kept.
+   */
+  async abandon(id: string, confirmedSignature: string, confirmed: boolean): Promise<string | undefined> {
     const work = getDb().prepare('SELECT * FROM work WHERE id = ?').get(id) as WorkRow | undefined
     if (!work) return
-    await reviewManager.cancelWork(id)
+    if (shipManager.isShipping(id)) throw new Error('Shipping is in progress; wait for it to finish before abandoning this work.')
+    // Active review ⇒ refuse before anything (including any cancellation) can happen.
+    if (reviewManager.isBusyReviewing(id)) {
+      throw new Error('A review round is still in flight for this work — wait for it to finish (or let it time out) before abandoning. Nothing was cancelled or removed.')
+    }
+    if (reviewManager.isStartingReview(id)) throw new Error('Review is starting; wait for it to finish starting before abandoning this work.')
+
+    // Proof first: protected path, unregistered path (exact registration is
+    // required — no no-op exception), or unreadable/fingerprint-over-limit
+    // state ⇒ refuse. Nothing is cancelled or deleted at any refusal point.
+    const preflight = await preflightWorktreeRemoval(work.repo_dir, work.worktree_dir)
+    if (preflight.signature !== confirmedSignature) throw staleConfirmationError()
+    if (preflight.requiresConfirmation && !confirmed) {
+      // The folder holds content the user has not explicitly confirmed destroying.
+      throw new Error(
+        `Explicit confirmation required — the worktree holds content that would go: ${preflight.confirmationReasons.join('; ')}. Nothing was abandoned — confirm this exact worktree first.`
+      )
+    }
+
+    // A running build would keep writing into the worktree path (and could
+    // recreate a vanished folder). Fails closed: unprovable ⇒ refuse.
+    await requireAbsenceOfAgents(preflight.directory)
+    if (work.session_id) {
+      const active = await openCodeService.api.session.active().catch(() => undefined)
+      if (!active) throw new Error('Nothing was removed: the OpenCode service could not be consulted about running sessions.')
+      if (work.session_id in active) {
+        throw new Error('The build session is still running — interrupt it before abandoning this work.')
+      }
+    }
+
+    // Final rechecks immediately before the deletion. The occupancy probe is a
+    // network-slow SNAPSHOT (a session can start right after it returns) and
+    // runs first, so the full fresh preflight (contents + index + path
+    // identity) lands last, directly before the unlink. These are awaited
+    // probes: they narrow the race window rather than closing it, and no claim
+    // of race-freedom is made anywhere.
+    if (reviewManager.isBusyReviewing(id) || reviewManager.isStartingReview(id) || shipManager.isShipping(id)) {
+      throw new Error('A review or ship started just now — nothing was removed. Try abandoning again once it settles.')
+    }
+    await requireAbsenceOfAgents(preflight.directory)
+    const final = await preflightWorktreeRemoval(work.repo_dir, work.worktree_dir)
+    if (final.signature !== confirmedSignature) throw staleConfirmationError()
+    // Synchronous last word, directly before the git subprocess starts: no
+    // await between here and performRemoval, so within this process no review
+    // or ship round can slip in after the final content proof.
+    if (reviewManager.isBusyReviewing(id) || reviewManager.isStartingReview(id) || shipManager.isShipping(id)) {
+      throw new Error('A review or ship started just now — nothing was removed. Try abandoning again once it settles.')
+    }
+
+    // Deletion happens here (or the registration is cleared, folder already gone).
+    // `--force` only for modified/untracked content the confirmation covered —
+    // the content-bound signature binds exactly those contents, so any edit
+    // since the preview (even to an already-dirty file or a staged blob)
+    // voided it above. Never unlock, never broad prune. Git's own
+    // deletion-time check still refuses fresh modified/untracked files; revva
+    // does not escalate that.
+    const force = !final.missing && final.trackedDirty + final.untracked > 0
+    try {
+      await performRemoval(final.repoDir, final.directory, force)
+    } catch (err) {
+      // Nothing was cancelled either — the whole work is intact and retryable.
+      throw new Error(`${(err as Error).message} (The work, its files, its session, its reviews and its state are untouched — retry once resolved.)`)
+    }
+
+    // Filesystem removal succeeded — only now let the rest of the record follow.
     if (work.session_id) await openCodeService.api.session.remove({ sessionID: work.session_id }).catch(() => undefined)
-    await exec('git', ['-C', work.repo_dir, 'worktree', 'remove', '--force', work.worktree_dir]).catch(() => undefined)
     let note: string | undefined
     try {
-      await exec('git', ['-C', work.repo_dir, 'branch', '-d', work.branch])
+      await exec('git', ['-C', final.repoDir, 'branch', '-d', work.branch])
     } catch (err) {
       const e = err as { stderr?: string; message?: string }
       const reason = (e.stderr || e.message || 'not fully merged').trim().slice(0, 160)
@@ -367,9 +506,17 @@ class WorkManager {
   /** Follow-up message into a running/finished build session. */
   async followUp(sessionId: string, text: string, images: PromptImage[] = [], queued = false, refs?: PromptRefs): Promise<void> {
     const work = this.workBySession(sessionId)
+    let resumed = false
     if (work) {
+      if (shipManager.isShipping(work.id)) throw new Error('Shipping is in progress; wait for it to finish before sending a follow-up.')
+      if (reviewManager.isBusyReviewing(work.id) || work.state === 'REVIEW' || work.state === 'FIXING') {
+        throw new Error('Review is in progress; wait for it to finish or re-run a stuck review before sending a follow-up.')
+      }
       // A human re-prompting a settled build takes it back through review.
-      if (['WAITING_HUMAN', 'APPROVED', 'REVIEW', 'FIXING'].includes(work.state)) this.setState(work.id, 'BUILDING')
+      if (['WAITING_HUMAN', 'APPROVED', 'SHIPPED'].includes(work.state)) {
+        this.setState(work.id, 'BUILDING')
+        resumed = true
+      }
       this.touch(work.id)
     }
     const files = [
@@ -393,8 +540,17 @@ class WorkManager {
       // Steer refused (session state raced) — park the follow-up so it is not lost.
       const msg = String((err as Error)?.message ?? err ?? '')
       const conflict = (err as { status?: unknown })?.status === 409 || /409|conflict|busy|already running/i.test(msg)
-      if (!queued && conflict) await openCodeService.api.session.prompt({ ...payload, delivery: 'queue' })
-      else throw err
+      if (!queued && conflict) {
+        try {
+          await openCodeService.api.session.prompt({ ...payload, delivery: 'queue' })
+          return
+        } catch (queueError) {
+          if (work && resumed) this.setState(work.id, work.state as WorkState, work.blocker ?? undefined)
+          throw queueError
+        }
+      }
+      if (work && resumed) this.setState(work.id, work.state as WorkState, work.blocker ?? undefined)
+      throw err
     }
   }
 

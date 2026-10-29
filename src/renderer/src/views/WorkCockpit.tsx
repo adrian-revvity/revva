@@ -1,10 +1,9 @@
 import { useEffect, useMemo } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { CircleDot, GitBranch, FolderGit2 } from 'lucide-react'
+import { CircleDot } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import type { PushEvent, WorkSummary } from '@shared/types'
 import { TranscriptView, type TranscriptDrive } from './Chat'
-import { FormCard, PermissionCard, useInbox } from './InboxView'
 import { ReviewPanel, ReviewRerunButton } from './ReviewPanel'
 import { ShipPanel } from './ShipPanel'
 import { CommentsStrip } from './CommentsStrip'
@@ -26,9 +25,16 @@ const stateClasses: Record<string, string> = {
  */
 export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element {
   const sessionId = work.sessionId
-  const allPending = useInbox()
-  const pending = allPending.filter((p) => p.sessionID === sessionId)
   const qc = useQueryClient()
+
+  // Opening the cockpit counts as "seen": clears the inbox finished-unread card
+  // and the unread flag on the work.
+  useEffect(() => {
+    if (!work.unread) return
+    void window.revva.triage.markRead('work', work.id).then(() => {
+      void qc.invalidateQueries({ queryKey: ['works'] })
+    })
+  }, [work.unread, work.id, qc])
 
   // Orca lesson: push events alone go stale (e.g. the agent commits while the window
   // is hidden). Refetch the panels' data whenever the window regains focus too.
@@ -83,27 +89,22 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <ReviewPanel workId={work.id} />
+      <ReviewPanel workId={work.id} building={work.state === 'BUILDING'} />
       <ShipPanel work={work} />
-      <CommentsStrip workId={work.id} />
-      {pending.length > 0 && (
-        <div className="max-h-64 shrink-0 space-y-2 overflow-y-auto border-b bg-amber-500/5 p-3">
-          <p className="text-[11px] font-medium text-amber-700 dark:text-amber-400">
-            Waiting on you ({pending.length})
-          </p>
-          {pending.map((p) =>
-            p.kind === 'form' ? <FormCard key={p.id} item={p} /> : <PermissionCard key={p.id} item={p} />
-          )}
+      {work.blocker && (
+        <div role="alert" className="shrink-0 border-b bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          {work.blocker}
         </div>
       )}
+      <CommentsStrip workId={work.id} />
       <TranscriptView
       sessionId={sessionId}
       drive={drive}
       emptyHint="The build session is spinning up — output appears here live."
+      details={{ branch: work.branch, worktreeDir: work.worktreeDir }}
       header={
         <>
-          <span className="font-mono text-[13px] font-semibold">{work.ticketKey}</span>
-          <span className="truncate text-[13px] text-muted-foreground">{work.ticketSummary}</span>
+          <span className="min-w-0 flex-1 truncate text-[13px] font-medium" title={work.ticketSummary}>{work.ticketSummary}</span>
           <Badge variant="outline" className={`text-[10px] ${stateClasses[work.state] ?? ''}`}>
             <CircleDot className="mr-1 size-3" />
             {work.state}
@@ -114,14 +115,6 @@ export function WorkCockpit({ work }: { work: WorkSummary }): React.JSX.Element 
           {(work.state === 'APPROVED' || work.state === 'WAITING_HUMAN') && (
             <ReviewRerunButton workId={work.id} />
           )}
-          <Badge variant="outline" className="ml-auto max-w-56 truncate font-mono text-[10px] font-normal">
-            <GitBranch className="mr-1 inline size-3" />
-            {work.branch}
-          </Badge>
-          <Badge variant="outline" className="max-w-52 truncate font-mono text-[10px] font-normal">
-            <FolderGit2 className="mr-1 inline size-3" />
-            {work.worktreeDir.split('/').filter(Boolean).pop()}
-          </Badge>
         </>
       }
     />

@@ -1,7 +1,7 @@
 /**
  * Typed IPC surface. Renderer never touches node/electron APIs directly.
  */
-import { app, ipcMain, dialog, shell, BrowserWindow } from 'electron'
+import { app, ipcMain, dialog, shell, clipboard, BrowserWindow } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
@@ -9,6 +9,7 @@ import { IPC, settingsKeySchema, chatCreateInputSchema, type Workspace } from '@
 import { openCodeService } from './opencode/service'
 import { chatManager } from './opencode/chats'
 import { inboxManager } from './opencode/inbox'
+import { triageManager } from './opencode/triage'
 import { listAgents, listModels, listSkills } from './opencode/inventory'
 import { jiraAuth } from './jira/auth'
 import { jiraMcp } from './jira/mcp'
@@ -34,6 +35,7 @@ import {
   promptImageSchema,
   promptRefsSchema,
   worktreeRemoveInputSchema,
+  workAbandonInputSchema,
   type PromptImage,
   type PromptRefs
 } from '@shared/types'
@@ -164,6 +166,10 @@ export function registerIpc(): void {
     const session = await openCodeService.api.session.get({ sessionID: String(sessionId) })
     return session.model ?? null
   })
+  ipcMain.handle(IPC.sessionCopyId, (_e, sessionId: unknown) => {
+    if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 500) throw new Error('Invalid session ID.')
+    clipboard.writeText(sessionId)
+  })
   ipcMain.handle(IPC.sessionContextUsage, async (_e, sessionId: string) => {
     const api = openCodeService.api
     const [messages, session] = await Promise.all([
@@ -193,9 +199,13 @@ export function registerIpc(): void {
 
   /* ---------- worktree cleanup ---------- */
   ipcMain.handle(IPC.worktreeList, () => worktreeManager.list())
+  ipcMain.handle(IPC.worktreePreflight, (_e, input: unknown) => {
+    const { repoDir, directory } = worktreeRemoveInputSchema.parse(input)
+    return worktreeManager.preflight(repoDir, directory)
+  })
   ipcMain.handle(IPC.worktreeRemove, (_e, input: unknown) => {
     const parsed = worktreeRemoveInputSchema.parse(input)
-    return worktreeManager.remove(parsed.repoDir, parsed.directory, parsed.force)
+    return worktreeManager.remove(parsed.repoDir, parsed.directory, parsed.confirmedSignature, parsed.confirmed)
   })
 
   /* ---------- jira ---------- */
@@ -218,7 +228,11 @@ export function registerIpc(): void {
   /* ---------- works (ticket pipeline) ---------- */
   ipcMain.handle(IPC.workStart, (_e, input: unknown) => workManager.start(startWorkInputSchema.parse(input)))
   ipcMain.handle(IPC.workList, () => workManager.list())
-  ipcMain.handle(IPC.workAbandon, (_e, id: string) => workManager.abandon(String(id)))
+  ipcMain.handle(IPC.workAbandonPreflight, (_e, id: string) => workManager.abandonPreflight(String(id)))
+  ipcMain.handle(IPC.workAbandon, (_e, input: unknown) => {
+    const parsed = workAbandonInputSchema.parse(input)
+    return workManager.abandon(parsed.id, parsed.confirmedSignature, parsed.confirmed)
+  })
   ipcMain.handle(IPC.workMessages, (_e, sessionId: string) => chatManager.messages(String(sessionId)))
   ipcMain.handle(IPC.workPrompt, (_e, sessionId: string, text: string, images?: unknown, queued?: unknown, refs?: unknown) =>
     workManager.followUp(String(sessionId), String(text), promptImageList(images), Boolean(queued), promptRefs(refs))
@@ -227,7 +241,7 @@ export function registerIpc(): void {
   ipcMain.handle(IPC.workReviews, (_e, workId: string) => reviewManager.reviewsFor(String(workId)))
   ipcMain.handle(IPC.workReviewStart, async (_e, workId: string) => {
     const round = reviewManager.latestRound(String(workId)) + 1
-    await reviewManager.startRound(String(workId), round)
+    await reviewManager.startRound(String(workId), round, true)
   })
   ipcMain.handle(IPC.workShipCheck, (_e, workId: string) => shipManager.checks(String(workId)))
   ipcMain.handle(IPC.workShip, (_e, workId: string) => shipManager.ship(String(workId)))
@@ -244,6 +258,11 @@ export function registerIpc(): void {
     inboxManager.replyForm(String(sessionId), String(formId), inboxAnswerSchema.parse(answer)))
   ipcMain.handle(IPC.inboxReplyPermission, (_e, sessionId: string, requestId: string, decision: unknown) =>
     inboxManager.replyPermission(String(sessionId), String(requestId), permissionDecisionSchema.parse(decision)))
+
+  /* ---------- triage inbox (finished-unseen feed) ---------- */
+  ipcMain.handle(IPC.triageList, () => triageManager.list())
+  ipcMain.handle(IPC.triageMarkRead, (_e, source: unknown, id: string) =>
+    triageManager.markRead(source === 'work' ? 'work' : 'chat', String(id)))
 
   /* ---------- comment watcher (M6) ---------- */
   ipcMain.handle(IPC.commentsPending, () => commentWatcher.pending())

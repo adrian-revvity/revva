@@ -28,7 +28,7 @@ const statusMeta: Record<string, { cls: string; text: string }> = {
  * Review ledger strip under the cockpit header: one card per reviewer of the latest round
  * (fixer when one is running), expandable to its live transcript. Reviewers run concurrently.
  */
-export function ReviewPanel({ workId }: { workId: string }): React.JSX.Element | null {
+export function ReviewPanel({ workId, building }: { workId: string; building?: boolean }): React.JSX.Element | null {
   const qc = useQueryClient()
   const reviews = useQuery({ queryKey: ['reviews', workId], queryFn: () => window.revva.work.reviews(workId) })
   const [open, setOpen] = useState<number | null>(null)
@@ -50,7 +50,7 @@ export function ReviewPanel({ workId }: { workId: string }): React.JSX.Element |
     <div className="shrink-0 space-y-1 border-b bg-muted/30 px-3 py-2">
       <div className="flex flex-wrap items-center gap-1.5">
         <span className="mr-1 text-[11px] font-medium text-muted-foreground">
-          Review · round {round || '—'}
+          {building ? 'Previous review' : 'Review'} · round {round || '—'}
         </span>
         {visible.map((r) => (
           <ReviewChip key={r.id} row={r} active={open === r.id} onClick={() => setOpen(open === r.id ? null : r.id)} />
@@ -173,21 +173,26 @@ function ReviewTranscript({ row, onClose }: { row: ReviewRow; onClose: () => voi
 export function ReviewRerunButton({ workId, disabled }: { workId: string; disabled?: boolean }): React.JSX.Element {
   const qc = useQueryClient()
   const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   return (
+    <>
     <Button
       size="sm"
       variant="outline"
       disabled={busy || disabled}
       onClick={() => {
         setBusy(true)
+        setError(null)
         void window.revva.work
           .reviewStart(workId)
-          .catch((err) => console.error(err))
+          .catch((err) => setError(err instanceof Error ? err.message : String(err)))
           .finally(() => setBusy(false))
           .then(() => qc.invalidateQueries({ queryKey: ['reviews', workId] }))
       }}
     >
       Re-run review
     </Button>
+    {error && <span role="alert" className="text-xs text-destructive">{error}</span>}
+    </>
   )
 }
