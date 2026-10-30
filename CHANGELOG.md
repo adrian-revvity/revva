@@ -7,6 +7,8 @@ The rule of thumb: every user-visible change gets an `[Unreleased]` bullet as pa
 
 ## [Unreleased]
 
+- **`pnpm dev` starts on Windows after a fresh install** — since Electron 42 the npm package no longer downloads its binary in a `postinstall` script, so on a clean machine `node_modules/electron/path.txt` never existed and `electron-vite dev` died with `Error: Electron uninstall` right after the renderer server came up. The project's own `postinstall` now runs `install-electron` (Electron's official on-demand installer) before rebuilding `better-sqlite3`, so `pnpm install` always leaves a usable Electron binary on macOS and Windows. On a checkout already stuck with the error, one `pnpm install` (or `pnpm exec install-electron`) fixes it in place.
+
 - (nothing yet)
 
 ## [1.2.0] - 2026-10-29

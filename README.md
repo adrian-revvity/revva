@@ -88,6 +88,10 @@ After the first install, just run `pnpm dev`. Leave the terminal running while
 you use Revva; press `Ctrl+C` there to stop it. OpenCode must be installed for
 agent features; Jira and GitHub can be connected as needed in Setup.
 
+If a checkout predates the binary download in `pnpm install` (typically Windows,
+where `pnpm dev` fails with `Error: Electron uninstall`), run
+`pnpm exec install-electron` once — or simply `pnpm install` again.
+
 For quicker launches on macOS, add an alias to `~/.zshrc`, replacing the path
 with your checkout's location (run `pwd` in the project folder to find it):
 
